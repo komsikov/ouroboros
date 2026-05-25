@@ -1,6 +1,6 @@
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
-import { showToast } from './toast.js';
 import { apiFetch } from './api_client.js';
+import { showToast } from './toast.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export function initUpdates({ mount, state }) {
     const page = document.createElement('div');
@@ -114,7 +114,7 @@ export function initUpdates({ mount, state }) {
             `<span class="evo-runtime-chip"><strong>Расхождение:</strong> ${escapeHtml(divergenceText(data))}</span>`,
             `<span class="evo-runtime-chip"><strong>Последнее:</strong> ${escapeHtml(latestMsg)}</span>`,
         ].join('');
-        applyBtn.disabled = !canUpdate;
+        applyBtn.disabled = true // !canUpdate;
         applyBtn.dataset.safe = safe ? '1' : '0';
         applyBtn.textContent = !canUpdate ? 'Нет обновлений' : (safe ? 'Обновить сейчас' : 'Обновить с параметрами');
         setBadge(canUpdate ? (safe ? 'online' : 'starting') : 'offline', canUpdate ? 'Доступно' : 'Актуально');
@@ -240,7 +240,7 @@ export function initUpdates({ mount, state }) {
             showToast(`Обновление подготовлено. Сервер перезапускается.${keep}`, 'success');
         } catch (err) {
             showToast('Обновление не удалось: ' + (err.message || err), 'error');
-            applyBtn.disabled = false;
+            applyBtn.disabled = true;
             applyBtn.textContent = safe ? 'Обновить сейчас' : 'Обновить с параметрами';
         }
     }
