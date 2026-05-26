@@ -10,10 +10,10 @@ function mountOverlay(html) {
     overlay.className = 'onboarding-overlay';
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
-    overlay.setAttribute('aria-label', 'Ouroboros setup');
+    overlay.setAttribute('aria-label', 'Настройка Ouroboros');
     overlay.innerHTML = `
         <div class="onboarding-overlay-backdrop"></div>
-        <iframe class="onboarding-frame" title="Ouroboros Setup" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
+        <iframe class="onboarding-frame" title="Настройка Ouroboros" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
     `;
     const frame = overlay.querySelector('.onboarding-frame');
     if (frame) frame.srcdoc = html;
@@ -37,13 +37,13 @@ function showRestartRequiredOverlay(runtimeMode) {
     overlay.className = 'onboarding-overlay';
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
-    overlay.setAttribute('aria-label', 'Ouroboros restart required');
+    overlay.setAttribute('aria-label', 'Требуется перезапуск Ouroboros');
     overlay.innerHTML = `
         <div class="onboarding-overlay-backdrop"></div>
         <section class="onboarding-restart-card">
-            <h2>Restart Required</h2>
-            <p>Runtime mode was saved as <code>${mode}</code> for the next boot. Restart Ouroboros to apply it before continuing in that mode.</p>
-            <button type="button" class="btn btn-primary" data-onboarding-continue>Continue in current mode</button>
+            <h2>Требуется перезапуск</h2>
+            <p>Режим работы сохранён как <code>${mode}</code> для следующего запуска. Перезапустите Ouroboros, чтобы применить его, прежде чем продолжать в этом режиме.</p>
+            <button type="button" class="btn btn-primary" data-onboarding-continue>Продолжить в текущем режиме</button>
         </section>
     `;
     if (!overlay.parentElement) document.body.appendChild(overlay);

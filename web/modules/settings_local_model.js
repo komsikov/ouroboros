@@ -57,7 +57,8 @@ export function bindLocalModelControls({ state }) {
             const isDownloading = d.status === 'downloading';
             const runtimeMissing = d.runtime_status === 'missing' || d.runtime_status === 'install_error';
 
-            let text = 'Статус: ' + (d.status || 'offline').charAt(0).toUpperCase() + (d.status || 'offline').slice(1);
+            const statusMap = { ready: 'готов', downloading: 'загрузка', error: 'ошибка', offline: 'не запущен', stopped: 'остановлен', starting: 'запуск', installing: 'установка' };
+            let text = 'Статус: ' + (statusMap[d.status] || d.status || 'не запущен');
             if (isReady && d.context_length) text += ` (ctx: ${d.context_length})`;
             if (isDownloading && d.download_progress != null) {
                 const pct = Math.round(d.download_progress * 100);
@@ -137,7 +138,7 @@ export function bindLocalModelControls({ state }) {
                 updateLocalStatus();
             }
         } catch (e) {
-            setLocalStatus('Failed: ' + e.message, 'error');
+            setLocalStatus('Не удалось: ' + e.message, 'error');
         }
     }
 

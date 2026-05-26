@@ -239,7 +239,7 @@ function summaryCard(summary, installedMap, isPlugin) {
     const workingIndicator = lifecycleSpinnerFor(pending);
     const detailsBtn = `<button class="btn btn-default" data-mp-detail="${escapeHtml(slug)}">Подробнее</button>`;
     const primaryButton = isPlugin
-        ? `<button class="btn btn-default" disabled title="OpenClaw Node/TypeScript plugins are not installable in Ouroboros. Use a Python port or MCP bridge.">Plugin</button>`
+        ? `<button class="btn btn-default" disabled title="Плагины OpenClaw на Node/TypeScript нельзя установить в Ouroboros. Используйте Python-порт или MCP-мост.">Плагин</button>`
         : isInstalled
             ? `<button class="btn btn-primary" disabled>Установлен v${escapeHtml(installedAtVersion || summary.latest_version || '—')}</button>`
             : `<button class="btn btn-default marketplace-next-action"

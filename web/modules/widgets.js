@@ -39,7 +39,7 @@ function renderShell(host, tabs) {
         // Avoid leaking internal "skill:tab_id"; show skill only as needed.
         const title = tab.title || tab.tab_id || tab.skill;
         const subtitle = tab.skill && tab.skill !== title
-            ? `<span class="widgets-card-source">from ${escapeHtml(tab.skill)}</span>`
+            ? `<span class="widgets-card-source">из ${escapeHtml(tab.skill)}</span>`
             : '';
         const span = Number(tab.span || tab.grid_span || 1);
         const spanClass = span >= 2 ? ' widgets-card-span-2' : '';
@@ -214,7 +214,7 @@ function renderDataComponent(tab, component, state, status, componentState = {},
             const value = getPath(data, field.path, '—');
             return `<div class="widget-kv-row"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`;
         }).join('');
-        return `<div class="widget-kv">${rows || '<div class="muted">No data.</div>'}</div>`;
+        return `<div class="widget-kv">${rows || '<div class="muted">Нет данных.</div>'}</div>`;
     }
     if (type === 'key_value') {
         const rows = getPath(data, component.items_key || component.path || '', []);
@@ -224,7 +224,7 @@ function renderDataComponent(tab, component, state, status, componentState = {},
     if (type === 'table') {
         const rows = getPath(data, component.path || '', []);
         const cols = component.columns || [];
-        if (!Array.isArray(rows)) return '<div class="muted">No rows.</div>';
+        if (!Array.isArray(rows)) return '<div class="muted">Нет строк.</div>';
         return `<div class="widget-table-wrap"><table class="widget-table"><thead><tr>${cols.map((c) => `<th>${escapeHtml(c.label || c.path || '')}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${cols.map((c) => `<td>${escapeHtml(getPath(row, c.path, ''))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
     }
     if (type === 'markdown') {
@@ -249,13 +249,13 @@ function renderDataComponent(tab, component, state, status, componentState = {},
         const stateKey = `tab:${componentKey}`;
         const active = Math.max(0, Math.min(Number(componentState[stateKey] || 0), Math.max(tabs.length - 1, 0)));
         const buttons = tabs.map((item, idx) => (
-            `<button type="button" class="widget-tab-btn ${idx === active ? 'active' : ''}" data-widget-tab-key="${escapeHtml(stateKey)}" data-widget-tab-idx="${idx}">${escapeHtml(item.label || `Tab ${idx + 1}`)}</button>`
+            `<button type="button" class="widget-tab-btn ${idx === active ? 'active' : ''}" data-widget-tab-key="${escapeHtml(stateKey)}" data-widget-tab-idx="${idx}">${escapeHtml(item.label || `Вкладка ${idx + 1}`)}</button>`
         )).join('');
         const activeTab = tabs[active] || {};
         const body = (activeTab.components || [])
             .map((child, idx) => renderDataComponent(tab, child, state, status, componentState, `${componentKey}:${active}:${idx}`))
             .join('');
-        return `<div class="widget-tabs"><div class="widget-tab-list">${buttons}</div><div class="widget-tab-body">${body || '<div class="muted">No content.</div>'}</div></div>`;
+        return `<div class="widget-tabs"><div class="widget-tab-list">${buttons}</div><div class="widget-tab-body">${body || '<div class="muted">Нет содержимого.</div>'}</div></div>`;
     }
     if (type === 'stream') {
         const current = status[target] || 'idle';
@@ -264,7 +264,7 @@ function renderDataComponent(tab, component, state, status, componentState = {},
     if (['image', 'audio', 'video', 'file'].includes(type)) {
         const src = safeMediaSrc(tab, component, state);
         const label = escapeHtml(component.label || component.alt || type);
-        if (!src) return `<div class="muted">${label}: no safe media source.</div>`;
+        if (!src) return `<div class="muted">${label}: безопасный источник медиа не найден.</div>`;
         if (type === 'image') return `<figure class="widget-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(component.alt || label)}"><figcaption>${label}</figcaption></figure>`;
         if (type === 'audio') return `<div class="widget-media"><div>${label}</div><audio controls src="${escapeHtml(src)}"></audio></div>`;
         if (type === 'video') return `<div class="widget-media"><div>${label}</div><video controls src="${escapeHtml(src)}"></video></div>`;
@@ -273,7 +273,7 @@ function renderDataComponent(tab, component, state, status, componentState = {},
     }
     if (type === 'gallery') {
         let items = component.items || getPath(data, component.path || component.items_key || '', []);
-        if (!Array.isArray(items)) return '<div class="muted">No media items.</div>';
+        if (!Array.isArray(items)) return '<div class="muted">Нет медиафайлов.</div>';
         if (component.items_key && component.route_prefix) {
             items = items.map((item) => routePrefixToMediaSpec(
                 component.route_prefix,
@@ -294,18 +294,18 @@ function renderDataComponent(tab, component, state, status, componentState = {},
         const markers = Array.isArray(component.markers) ? component.markers : [];
         const list = markers.length
             ? `<ul class="widget-map-list">${markers.map((m) => `<li><strong>${escapeHtml(m.label || `${m.lat}, ${m.lon}`)}</strong>${m.popup ? ` — ${escapeHtml(m.popup)}` : ''}</li>`).join('')}</ul>`
-            : '<div class="muted">No map markers.</div>';
+            : '<div class="muted">Нет меток на карте.</div>';
         return `<div class="widget-map" data-widget-map-config="${escapeHtml(JSON.stringify({ tiles_url: component.tiles_url, markers }))}">${list}</div>`;
     }
     if (type === 'calendar') {
         const items = Array.isArray(component.items) ? component.items : (Array.isArray(getPath(data, component.path || '', [])) ? getPath(data, component.path || '', []) : []);
-        if (!items.length) return '<div class="muted">No calendar entries.</div>';
+        if (!items.length) return '<div class="muted">Нет записей в календаре.</div>';
         const rows = items.map((item) => `<li class="widget-calendar-row"><strong>${escapeHtml(item.label || '—')}</strong>${item.start ? ` <span class="muted">${escapeHtml(item.start)}${item.end ? ' → ' + escapeHtml(item.end) : ''}</span>` : ''}${item.row ? ` <em>${escapeHtml(item.row)}</em>` : ''}</li>`).join('');
         return `<div class="widget-calendar"><ul class="widget-calendar-list">${rows}</ul></div>`;
     }
     if (type === 'kanban') {
         const columns = Array.isArray(component.columns) ? component.columns : [];
-        if (!columns.length) return '<div class="muted">Kanban has no columns.</div>';
+        if (!columns.length) return '<div class="muted">В канбане нет колонок.</div>';
         const rawMoveRoute = component.on_move?.route || '';
         const moveRoute = cleanExtensionRoute(rawMoveRoute) ? rawMoveRoute : '';
         const cardsByCol = new Map();
@@ -566,13 +566,13 @@ async function mountDeclarativeWidget(mount, tab, render) {
                 const fields = (component.fields || [])
                     .map((field) => renderField(field, formValues[idx] || {}))
                     .join('');
-                return `<form class="widget-form" data-widget-form="${idx}">${component.title ? `<h4>${escapeHtml(component.title)}</h4>` : ''}${fields}<button class="btn btn-primary" type="submit">${escapeHtml(component.submit_label || 'Submit')}</button></form>`;
+                return `<form class="widget-form" data-widget-form="${idx}">${component.title ? `<h4>${escapeHtml(component.title)}</h4>` : ''}${fields}<button class="btn btn-primary" type="submit">${escapeHtml(component.submit_label || 'Отправить')}</button></form>`;
             }
             if (type === 'action') {
-                return `<button class="btn btn-default" data-widget-action="${idx}">${escapeHtml(component.label || 'Run')}</button>`;
+                return `<button class="btn btn-default" data-widget-action="${idx}">${escapeHtml(component.label || 'Запустить')}</button>`;
             }
             if (type === 'poll') {
-                return `<button class="btn btn-default" data-widget-poll="${idx}">${escapeHtml(component.label || 'Start polling')}</button>`;
+                return `<button class="btn btn-default" data-widget-poll="${idx}">${escapeHtml(component.label || 'Начать опрос')}</button>`;
             }
             return renderDataComponent(tab, component, state, status, componentState, String(idx));
         }).join('');
@@ -591,7 +591,7 @@ async function mountDeclarativeWidget(mount, tab, render) {
                     if (spec.job === true || spec.mode === 'job') {
                         const jobId = data.job_id || data.id;
                         if (!jobId) throw new Error('job response missing job_id');
-                        state[target] = { job_id: jobId, message: data.message || 'Job started.' };
+                        state[target] = { job_id: jobId, message: data.message || 'Задача запущена.' };
                         status[target] = 'loading';
                         startJobPoll(Number(form.dataset.widgetForm), jobId);
                     } else {
@@ -617,7 +617,7 @@ async function mountDeclarativeWidget(mount, tab, render) {
                     if (spec.job === true || spec.mode === 'job') {
                         const jobId = data.job_id || data.id;
                         if (!jobId) throw new Error('job response missing job_id');
-                        state[target] = { job_id: jobId, message: data.message || 'Job started.' };
+                        state[target] = { job_id: jobId, message: data.message || 'Задача запущена.' };
                         status[target] = 'loading';
                         startJobPoll(Number(button.dataset.widgetAction), jobId);
                     } else {
@@ -790,7 +790,7 @@ async function mountTab(card, tab) {
         const resp = await apiFetch(entryUrl, { cache: 'no-store' });
         const moduleSource = await resp.text();
         if (!resp.ok) {
-            mount.innerHTML = `<div class="skills-load-error">module load failed: ${escapeHtml(moduleSource || `HTTP ${resp.status}`)}</div>`;
+            mount.innerHTML = `<div class="skills-load-error">не удалось загрузить модуль: ${escapeHtml(moduleSource || `HTTP ${resp.status}`)}</div>`;
             return;
         }
         const expectedPrefix = extensionRoutePrefix(tab.skill);
@@ -883,7 +883,7 @@ async function mountTab(card, tab) {
         window.addEventListener('message', onMessage);
         return () => window.removeEventListener('message', onMessage);
     }
-    mount.innerHTML = `<div class="muted">Widget render kind <code>${escapeHtml(render.kind || 'unknown')}</code> is not supported yet.</div>`;
+    mount.innerHTML = `<div class="muted">Тип отрисовки виджета <code>${escapeHtml(render.kind || 'unknown')}</code> пока не поддерживается.</div>`;
     return null;
 }
 
@@ -985,7 +985,7 @@ export function initWidgets(ctx = {}) {
                     applyWidgetsLayout(list);
                 } catch (err) {
                     const mount = card.querySelector('[data-widget-mount]');
-                    if (mount) mount.innerHTML = `<div class="skills-load-error">widget failed: ${escapeHtml(err.message || err)}</div>`;
+                    if (mount) mount.innerHTML = `<div class="skills-load-error">ошибка виджета: ${escapeHtml(err.message || err)}</div>`;
                     applyWidgetsLayout(list);
                 }
             }
@@ -995,7 +995,7 @@ export function initWidgets(ctx = {}) {
             if (!widgetsVisible || generation !== renderGeneration) return;
             // Preserve cached widgets on transient fetch errors.
             if (!lastTabs) {
-                list.innerHTML = `<div class="skills-load-error">Failed to load widgets: ${escapeHtml(err.message || err)}</div>`;
+                list.innerHTML = `<div class="skills-load-error">Не удалось загрузить виджеты: ${escapeHtml(err.message || err)}</div>`;
             }
             widgetsMounted = false;
         } finally {

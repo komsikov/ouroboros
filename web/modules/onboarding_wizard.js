@@ -345,7 +345,7 @@
             return apiRequest('/api/claude-code/status', { cache: 'no-store' });
         }
         if (!window.pywebview?.api?.claude_code_status) {
-            throw new Error('Desktop Claude Code bridge is unavailable.');
+            throw new Error('Десктоп-мост Claude Code недоступен.');
         }
         return window.pywebview.api.claude_code_status();
     }
@@ -355,7 +355,7 @@
             return apiRequest('/api/claude-code/install', { method: 'POST' });
         }
         if (!window.pywebview?.api?.install_claude_code) {
-            throw new Error('Desktop Claude Code install bridge is unavailable.');
+            throw new Error('Десктоп-мост установки Claude Code недоступен.');
         }
         return window.pywebview.api.install_claude_code();
     }
@@ -1130,7 +1130,7 @@
             return 'ok';
         }
         if (!window.pywebview?.api?.save_wizard) {
-            throw new Error('Desktop onboarding bridge is unavailable.');
+            throw new Error('Десктоп-мост онбординга недоступен.');
         }
         const result = await window.pywebview.api.save_wizard(payload);
         if (result !== 'ok') throw new Error(result || 'Не удалось сохранить настройки онбординга.');

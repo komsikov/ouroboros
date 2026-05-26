@@ -67,10 +67,10 @@ export function initUpdates({ mount, state }) {
 
     function divergenceText(data) {
         const parts = [];
-        if (data.behind) parts.push(`${data.behind} incoming`);
-        if (data.ahead) parts.push(`${data.ahead} local`);
-        if (data.dirty_count) parts.push(`${data.dirty_count} dirty`);
-        return parts.join(' / ') || 'clean';
+        if (data.behind) parts.push(`${data.behind} входящих`);
+        if (data.ahead) parts.push(`${data.ahead} локальных`);
+        if (data.dirty_count) parts.push(`${data.dirty_count} изменено`);
+        return parts.join(' / ') || 'чисто';
     }
 
     function renderStatus(data) {
@@ -98,11 +98,11 @@ export function initUpdates({ mount, state }) {
             setBadge('offline', 'Не проверялось');
             return;
         }
-        const currentVersion = data.current_version || 'unknown';
-        const latestVersion = data.latest_version || 'unknown';
+        const currentVersion = data.current_version || 'неизвестно';
+        const latestVersion = data.latest_version || 'неизвестно';
         const currentSha = data.current_short_sha || '?';
         const latestSha = data.latest_short_sha || '?';
-        const latestMsg = data.latest_message || 'No remote message.';
+        const latestMsg = data.latest_message || 'Сообщение удалённого репозитория отсутствует.';
         const canUpdate = Boolean(data.available);
         const safe = Boolean(data.safe_to_apply);
         summary.textContent = canUpdate
@@ -174,9 +174,9 @@ export function initUpdates({ mount, state }) {
     async function loadVersions() {
         try {
             const resp = await apiFetch('/api/git/log', { cache: 'no-store' });
-            if (!resp.ok) throw new Error('Git log API error ' + resp.status);
+            if (!resp.ok) throw new Error('Ошибка API git log ' + resp.status);
             const data = await resp.json();
-            current.textContent = `Branch: ${data.branch || '?'} @ ${data.sha || '?'}`;
+            current.textContent = `Ветка: ${data.branch || '?'} @ ${data.sha || '?'}`;
             commitsDiv.innerHTML = '';
             (data.commits || []).forEach((commit) => {
                 commitsDiv.appendChild(renderVersionRow(commit, commit.short_sha || commit.sha?.slice(0, 8), commit.sha));
@@ -188,7 +188,7 @@ export function initUpdates({ mount, state }) {
             });
             if (!data.tags?.length) tagsDiv.innerHTML = '<div class="evo-empty">Теги не найдены</div>';
         } catch (err) {
-            const msg = `<div class="evo-empty evo-empty-error">Failed to load: ${escapeHtml(err.message || err)}</div>`;
+            const msg = `<div class="evo-empty evo-empty-error">Не удалось загрузить: ${escapeHtml(err.message || err)}</div>`;
             commitsDiv.innerHTML = msg;
             tagsDiv.innerHTML = msg;
             current.textContent = 'Ветка: неизвестна';
@@ -258,10 +258,10 @@ export function initUpdates({ mount, state }) {
             if (data.status === 'ok') {
                 showToast(data.message, 'success');
             } else {
-                showToast('Error: ' + (data.error || 'unknown'), 'error');
+                showToast('Ошибка: ' + (data.error || 'неизвестная ошибка'), 'error');
             }
         } catch (err) {
-            showToast('Failed: ' + (err.message || err), 'error');
+            showToast('Не удалось: ' + (err.message || err), 'error');
         }
     });
 

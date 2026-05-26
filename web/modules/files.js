@@ -209,7 +209,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         textarea.className = 'files-editor';
         textarea.value = content || '';
         textarea.spellcheck = false;
-        textarea.placeholder = options.isNew ? 'Start typing file contents...' : '';
+        textarea.placeholder = options.isNew ? 'Введите содержимое файла...' : '';
         textarea.addEventListener('input', () => {
             state.editorValue = textarea.value;
             state.editorDirty = state.editorValue !== state.editorOriginal || state.editorFilename !== state.editorOriginalFilename;
@@ -225,7 +225,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         return wrapper;
     }
 
-    async function showModal({ title, message, input = false, initialValue = '', confirmLabel = 'OK', cancelLabel = 'Cancel' }) {
+    async function showModal({ title, message, input = false, initialValue = '', confirmLabel = 'OK', cancelLabel = 'Отмена' }) {
         const result = await openConfirmDialog({
             title,
             body: message,
@@ -488,7 +488,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
             setPreview({
                 path,
                 meta: openExternal ? 'Открыто снаружи' : 'Скачано',
-                content: `${filename} saved to ${result.path || 'Downloads'}.`,
+                content: `${filename} сохранён в ${result.path || 'Загрузки'}.`,
             });
             return;
         }

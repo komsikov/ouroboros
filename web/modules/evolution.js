@@ -13,7 +13,7 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
         : `
         <div class="page-header">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-            <h2>Evolution</h2>
+            <h2>Эволюция</h2>
             <div class="spacer"></div>
             <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
             <span id="evo-status" class="status-badge">Загрузка...</span>
@@ -21,8 +21,8 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
     const inlineEvoControls = embedded
         ? `
                     <div class="evo-runtime-pills evo-runtime-controls">
-                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Refresh</button>
-                        <span id="evo-status" class="status-badge">Loading...</span>
+                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
+                        <span id="evo-status" class="status-badge">Загрузка...</span>
                     </div>`
         : '';
     page.innerHTML = `
@@ -34,12 +34,12 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
                         <div id="evo-runtime-detail" class="evo-runtime-detail">Загрузка состояния эволюции и сознания...</div>
                     </div>
                     <div class="evo-runtime-pills">
-                        <span id="evo-mode-pill" class="evo-runtime-pill">Evolution</span>
-                        <span id="evo-bg-pill" class="evo-runtime-pill">Consciousness</span>
+                        <span id="evo-mode-pill" class="evo-runtime-pill">Эволюция</span>
+                        <span id="evo-bg-pill" class="evo-runtime-pill">Сознание</span>
                     </div>
                     <div class="evo-runtime-pills evo-runtime-controls">
-                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Refresh</button>
-                        <span id="evo-status" class="status-badge">Loading...</span>
+                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
+                        <span id="evo-status" class="status-badge">Загрузка...</span>
                     </div>
                 </div>
                 <div id="evo-runtime-meta" class="evo-runtime-meta"></div>
@@ -81,12 +81,12 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
         memory_kb:  '#fb7185',
     };
     const LABELS = {
-        code_lines: 'Code (lines)',
-        bible_kb:   'BIBLE.md (KB)',
-        system_kb:  'SYSTEM.md (KB)',
-        identity_kb:'identity.md (KB)',
-        scratchpad_kb: 'Scratchpad (KB)',
-        memory_kb:  'Memory (KB)',
+        code_lines: 'Код (строки)',
+        bible_kb:   'BIBLE.md (КБ)',
+        system_kb:  'SYSTEM.md (КБ)',
+        identity_kb:'identity.md (КБ)',
+        scratchpad_kb: 'Scratchpad (КБ)',
+        memory_kb:  'Memory (КБ)',
     };
 
     function setBadge(kind, text) {
@@ -140,14 +140,14 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
         const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled ? 'running' : 'disabled');
 
         evolutionPill.className = `evo-runtime-pill ${pillTone(evolutionStatus)}`;
-        evolutionPill.textContent = `Эволюция: ${shortStatusLabel(evolutionStatus, 'off')}`;
+        evolutionPill.textContent = `Эволюция: ${shortStatusLabel(evolutionStatus, 'выкл')}`;
 
         consciousnessPill.className = `evo-runtime-pill ${pillTone(consciousnessStatus)}`;
-        consciousnessPill.textContent = `Сознание: ${shortStatusLabel(consciousnessStatus, 'off')}`;
+        consciousnessPill.textContent = `Сознание: ${shortStatusLabel(consciousnessStatus, 'выкл')}`;
 
         const lines = [];
         if (evolution.detail) lines.push(evolution.detail);
-        if (consciousness.detail) lines.push(`Consciousness: ${consciousness.detail}`);
+        if (consciousness.detail) lines.push(`Сознание: ${consciousness.detail}`);
         runtimeDetail.textContent = lines.filter(Boolean).join(' ');
 
         runtimeMeta.innerHTML = [
@@ -181,8 +181,8 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
                 apiFetch('/api/state', { cache: 'no-store' }),
                 apiFetch(`/api/evolution-data${suffix}`, { cache: 'no-store' }),
             ]);
-            if (!stateResp.ok) throw new Error('State API error ' + stateResp.status);
-            if (!evoResp.ok) throw new Error('Evolution API error ' + evoResp.status);
+            if (!stateResp.ok) throw new Error('Ошибка API состояния ' + stateResp.status);
+            if (!evoResp.ok) throw new Error('Ошибка API эволюции ' + evoResp.status);
             const runtime = await stateResp.json();
             const data = await evoResp.json();
             if (requestId !== loadSequence) return;
@@ -271,8 +271,8 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
                                 const val = ctx.parsed.y;
                                 if (val === null || val === undefined) return null;
                                 const key = Object.keys(COLORS)[ctx.datasetIndex];
-                                if (key === 'code_lines') return ' ' + ctx.dataset.label + ': ' + val.toLocaleString() + ' lines';
-                                return ' ' + ctx.dataset.label + ': ' + val.toFixed(1) + ' KB';
+                                if (key === 'code_lines') return ' ' + ctx.dataset.label + ': ' + val.toLocaleString() + ' строк';
+                                return ' ' + ctx.dataset.label + ': ' + val.toFixed(1) + ' КБ';
                             },
                         },
                     },
@@ -285,14 +285,14 @@ export function initEvolution({ ws, state, mount = null, embedded = false, chart
                     y: {
                         type: 'linear',
                         position: 'left',
-                        title: { display: true, text: 'Lines of Code', color: '#60a5fa', font: { size: 11 } },
+                        title: { display: true, text: 'Строки кода', color: '#60a5fa', font: { size: 11 } },
                         ticks: { color: '#60a5fa', font: { size: 10 } },
                         grid: { color: '#1e293b' },
                     },
                     y1: {
                         type: 'linear',
                         position: 'right',
-                        title: { display: true, text: 'Size (KB)', color: '#94a3b8', font: { size: 11 } },
+                        title: { display: true, text: 'Размер (КБ)', color: '#94a3b8', font: { size: 11 } },
                         ticks: { color: '#94a3b8', font: { size: 10 } },
                         grid: { drawOnChartArea: false },
                     },

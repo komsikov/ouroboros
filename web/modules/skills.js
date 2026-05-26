@@ -120,19 +120,19 @@ function skillSourceChip(skill) {
     const labelMap = {
         clawhub: { label: 'ClawHub', tone: 'warn' },
         ouroboroshub: { label: 'OuroborosHub', tone: 'ok' },
-        self_authored: { label: 'Authored', tone: 'ok' },
-        external: { label: 'External', tone: 'muted' },
-        user_repo: { label: 'User repo', tone: 'muted' },
+        self_authored: { label: 'Своё', tone: 'ok' },
+        external: { label: 'Внешний', tone: 'muted' },
+        user_repo: { label: 'Репозиторий', tone: 'muted' },
     };
     const entry = labelMap[source] || { label: source, tone: 'muted' };
-    return `<span class="skills-source-chip skills-source-${entry.tone}" title="Source: ${escapeHtml(entry.label)}">${escapeHtml(entry.label)}</span>`;
+    return `<span class="skills-source-chip skills-source-${entry.tone}" title="Источник: ${escapeHtml(entry.label)}">${escapeHtml(entry.label)}</span>`;
 }
 
 function renderReviewFindings(skill) {
     const findings = Array.isArray(skill.review_findings) ? skill.review_findings : [];
     if (!findings.length) return '';
     const rows = findings.map((finding) => {
-        const item = finding.item || finding.check || finding.title || 'finding';
+        const item = finding.item || finding.check || finding.title || 'замечание';
         const verdict = finding.verdict || finding.severity || '';
         const reason = finding.reason || finding.message || JSON.stringify(finding);
         return `<li><strong>${escapeHtml(verdict)}</strong> ${escapeHtml(item)}: ${escapeHtml(reason)}</li>`;
@@ -208,18 +208,18 @@ function extensionLiveBadge(skill) {
     if (skill.type !== 'extension') return '';
     const pendingUiTabs = Array.isArray(skill.ui_tabs_pending) ? skill.ui_tabs_pending : [];
     if (pendingUiTabs.length && !skill.dispatch_live) {
-        return '<span class="skills-badge skills-badge-warn">ui tab pending</span>';
+        return '<span class="skills-badge skills-badge-warn">вкладка ожидает</span>';
     }
     if (skill.live_loaded && skill.dispatch_live) {
-        return '<span class="skills-badge skills-badge-ok">live</span>';
+        return '<span class="skills-badge skills-badge-ok">активно</span>';
     }
     if (skill.live_loaded) {
-        return '<span class="skills-badge skills-badge-muted">loaded</span>';
+        return '<span class="skills-badge skills-badge-muted">загружен</span>';
     }
     if (skill.desired_live) {
-        return '<span class="skills-badge skills-badge-warn">catalog only</span>';
+        return '<span class="skills-badge skills-badge-warn">только в каталоге</span>';
     }
-    return '<span class="skills-badge skills-badge-muted">not live</span>';
+    return '<span class="skills-badge skills-badge-muted">не активен</span>';
 }
 
 
@@ -227,12 +227,12 @@ function extensionLiveNote(skill) {
     if (skill.type !== 'extension') return '';
     const pendingUiTabs = Array.isArray(skill.ui_tabs_pending) ? skill.ui_tabs_pending : [];
     if (pendingUiTabs.length && !skill.dispatch_live) {
-        return '<div class="muted">extension runtime: ui tab declared, but the browser host does not ship extension tabs yet</div>';
+        return '<div class="muted">среда расширения: вкладка UI объявлена, но браузерный хост её пока не отображает</div>';
     }
     const reason = escapeHtml(skill.live_reason || 'catalog_only');
     const prefix = skill.live_loaded && skill.dispatch_live
-        ? 'extension runtime: live'
-        : (skill.live_loaded ? 'extension runtime: loaded' : 'extension runtime');
+        ? 'среда расширения: активна'
+        : (skill.live_loaded ? 'среда расширения: загружена' : 'среда расширения');
     return `<div class="muted">${prefix}${skill.live_loaded && skill.dispatch_live ? '' : ` (${reason})`}</div>`;
 }
 
@@ -247,14 +247,14 @@ function renderProvenanceBlock(prov) {
         rows.push(`<span>sha256: <code>${escapeHtml(String(prov.sha256).slice(0, 12))}…</code></span>`);
     }
     if (prov.license) {
-        rows.push(`<span>license: ${escapeHtml(prov.license)}</span>`);
+        rows.push(`<span>лицензия: ${escapeHtml(prov.license)}</span>`);
     }
     const homepageHref = safeExternalUrl(prov.homepage);
     if (homepageHref) {
-        rows.push(`<a href="${homepageHref}" target="_blank" rel="noopener noreferrer">homepage</a>`);
+        rows.push(`<a href="${homepageHref}" target="_blank" rel="noopener noreferrer">сайт</a>`);
     }
     if (prov.registry_url) {
-        rows.push(`<span>registry: <code>${escapeHtml(prov.registry_url)}</code></span>`);
+        rows.push(`<span>реестр: <code>${escapeHtml(prov.registry_url)}</code></span>`);
     }
     const meta = rows.length ? `<div class="skills-card-provenance muted">${rows.join(' · ')}</div>` : '';
     const warnings = Array.isArray(prov.adapter_warnings) ? prov.adapter_warnings : [];
@@ -304,13 +304,13 @@ function toggleLockReason(skill) {
     // keeps stale/review/repair work as explicit actions instead of hiding them
     // behind the toggle.
     if (skill?.review_gate && skill.review_gate.executable_review === false) {
-        return skill.review_gate.summary || skill.review_gate.blocking_reason || 'review has not produced an executable verdict yet';
+        return skill.review_gate.summary || skill.review_gate.blocking_reason || 'проверка ещё не вынесла исполнимый вердикт';
     }
-    if (skill.review_status === 'blockers' && !reviewReady(skill)) return 'review has blocker findings — repair the skill first';
-    if (skill.review_stale) return 'review is stale — re-review the skill first';
-    if (skill.review_status === 'pending') return 'review is still pending';
-    if (!reviewReady(skill)) return 'review has not produced an executable verdict yet';
-    if (skill.load_error && !isMissingGrantLoadError(skill)) return 'load error — repair the skill first';
+    if (skill.review_status === 'blockers' && !reviewReady(skill)) return 'проверка нашла блокирующие замечания — сначала восстановите навык';
+    if (skill.review_stale) return 'проверка устарела — сначала перепроверьте навык';
+    if (skill.review_status === 'pending') return 'проверка ещё не выполнена';
+    if (!reviewReady(skill)) return 'проверка ещё не вынесла исполнимый вердикт';
+    if (skill.load_error && !isMissingGrantLoadError(skill)) return 'ошибка загрузки — сначала восстановите навык';
     return '';
 }
 
@@ -400,7 +400,7 @@ function renderSkillCard(skill, reviewingSkills = new Set(), repairingSkills = n
     // name and ``role="switch"`` so AT users hear "weather, on, switch"
     // instead of the awkward "Disable weather, checked, checkbox".
     const toggleAriaLabel = toggleLocked
-        ? `${skill.name} (locked: ${lockReason})`
+        ? `${skill.name} (заблокировано: ${lockReason})`
         : skill.name;
 
     const status = skillStatusChip(skill, live);
@@ -455,10 +455,10 @@ function renderSkillCard(skill, reviewingSkills = new Set(), repairingSkills = n
     const source = (skill.source || 'native').toLowerCase();
     const sourceLabel = source === 'clawhub' ? 'ClawHub'
         : source === 'ouroboroshub' ? 'OuroborosHub'
-        : source === 'self_authored' ? 'Authored'
-        : source === 'native' ? 'Built-in'
-        : source === 'external' ? 'External'
-        : source === 'user_repo' ? 'User repo'
+        : source === 'self_authored' ? 'Своё'
+        : source === 'native' ? 'Встроенный'
+        : source === 'external' ? 'Внешний'
+        : source === 'user_repo' ? 'Репозиторий пользователя'
         : source;
 
     const isMarketplaceManaged = source === 'clawhub' || source === 'ouroboroshub';
@@ -525,7 +525,7 @@ function renderSkillCard(skill, reviewingSkills = new Set(), repairingSkills = n
         </div>
         <div class="skills-detail-row">
             <span class="skills-detail-label">Проверка</span>
-            ${statusBadge(skill.review_status, skill.review_gate)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">stale</span>' : ''}
+            ${statusBadge(skill.review_status, skill.review_gate)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">устарела</span>' : ''}
         </div>
         <div class="skills-detail-row">
             <span class="skills-detail-label">Разрешения</span>
@@ -621,7 +621,7 @@ function mergeLifecycleEvents(skills, events) {
         names.add(name);
         out.unshift({
             name,
-            description: event.message || event.error || 'Skill lifecycle operation',
+            description: event.message || event.error || 'Операция жизненного цикла навыка',
             version: '—',
             type: 'skill',
             enabled: false,
@@ -817,13 +817,13 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             body: `Предоставить ${name} доступ к этим ключам и разрешениям?\n\n${cleanItems.join('\n')}\n\nВыдавайте доступ только проверенным навыкам, которым вы доверяете.`,
             confirmLabel: 'Предоставить доступ',
         });
-        if (!ok) throw new Error('Skill grant cancelled.');
+        if (!ok) throw new Error('Выдача доступа отменена.');
         const bridge = window.pywebview?.api?.request_skill_key_grant;
         const result = bridge
             ? await bridge(name, cleanItems)
             : await apiClient.skillGrants(name, cleanItems);
         if (!result?.ok) {
-            throw new Error(result?.error || 'Skill grant was cancelled.');
+            throw new Error(result?.error || 'Выдача доступа отменена.');
         }
         return result;
     }
@@ -836,20 +836,20 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         }
         const { skills } = await fetchSkills();
         const skill = (skills || []).find((item) => item.name === name);
-        if (!skill) throw new Error('Skill not found in current catalogue.');
+        if (!skill) throw new Error('Навык не найден в текущем каталоге.');
 
         if (action === 'retry_install') {
-            showToast(`${name}: retrying ClawHub install (this may take ~30s)`, 'muted');
+            showToast(`${name}: повторная установка из ClawHub (может занять ~30 сек.)`, 'muted');
             const result = await postWithFeedback('/api/marketplace/clawhub/install', {
                 slug: name,
                 overwrite: true,
                 auto_review: true,
             });
-            const tail = result.review_status ? ` — review ${result.review_status}` : '';
+            const tail = result.review_status ? ` — проверка ${result.review_status}` : '';
             showToast(
                 result.ok
-                    ? `${name}: install retried${tail}`
-                    : `${name}: install retry failed — ${result.error || 'unknown'}`,
+                    ? `${name}: установка повторена${tail}`
+                    : `${name}: повторная установка не удалась — ${result.error || 'неизвестная ошибка'}`,
                 result.ok ? 'ok' : 'danger',
             );
             if (result.ok) emitSkillLifecycle('retry_install', name, result);
@@ -875,7 +875,7 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             const missing = keys.length ? keys : [...missingKeys, ...missingPermissions];
             const result = await requestMissingKeyGrants(name, missing);
             if (result) {
-                showToast(`${name}: requested grants saved`, 'ok');
+                showToast(`${name}: запрошенные доступы сохранены`, 'ok');
                 emitSkillLifecycle('grant', name, result);
             }
             return;
@@ -894,7 +894,7 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
 
         if (action === 'repair') {
             if (repairingSkills.has(name)) {
-                showToast(`${name}: repair is already being queued`, 'muted');
+                showToast(`${name}: восстановление уже ставится в очередь`, 'muted');
                 return;
             }
             const ok = await openConfirmDialog({
@@ -911,10 +911,10 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 await postWithFeedback('/api/command', {
                     cmd: prompt,
                     task_constraint: { mode: 'skill_repair', skill_name: skill.name || name, payload_root: skill.payload_root || '', allow_enable: false, allow_review: true },
-                    visible_text: `Repair task queued for ${name}. Ouroboros will inspect the skill payload and re-run review.`,
+                    visible_text: `Задача восстановления поставлена в очередь для ${name}. Ouroboros проверит навык и повторит проверку безопасности.`,
                     visible_task_id: `skill_repair_${name}`,
                 });
-                showToast(`${name}: repair task sent to Ouroboros`, 'ok');
+                showToast(`${name}: задача восстановления отправлена в Ouroboros`, 'ok');
                 emitSkillLifecycle('repair', name);
                 if (typeof ctx.showPage === 'function') {
                     ctx.showPage('chat');
@@ -939,10 +939,10 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             const message = `Submit skill ${name} to OuroborosHub`;
             await postWithFeedback('/api/command', {
                 cmd: message,
-                visible_text: `Submission task queued for ${name}. Ouroboros will open a PR to OuroborosHub if validation passes.`,
+                visible_text: `Задача отправки поставлена в очередь для ${name}. При успешной валидации Ouroboros откроет PR в OuroborosHub.`,
                 visible_task_id: `skill_submit_${name}`,
             });
-            showToast(`${name}: submission task sent to Ouroboros`, 'ok');
+            showToast(`${name}: задача отправки передана в Ouroboros`, 'ok');
             emitSkillLifecycle('submit_hub', name);
             if (typeof ctx.showPage === 'function') {
                 ctx.showPage('chat');
@@ -958,15 +958,15 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             { enabled: wantsEnabled }
         );
         const actionLabels = {
-            extension_loaded: 'live',
-            extension_unloaded: 'stopped',
+            extension_loaded: 'активно',
+            extension_unloaded: 'остановлено',
             extension_already_live: '',
             extension_inactive: '',
-            extension_load_error: 'load failed',
+            extension_load_error: 'ошибка загрузки',
         };
         const friendlyAction = actionLabels[result.extension_action];
         const tail = friendlyAction ? ` — ${friendlyAction}` : '';
-        showToast(`${name} ${wantsEnabled ? 'turned on' : 'turned off'}${tail}`, 'ok');
+        showToast(`${name} ${wantsEnabled ? 'включён' : 'выключен'}${tail}`, 'ok');
         emitSkillLifecycle(wantsEnabled ? 'enable' : 'disable', name, result);
         return result;
     }
@@ -976,15 +976,16 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         reviewingSkills.add(name);
         renderFn();
         try {
-            showToast(`${name}: security review started; this can take a few minutes`, 'muted');
+            showToast(`${name}: запущена проверка безопасности — это может занять несколько минут`, 'muted');
             const result = await postWithFeedback(
                 `/api/skills/${encodeURIComponent(name)}/review`,
                 {}
             );
             const findings = result.findings?.length ?? 0;
             const errorTail = result.error ? ` — ${result.error}` : '';
+            const findingsNoun = findings === 1 ? 'замечание' : (findings < 5 ? 'замечания' : 'замечаний');
             showToast(
-                `${name}: review ${result.status}${findings ? ` (${findings} findings)` : ''}${errorTail}`,
+                `${name}: проверка ${result.status}${findings ? ` (${findings} ${findingsNoun})` : ''}${errorTail}`,
                 reviewTone(result.status, result.error)
             );
             emitSkillLifecycle('review', name, result);
@@ -1008,12 +1009,12 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         try {
             if (wantsEnabled) {
                 let current = (await fetchSkills()).skills.find((skill) => skill.name === name);
-                if (!current) throw new Error('Skill not found in current catalogue.');
+                if (!current) throw new Error('Навык не найден в текущем каталоге.');
                 if ((current.review_status === 'blockers' && !reviewReady(current)) || (current.load_error && !isMissingGrantLoadError(current))) {
-                    throw new Error('Repair this skill before enabling it.');
+                    throw new Error('Сначала восстановите этот навык, прежде чем включать его.');
                 }
                 if (!reviewReady(current)) {
-                    throw new Error('Run review and wait for a fresh executable review before enabling this skill.');
+                    throw new Error('Запустите проверку и дождитесь свежего исполнимого вердикта перед включением.');
                 }
                 if (!grantReady(current)) {
                     const grants = current.grants || {};
@@ -1107,7 +1108,7 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             } else if (target.classList.contains('skills-grant')) {
                 const keys = (target.dataset.keys || '').split(',').map((k) => k.trim()).filter(Boolean);
                 if (!keys.length) {
-                    showToast(`${name}: no requested keys or permissions to grant`, 'warn');
+                    showToast(`${name}: нет запрошенных ключей или разрешений для выдачи`, 'warn');
                 } else {
                     const result = await requestMissingKeyGrants(name, keys);
                     // Grant may persist even if live extension reconcile fails.
@@ -1116,38 +1117,38 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                     const loadError = result.load_error;
                     if (reason === 'reconcile_call_failed') {
                         showToast(
-                            `${name}: grant saved, but server reconcile failed \u2014 toggle disable/enable to retry`,
+                            `${name}: \u0434\u043e\u0441\u0442\u0443\u043f \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d, \u043d\u043e \u0441\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u044f \u0441\u0435\u0440\u0432\u0435\u0440\u0430 \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c \u2014 \u0432\u044b\u043a\u043b\u044e\u0447\u0438\u0442\u0435/\u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u0434\u043b\u044f \u043f\u043e\u0432\u0442\u043e\u0440\u0430`,
                             'warn'
                         );
                     } else if (loadError) {
                         showToast(
-                            `${name}: grant saved, but extension load failed: ${loadError}`,
+                            `${name}: доступ сохранён, но расширение не загрузилось: ${loadError}`,
                             'warn'
                         );
                     } else if (action === 'extension_loaded') {
-                        showToast(`${name}: grant saved and extension loaded`, 'ok');
+                        showToast(`${name}: доступ сохранён, расширение загружено`, 'ok');
                     } else {
-                        showToast(`${name}: requested grants saved`, 'ok');
+                        showToast(`${name}: запрошенные доступы сохранены`, 'ok');
                     }
                 }
             } else if (target.classList.contains('skills-update')) {
                 const source = target.dataset.source === 'ouroboroshub' ? 'ouroboroshub' : 'clawhub';
-                showToast(`${name}: updating from ${source === 'ouroboroshub' ? 'OuroborosHub' : 'ClawHub'} (this may take ~30s)`, 'muted');
+                showToast(`${name}: обновление из ${source === 'ouroboroshub' ? 'OuroborosHub' : 'ClawHub'} (может занять ~30 сек.)`, 'muted');
                 const url = source === 'ouroboroshub'
                     ? `/api/marketplace/ouroboroshub/install`
                     : `/api/marketplace/clawhub/update/${encodeURIComponent(name)}`;
                 const body = source === 'ouroboroshub' ? { slug: name, overwrite: true, auto_review: true } : {};
                 const result = await postWithFeedback(url, body);
-                const tail = result.review_status ? ` — review ${result.review_status}` : '';
+                const tail = result.review_status ? ` — проверка ${result.review_status}` : '';
                 showToast(
                     result.ok
-                        ? `${name}: updated${tail}`
-                        : `${name}: update failed — ${result.error || 'unknown'}`,
+                        ? `${name}: обновлено${tail}`
+                        : `${name}: обновление не удалось — ${result.error || 'неизвестная ошибка'}`,
                     result.ok ? 'ok' : 'danger',
                 );
             } else if (target.classList.contains('skills-submit-hub')) {
                 if (target.dataset.submitDisabled === 'true') {
-                    showToast(`${name}: submit disabled — ${target.dataset.submitReason || 'unknown reason'}`, 'warn');
+                    showToast(`${name}: отправка отключена — ${target.dataset.submitReason || 'неизвестная причина'}`, 'warn');
                     return;
                 }
                 await triggerSkillAction(name, 'submit_hub');
@@ -1167,16 +1168,16 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                     : `/api/marketplace/clawhub/uninstall/${encodeURIComponent(name)}`;
                 const result = await postWithFeedback(url, {});
                 showToast(
-                    result.ok ? `${name}: uninstalled` : `${name}: uninstall failed — ${result.error}`,
+                    result.ok ? `${name}: удалён` : `${name}: удаление не удалось — ${result.error}`,
                     result.ok ? 'ok' : 'danger',
                 );
                 if (result.ok) emitSkillLifecycle('uninstall', name, result);
             } else if (target.classList.contains('skills-delete-local')) {
                 const payloadRoot = target.dataset.payloadRoot || `skills/external/${name}`;
                 const ok = await openConfirmDialog({
-                    title: `Delete ${name}`,
-                    body: `Delete ${name}? This deletes data/${payloadRoot}/ and data/state/skills/${name}/.`,
-                    confirmLabel: 'Delete',
+                    title: `Удалить ${name}`,
+                    body: `Удалить ${name}? Будут удалены data/${payloadRoot}/ и data/state/skills/${name}/.`,
+                    confirmLabel: 'Удалить',
                     danger: true,
                 });
                 if (!ok) {
@@ -1184,7 +1185,7 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 }
                 const result = await apiClient.deleteSkill(name, payloadRoot);
                 showToast(
-                    result.ok ? `${name}: deleted` : `${name}: delete failed — ${result.error}`,
+                    result.ok ? `${name}: удалён` : `${name}: удаление не удалось — ${result.error}`,
                     result.ok ? 'ok' : 'danger',
                 );
                 if (result.ok) emitSkillLifecycle('delete', name, result);
@@ -1243,7 +1244,7 @@ async function renderMarketplacePane() {
         pane.dataset.bootstrapped = 'true';
     } catch (err) {
         pane.dataset.bootstrapped = '';
-        pane.innerHTML = `<div class="skills-load-error">Failed to load marketplace UI: ${escapeHtml(err.message || err)}</div>`;
+        pane.innerHTML = `<div class="skills-load-error">Не удалось загрузить интерфейс маркетплейса: ${escapeHtml(err.message || err)}</div>`;
         throw err;
     }
 }
@@ -1264,7 +1265,7 @@ async function renderOuroborosHubPane() {
         pane.dataset.bootstrapped = 'true';
     } catch (err) {
         pane.dataset.bootstrapped = '';
-        pane.innerHTML = `<div class="skills-load-error">Failed to load OuroborosHub UI: ${escapeHtml(err.message || err)}</div>`;
+        pane.innerHTML = `<div class="skills-load-error">Не удалось загрузить интерфейс OuroborosHub: ${escapeHtml(err.message || err)}</div>`;
         throw err;
     }
 }
@@ -1292,7 +1293,7 @@ export function initSkills(ctx) {
                 new Promise((resolve) => setTimeout(resolve, 250)),
             ]);
         } catch (err) {
-            container.innerHTML = `<div class="skills-load-error">Failed to render skills: ${escapeHtml(err.message || err)}</div>`;
+            container.innerHTML = `<div class="skills-load-error">Не удалось отобразить навыки: ${escapeHtml(err.message || err)}</div>`;
             console.warn('skills: render failed', err);
         } finally {
             refreshBtn.disabled = false;
@@ -1310,11 +1311,11 @@ export function initSkills(ctx) {
             activateTab(tabName);
             if (tabName === 'marketplace') {
                 renderMarketplacePane().catch((err) => {
-                    showToast(`ClawHub failed: ${err.message || err}`, 'danger');
+                    showToast(`ClawHub не удалось загрузить: ${err.message || err}`, 'danger');
                 });
             } else if (tabName === 'ouroboroshub') {
                 renderOuroborosHubPane().catch((err) => {
-                    showToast(`OuroborosHub failed: ${err.message || err}`, 'danger');
+                    showToast(`OuroborosHub не удалось загрузить: ${err.message || err}`, 'danger');
                 });
             }
         });

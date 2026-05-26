@@ -65,11 +65,11 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                         <img class="chat-action-trigger-icon" src="/static/icons/settings-cog.svg" alt="">
                     </button>
                     <div class="chat-header-actions chat-action-dropdown" id="chat-header-actions" role="menu">
-                        <button class="chat-header-btn" type="button" data-chat-command="evolve" role="menuitem" title="Toggle evolution mode"><span class="chat-action-switch" aria-hidden="true"></span><span>Эволюция</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="review" role="menuitem" title="Run review now"><span class="chat-action-switch" aria-hidden="true"></span><span>Ревью кода</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="bg" role="menuitem" title="Toggle background consciousness"><span class="chat-action-switch" aria-hidden="true"></span><span>Фоновое сознание</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="restart" role="menuitem" title="Restart agent"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/restart.svg" alt=""></span><span>Перезапустить чат</span></button>
-                        <button class="chat-header-btn danger" type="button" data-chat-command="panic" role="menuitem" title="Stop all workers"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/power.svg" alt=""></span><span>Экстренное отключение</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="evolve" role="menuitem" title="Переключить режим эволюции"><span class="chat-action-switch" aria-hidden="true"></span><span>Эволюция</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="review" role="menuitem" title="Запустить ревью сейчас"><span class="chat-action-switch" aria-hidden="true"></span><span>Ревью кода</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="bg" role="menuitem" title="Переключить фоновое сознание"><span class="chat-action-switch" aria-hidden="true"></span><span>Фоновое сознание</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="restart" role="menuitem" title="Перезапустить агента"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/restart.svg" alt=""></span><span>Перезапустить чат</span></button>
+                        <button class="chat-header-btn danger" type="button" data-chat-command="panic" role="menuitem" title="Остановить всех воркеров"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/power.svg" alt=""></span><span>Экстренное отключение</span></button>
                     </div>
                 </div>
             `,
@@ -132,7 +132,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <span class="attach-badge">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
                 <span class="attach-name">${escapeHtml(file.name)}</span>
-                <button class="attach-remove" type="button" title="Remove">×</button>
+                <button class="attach-remove" type="button" title="Убрать">×</button>
             </span>
         `;
         requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
@@ -303,7 +303,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function summarizeSkillReviewMessage(text) {
         const raw = String(text || '');
         const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        const headline = lines[0] || 'Skill review';
+        const headline = lines[0] || 'Проверка навыка';
         const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
         const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
         const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
@@ -1318,7 +1318,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (pendingAttachment) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
-                showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
+                showToast('Нельзя прикрепить файл оффлайн. Переподключитесь и попробуйте снова.', 'error');
                 return;
             }
             const staged = pendingAttachment;
@@ -1329,16 +1329,16 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
                 const data = await resp.json();
                 if (!resp.ok || !data.ok) {
-                    showToast('Upload failed: ' + (data.error || resp.statusText), 'error');
+                    showToast('Не удалось загрузить: ' + (data.error || resp.statusText), 'error');
                     return;  // pendingAttachment and preview remain — user can retry
                 }
                 pendingAttachment = null;
                 attachmentPreview.classList.remove('visible');
                 attachmentPreview.innerHTML = '';
                 requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
-                text += (text ? '\n\n' : '') + `[Attached file: ${data.display_name || staged.display_name} saved to ${data.path}]`;
+                text += (text ? '\n\n' : '') + `[Прикреплён файл: ${data.display_name || staged.display_name} сохранён в ${data.path}]`;
             } catch (e) {
-                showToast('Upload error: ' + e.message, 'error');
+                showToast('Ошибка загрузки: ' + e.message, 'error');
                 return;  // pendingAttachment and preview remain — user can retry
             } finally {
                 setSendBusy(false);

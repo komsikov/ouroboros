@@ -81,13 +81,13 @@ function renderServerCard(server, index) {
 
     const authPlaceholder = authToken && looksMasked(authToken)
         ? authToken
-        : (authToken ? '••••••' : 'Bearer xxxxx (optional)');
+        : (authToken ? '••••••' : 'Bearer xxxxx (необязательно)');
 
     return `
         <article class="mcp-server-card" data-mcp-card data-mcp-index="${index}">
             <header class="mcp-server-card-head">
                 <div class="mcp-server-card-title">
-                    <strong>${escapeHtml(name || id || `MCP Server ${index + 1}`)}</strong>
+                    <strong>${escapeHtml(name || id || `MCP-сервер ${index + 1}`)}</strong>
                     <span class="mcp-server-status ${statusClass}">${escapeHtml(statusBadgeText)}</span>
                 </div>
                 <div class="mcp-server-card-actions">
