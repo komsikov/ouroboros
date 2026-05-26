@@ -1,5 +1,8 @@
 /** ClawHub marketplace UI inside the Skills page. */
 
+import { trackMetric } from './analytics.js';
+import { jsonPost } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import {
     getPending,
     getPendingBySlug,
@@ -8,8 +11,6 @@ import {
     setPending,
     startLifecyclePoller,
 } from './lifecycle_card.js';
-import { openConfirmDialog } from './confirm_dialog.js';
-import { jsonPost } from './api_client.js';
 import { renderToneBadge } from './ui_helpers.js';
 import {
     boundedText,
@@ -19,12 +20,11 @@ import {
     formatCompactNumber,
     grantReady,
     isRateLimitError,
-    renderHubCard,
     renderSkillRepairPrompt,
     reviewReady,
     reviewTone,
     safeExternalHrefAttr,
-    topReviewFinding,
+    topReviewFinding
 } from './utils.js';
 
 function installErrorCopy(message) {
@@ -608,6 +608,7 @@ export function initMarketplace(pane, controlsHost = null) {
             return;
         }
         if (action === 'install') {
+            trackMetric('clawhub_downloaded');
             setPending(slug, { label: 'Установка', tone: 'warn', message: 'Загрузка, адаптация и проверка…' });
             const result = await jsonPost('/api/marketplace/clawhub/install', { slug, auto_review: true });
             if (!result.ok) throw new Error(result.error || 'ошибка установки');

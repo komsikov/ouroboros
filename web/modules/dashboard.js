@@ -1,3 +1,4 @@
+import { trackMetric } from './analytics.js';
 import { renderPageHeader, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 
@@ -48,6 +49,9 @@ export function initDashboard({ state }) {
         tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.dashboardTab === name));
         panels.forEach((panel) => panel.classList.toggle('active', panel.dataset.dashboardPanel === name));
         state.dashboardActiveSubtab = name;
+        if (name === 'logs') trackMetric('dashboard_logs');
+        if (name === 'evolution') trackMetric('dashboard_evolution');
+        if (name === 'costs') trackMetric('dashboard_costs');
         window.dispatchEvent(new CustomEvent('ouro:dashboard-subtab-shown', { detail: { tab: name } }));
     }
 

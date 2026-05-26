@@ -1,3 +1,4 @@
+import { trackMetric } from './analytics.js';
 import { renderPageHeader, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 
@@ -598,6 +599,13 @@ export function bindSettingsTabs(root, options = {}) {
                 inline: 'center',
                 block: 'nearest',
             });
+        }
+        if (tabName === 'providers') trackMetric('settings_providers');
+        if (tabName === 'models') trackMetric('settings_models');
+        if (tabName === 'behavior') trackMetric('settings_behavior');
+        if (tabName === 'advanced') {
+            trackMetric('settings_advanced');
+            trackMetric('settings_integrations');
         }
         if (onActivate) onActivate(tabName);
         window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));

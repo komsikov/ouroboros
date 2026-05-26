@@ -1,3 +1,5 @@
+import { trackMetric } from './analytics.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import {
     clearPending,
     getPending,
@@ -7,7 +9,6 @@ import {
     setPending,
     startLifecyclePoller,
 } from './lifecycle_card.js';
-import { openConfirmDialog } from './confirm_dialog.js';
 import {
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
@@ -273,6 +274,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
         }
         if (!install) return;
         const slug = install.dataset.ohInstall;
+        trackMetric('ouroboshub_downloaded');
         install.disabled = true;
         setPending(slug, { label: 'Установка', tone: 'warn', message: 'Установка официального навыка…' });
         show(`Установка ${slug}…`, 'muted');

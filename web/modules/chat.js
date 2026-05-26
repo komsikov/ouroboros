@@ -1,3 +1,4 @@
+import { trackMetric } from './analytics.js';
 import { apiFetch } from './api_client.js';
 import {
     getLogTaskGroupId,
@@ -1523,11 +1524,13 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             return;
         }
         if (command === 'restart') {
+            trackMetric('restart');
             ws.send({ type: 'command', cmd: '/restart' });
             closeActionMenu();
             return;
         }
         if (command === 'panic' && confirm('Немедленно остановить всех воркеров?')) {
+            trackMetric('panic');
             ws.send({ type: 'command', cmd: '/panic' });
         }
         closeActionMenu();

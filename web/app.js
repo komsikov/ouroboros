@@ -1,21 +1,22 @@
 /** Web UI orchestrator: shared state, navigation, page init, WS startup. */
 
-import { createWS } from './modules/ws.js';
-import { loadVersion, initMatrixRain } from './modules/utils.js';
 import { initChat } from './modules/chat.js';
 import { initFiles } from './modules/files.js';
+import { initMatrixRain, loadVersion } from './modules/utils.js';
+import { createWS } from './modules/ws.js';
 
-import { initLogs } from './modules/logs.js';
-import { initEvolution } from './modules/evolution.js';
-import { initSettings } from './modules/settings.js';
-import { initCosts } from './modules/costs.js';
-import { initSkills } from './modules/skills.js';
-import { initWidgets } from './modules/widgets.js';
-import { initUpdates } from './modules/updates.js';
-import { initDashboard } from './modules/dashboard.js';
 import { apiFetch } from './modules/api_client.js';
+import { initCosts } from './modules/costs.js';
+import { initDashboard } from './modules/dashboard.js';
+import { initEvolution } from './modules/evolution.js';
+import { initLogs } from './modules/logs.js';
+import { initSettings } from './modules/settings.js';
+import { initSkills } from './modules/skills.js';
+import { initUpdates } from './modules/updates.js';
 import { escapeHtmlAttr, escapeHtmlText } from './modules/utils.js';
+import { initWidgets } from './modules/widgets.js';
 
+import { trackMetric } from './modules/analytics.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 import { initPwa } from './modules/pwa.js';
 
@@ -38,6 +39,22 @@ let settingsControls = null;
 let dashboardControls = null;
 let navWidgetsLoaded = false;
 let activeSidebarWidgetKey = '';
+
+function trackDashboardSubtab(tabName) {
+    if (tabName === 'logs') trackMetric('dashboard_logs');
+    if (tabName === 'evolution') trackMetric('dashboard_evolution');
+    if (tabName === 'costs') trackMetric('dashboard_costs');
+}
+
+function trackSettingsSubtab(tabName) {
+    if (tabName === 'providers') trackMetric('settings_providers');
+    if (tabName === 'models') trackMetric('settings_models');
+    if (tabName === 'behavior') trackMetric('settings_behavior');
+    if (tabName === 'advanced') {
+        trackMetric('settings_advanced');
+        trackMetric('settings_integrations');
+    }
+}
 
 async function showPage(name) {
     if (state.activePage === name) return;
@@ -63,6 +80,9 @@ async function showPage(name) {
         document.querySelectorAll('.nav-widget-item.active').forEach((item) => item.classList.remove('active'));
     }
     state.activePage = name;
+    if (name === 'chat') trackMetric('chat');
+    if (name === 'dashboard') trackDashboardSubtab(state.dashboardActiveSubtab || 'logs');
+    if (name === 'settings') trackSettingsSubtab(state.settingsActiveSubtab || 'providers');
     window.dispatchEvent(new CustomEvent('ouro:page-shown', { detail: { page: name } }));
     if (name === 'chat') {
         state.unreadCount = 0;
@@ -222,6 +242,7 @@ initOnboardingOverlay();
 initMatrixRain();
 loadVersion();
 initPwa();
+trackMetric('chat', { once: true });
 
 // Mobile soft-keyboard handling: --vvh + keyboard-open without inline styles.
 (function () {

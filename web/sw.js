@@ -3,7 +3,7 @@
  * Caches the UI shell; API and WebSocket always use the network.
  */
 
-const CACHE_SHELL = 'ouroboros-shell-v3';
+const CACHE_SHELL = 'ouroboros-shell-v4';
 
 const PRECACHE_URLS = [
     '/',

@@ -1,3 +1,4 @@
+import { trackMetric } from './analytics.js';
 import { apiFetch, jsonPost } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { renderPageHeader } from './page_header.js';
@@ -132,6 +133,9 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         contextEntryType: '',
         contextDestinationPath: '.',
     };
+
+    let searchMetricTimer = null;
+    let lastTrackedSearch = '';
 
     function updateEditorActions() {
         const visible = state.editorWritable && state.selectedType === 'file';
@@ -685,14 +689,29 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     searchEl.addEventListener('input', () => {
         state.filter = searchEl.value || '';
         renderList();
+        const query = state.filter.trim();
+        if (!query) {
+            lastTrackedSearch = '';
+            if (searchMetricTimer) clearTimeout(searchMetricTimer);
+            return;
+        }
+        if (searchMetricTimer) clearTimeout(searchMetricTimer);
+        searchMetricTimer = setTimeout(() => {
+            if (query !== lastTrackedSearch) {
+                trackMetric('search_folder');
+                lastTrackedSearch = query;
+            }
+        }, 350);
     });
 
     newFileBtn.addEventListener('click', async () => {
         if (!(await canLeaveEditor())) return;
+        trackMetric('add_file');
         createNewFile({ force: true });
     });
 
     newDirBtn.addEventListener('click', () => {
+        trackMetric('add_folder');
         createDirectory().catch(showError);
     });
 
