@@ -5,7 +5,7 @@ FROM registry.genai.int/ci/uv:python3.10-bookworm-slim
 # wheels for linux/arm64. ``ca-certificates`` lets the optional Nexus CA
 # build secret slot into the system trust bundle below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # git \
+    git \
     # build-essential \
     # ca-certificates \
     && rm -rf /var/lib/apt/lists/*
