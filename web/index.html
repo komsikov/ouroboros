@@ -333,45 +333,30 @@
     </div>
     <!-- Yandex.Metrika counter -->
     <script type="text/javascript">
-      (function (m, e, t, i, k, a) {
+      (function (m, e, t, r, i, k, a) {
         m[i] =
           m[i] ||
           function () {
             (m[i].a = m[i].a || []).push(arguments);
           };
         m[i].l = 1 * new Date();
-        const sources = [
-          "https://mc.yandex.ru/metrika/tag.js?id=108712410",
-          "https://mc.yandex.com/metrika/tag.js?id=108712410",
-        ];
-        for (let j = 0; j < document.scripts.length; j += 1) {
-          if (sources.includes(document.scripts[j].src)) return;
-        }
-        let idx = 0;
-        const loadNext = function () {
-          if (idx >= sources.length) {
-            console.warn(
-              "[metrics] failed to load Yandex.Metrika script from all sources",
-            );
+        for (var j = 0; j < document.scripts.length; j++) {
+          if (document.scripts[j].src === r) {
             return;
           }
-          const script = e.createElement(t);
-          script.async = 1;
-          script.src = sources[idx];
-          script.onload = function () {
-            console.info(
-              `[metrics] Yandex.Metrika loaded from ${sources[idx]}`,
-            );
-          };
-          script.onerror = function () {
-            idx += 1;
-            loadNext();
-          };
-          a.parentNode.insertBefore(script, a);
-        };
-        k = e.getElementsByTagName(t)[0];
-        loadNext();
-      })(window, document, "script", "ym");
+        }
+        ((k = e.createElement(t)),
+          (a = e.getElementsByTagName(t)[0]),
+          (k.async = 1),
+          (k.src = r),
+          a.parentNode.insertBefore(k, a));
+      })(
+        window,
+        document,
+        "script",
+        "https://mc.yandex.ru/metrika/tag.js?id=108712410",
+        "ym",
+      );
       ym(108712410, "init", {
         ssr: true,
         webvisor: true,
