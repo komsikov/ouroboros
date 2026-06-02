@@ -3,7 +3,7 @@
  * Caches the UI shell; API and WebSocket always use the network.
  */
 
-const CACHE_SHELL = 'ouroboros-shell-v4';
+const CACHE_SHELL = 'ouroboros-shell-v5';
 
 const PRECACHE_URLS = [
     '/',
@@ -19,9 +19,6 @@ const PRECACHE_URLS = [
     '/static/icons/favicon-32.png',
     '/static/icons/favicon-48.png',
     '/static/icons/favicon-76.png',
-    '/static/icons/apple-touch-icon.png',
-    '/static/icons/icon-192x192.png',
-    '/static/icons/icon-512x512.png',
 ];
 
 function isApiOrLiveRequest(url) {

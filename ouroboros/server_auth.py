@@ -26,7 +26,13 @@ def _is_public_pwa_asset(path: str, method: str) -> bool:
     """Allow installable shell assets through the network gate without a session."""
     if method.upper() != "GET":
         return False
-    if path in {"/sw.js", "/manifest.webmanifest"}:
+    if path in {
+        "/sw.js",
+        "/manifest.webmanifest",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+        "/favicon.ico",
+    }:
         return True
     return path.startswith("/static/")
 
