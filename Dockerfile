@@ -67,6 +67,11 @@ COPY --chown=${APP_UID}:${APP_GID} . /opt/ouroboros_image
 RUN mkdir -p /opt/ouroboros /mnt && \
     chown -R ${APP_UID}:${APP_GID} /opt/ouroboros /mnt ${APP_HOME}
 
+# Backward-compat path: legacy k8s init container copies image code from /app.
+# Code now lives at /opt/ouroboros_image; keep /app as a symlink so external
+# deploy manifests (`cp -a /app/. <dest>`) keep working without manifest changes.
+RUN ln -sfn /opt/ouroboros_image /app
+
 # Sync + entrypoint scripts.
 COPY docker/entrypoint.sh /usr/local/bin/ouroboros-entrypoint
 COPY docker/sync_dirs.sh /usr/local/bin/ouroboros-sync-dirs
