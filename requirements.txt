@@ -19,3 +19,12 @@ playwright
 playwright-stealth
 # optional: local model server (requires Metal-enabled build on macOS)
 # CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python[server]
+# OpenTelemetry tracing (OpenInference conventions). Runtime degrades to a
+# no-op if these packages are missing.
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0
+# NVIDIA NeMo Guardrails — input/output policy rails on LLM calls. The
+# runtime falls back to a no-op when the package is absent or when
+# OUROBOROS_NEMO_CONFIG_PATH is not set.
+nemoguardrails>=0.11.0

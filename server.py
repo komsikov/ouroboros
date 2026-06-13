@@ -70,6 +70,18 @@ else:
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[_file_handler, logging.StreamHandler()])
 log = logging.getLogger("server")
 
+try:
+    from ouroboros.telemetry import init_telemetry
+    init_telemetry(service_name="ouroboros-server")
+except Exception:
+    log.warning("OpenTelemetry initialization failed", exc_info=True)
+
+try:
+    from ouroboros.guardrails_llm import init_guardrails
+    init_guardrails()
+except Exception:
+    log.warning("Guardrails initialization failed", exc_info=True)
+
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _restart_requested = threading.Event()

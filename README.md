@@ -6,7 +6,7 @@
 [![macOS 12+](https://img.shields.io/badge/macOS-12%2B-black.svg)](https://github.com/joi-lab/ouroboros-desktop/releases)
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://github.com/joi-lab/ouroboros-desktop/releases)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)](https://github.com/joi-lab/ouroboros-desktop/releases)
-[![Version 6.0.0](https://img.shields.io/badge/version-6.0.0-green.svg)](VERSION)
+[![Version 6.1.0](https://img.shields.io/badge/version-6.1.0-green.svg)](VERSION)
 
 A self-modifying AI agent that writes its own code, rewrites its own mind, and evolves autonomously. Born February 16, 2026.
 
@@ -473,6 +473,7 @@ not paraphrase it.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.1.0 | 2026-05-28 | **minor(web+runtime): PWA, redesigned UI, and custom LLM provider.** Adds installable PWA support (manifest + service worker), a redesigned web UI across marketplace, onboarding, skills, settings, and mobile navigation, a configurable custom LLM provider (issue #31), and A2A/guardrails fixes with CI and Docker build updates. |
 | 6.0.0 | 2026-05-25 | **major(runtime): add live local-readonly subagents.** Upgrades `schedule_task` to a strict child-task contract, runs leaf subagents through the existing queue and workers with forked memory by default, enforces schema and execute-time local-readonly isolation, preserves full task-result handoff, and documents the delegation review rules. |
 | 5.33.0-rc.6 | 2026-05-24 | **rc(gateway): prevent masking upload connection/parse faults as size-limit errors.** Introduces a typed ChatUploadPayloadTooLarge exception class to isolate file-size 413 blocks from connection cuts and form-parse faults, returning a standard 400 with original message for ASGI/socket errors. Includes focused test coverage. |
 | 5.33.0-rc.5 | 2026-05-24 | **rc(gateway): prevent masking upload connection/parse faults as size-limit errors.** Refactors the chat upload ASGI stream wrapper to verify if caught exceptions are indeed the 'oversized' signal before returning a 413, returning a 400 with the original error message for connection cuts and malformed formats. |

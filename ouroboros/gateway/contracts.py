@@ -218,6 +218,7 @@ class SettingsMeta(SettingsNetworkMeta, total=False):
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
+    fixed_infra_models: bool
 
 
 class SettingsSaveResponse(TypedDict, total=False):

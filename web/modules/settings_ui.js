@@ -50,8 +50,20 @@ function secretField({ id, settingKey, label, placeholder }) {
             <label>${label}</label>
             <div class="secret-input-row">
                 <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
-                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}">Показать</button>
-                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}">Очистить</button>
+                <button
+                    type="button"
+                    class="secret-icon-btn secret-toggle"
+                    data-target="${id}"
+                    aria-label="Показать секрет"
+                    title="Показать секрет"
+                ></button>
+                <button
+                    type="button"
+                    class="secret-icon-btn secret-clear"
+                    data-target="${id}"
+                    aria-label="Очистить секрет"
+                    title="Очистить секрет"
+                ></button>
             </div>
         </div>
     `;
@@ -72,12 +84,12 @@ const PROVIDER_CARDS = [
         note: 'Используйте значения моделей вида <code>openai::gpt-5.5</code> во вкладке «Модели» для прямой маршрутизации. Если OpenRouter отсутствует и значения по умолчанию не изменялись, Ouroboros автоматически переключается на официальные модели OpenAI.',
     },
     {
-        id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Пользовательский OpenAI-совместимый эндпоинт',
+        id: 'compatible', title: 'Пользовательский LLM-провайдер', icon: '/static/providers/openai-compatible.svg', hint: 'Пользовательский OpenAI-совместимый эндпоинт',
         fields: [
-            { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Ключ совместимого провайдера' },
             { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
+            { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Ключ совместимого провайдера' },
         ],
-        note: 'Используйте эту карточку для пользовательских Base URL. Встроенный веб-поиск работает только с официальным OpenAI Responses API, поэтому оставьте <code>OPENAI_BASE_URL</code> пустым, если нужен <code>web_search</code>.',
+        note: 'Используйте эту карточку для пользовательских Base URL. Для маршрутизации на этот провайдер указывайте модели с префиксом <code>openai-compatible::</code> во вкладке «Модели» (например <code>openai-compatible::meta-llama/compatible</code>). Встроенный веб-поиск работает только с официальным OpenAI Responses API, поэтому оставьте <code>OPENAI_BASE_URL</code> пустым, если нужен <code>web_search</code>.',
     },
     {
         id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-совместимая среда',
@@ -239,7 +251,7 @@ export function renderSettingsPage() {
                                 <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 или совместимый эндпоинт">
                             </div>
                         </div>
-                        <div class="settings-inline-note">Запасной вариант для совместимости со старыми установками. Для новых пользовательских провайдеров используйте карточку <code>OpenAI Compatible</code>.</div>
+                        <div class="settings-inline-note">Запасной вариант для совместимости со старыми установками. Для новых пользовательских провайдеров используйте карточку <code>Пользовательский LLM-провайдер</code>.</div>
                     </div>
                     <div class="form-section compact">
                         <h3>Сетевой шлюз</h3>
@@ -620,6 +632,13 @@ export function bindSettingsTabs(root, options = {}) {
 }
 
 export function bindSecretInputs(root) {
+    const syncToggle = (button, input) => {
+        if (!button || !input) return;
+        const revealed = input.type === 'text';
+        button.classList.toggle('is-revealed', revealed);
+        button.setAttribute('aria-label', revealed ? 'Скрыть секрет' : 'Показать секрет');
+        button.title = revealed ? 'Скрыть секрет' : 'Показать секрет';
+    };
     root.querySelectorAll('.secret-input').forEach((input) => {
         input.addEventListener('input', () => {
             if (input.value.trim()) delete input.dataset.forceClear;
@@ -632,8 +651,10 @@ export function bindSecretInputs(root) {
             if (!target) return;
             const nextType = target.type === 'password' ? 'text' : 'password';
             target.type = nextType;
-            button.textContent = nextType === 'password' ? 'Показать' : 'Скрыть';
+            syncToggle(button, target);
         });
+        const target = root.querySelector(`#${button.dataset.target}`);
+        if (target) syncToggle(button, target);
     });
 
     root.querySelectorAll('.secret-clear').forEach((button) => {
@@ -644,7 +665,7 @@ export function bindSecretInputs(root) {
             target.type = 'password';
             target.dataset.forceClear = '1';
             const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
-            if (toggle) toggle.textContent = 'Показать';
+            if (toggle) syncToggle(toggle, target);
         });
     });
 }

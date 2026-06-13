@@ -19,6 +19,7 @@ from ouroboros.config import (
     DATA_DIR,
     SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS,
     apply_settings_to_env as _apply_settings_to_env,
+    is_fixed_infra_models as _is_fixed_infra_models,
     load_settings,
     save_settings,
 )
@@ -46,6 +47,16 @@ _SECRET_SETTING_KEYS = {
     "GITHUB_TOKEN",
     "OUROBOROS_NETWORK_PASSWORD",
 }
+_MODEL_SETTING_KEYS = frozenset({
+    "OUROBOROS_MODEL",
+    "OUROBOROS_MODEL_CODE",
+    "OUROBOROS_MODEL_LIGHT",
+    "OUROBOROS_MODEL_FALLBACK",
+    "USE_LOCAL_MAIN",
+    "USE_LOCAL_CODE",
+    "USE_LOCAL_LIGHT",
+    "USE_LOCAL_FALLBACK",
+})
 _CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 def _get_lan_ip() -> str:
@@ -249,6 +260,24 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
     return merged
 
 
+def _immutable_payload_change(
+    body: Dict[str, Any],
+    baseline: Dict[str, Any],
+    locked_keys: frozenset[str],
+) -> list[str]:
+    changed: list[str] = []
+    for key in sorted(locked_keys):
+        if key not in body:
+            continue
+        old_value = baseline.get(key)
+        new_value = body.get(key)
+        if key in _SECRET_SETTING_KEYS and _looks_masked_secret(new_value) and old_value:
+            continue
+        if str(new_value if new_value is not None else "") != str(old_value if old_value is not None else ""):
+            changed.append(key)
+    return changed
+
+
 def _current_bind_host(request: Request) -> str:
     return str(getattr(getattr(request.app, "state", None), "bind_host", "") or "")
 
@@ -414,6 +443,7 @@ def _claude_code_status_payload() -> Dict[str, Any]:
 
 async def api_settings_get(request: Request) -> JSONResponse:
     settings, _, _ = apply_runtime_provider_defaults(load_settings())
+    fixed_infra_models = _is_fixed_infra_models()
     safe = {k: v for k, v in settings.items()}
     for key in _SECRET_SETTING_KEYS:
         if safe.get(key):
@@ -437,6 +467,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
         and settings.get(key)
     )
     meta["setup_contract"] = build_setup_contract("web")
+    meta["fixed_infra_models"] = fixed_infra_models
     safe["_meta"] = meta
     return JSONResponse(safe)
 
@@ -515,6 +546,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         old_settings = load_settings()
+        fixed_infra_models = _is_fixed_infra_models()
         from ouroboros.config import get_runtime_mode, normalize_runtime_mode as _norm_runtime_mode
 
         raw_old_settings = _owner_read_settings_raw()
@@ -524,6 +556,14 @@ async def api_settings_post(request: Request) -> JSONResponse:
         current_runtime_mode = get_runtime_mode()
         old_effective_settings = dict(old_settings)
         old_effective_settings["OUROBOROS_RUNTIME_MODE"] = current_runtime_mode
+        if fixed_infra_models:
+            changed_model_keys = _immutable_payload_change(body, old_effective_settings, _MODEL_SETTING_KEYS)
+            if changed_model_keys:
+                return json_error(
+                    "Model settings are locked by OUROBOROS_FIXED_INFRA_MODELS and cannot be changed: "
+                    + ", ".join(changed_model_keys),
+                    400,
+                )
         if "MCP_SERVERS" in body:
             body = dict(body)
             body["MCP_SERVERS"] = _rehydrate_mcp_servers_payload(

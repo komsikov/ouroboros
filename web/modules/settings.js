@@ -1,15 +1,21 @@
+import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
+import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { refreshModelCatalog } from './settings_catalog.js';
 import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
-import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
-import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
 let setupContract = {};
+const MODEL_LOCKED_SETTING_KEYS = new Set([
+    'OUROBOROS_MODEL',
+    'OUROBOROS_MODEL_CODE',
+    'OUROBOROS_MODEL_LIGHT',
+    'OUROBOROS_MODEL_FALLBACK',
+]);
 
 const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
@@ -67,7 +73,9 @@ function resetSecretClearFlags(root) {
         input.type = 'password';
     });
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.textContent = 'Показать';
+        button.classList.remove('is-revealed');
+        button.setAttribute('aria-label', 'Показать секрет');
+        button.title = 'Показать секрет';
     });
 }
 
@@ -82,9 +90,17 @@ function wireSecretRow(row) {
     const input = row.querySelector('.secret-input');
     const toggle = row.querySelector('[data-row-secret-toggle]');
     const clear = row.querySelector('[data-row-secret-clear]');
+    const syncToggle = () => {
+        if (!toggle || !input) return;
+        const revealed = input.type === 'text';
+        toggle.classList.toggle('is-revealed', revealed);
+        toggle.setAttribute('aria-label', revealed ? 'Скрыть секрет' : 'Показать секрет');
+        toggle.title = revealed ? 'Скрыть секрет' : 'Показать секрет';
+    };
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
-    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Показать' : 'Скрыть'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Показать'; markSettingsDirty(); });
+    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; syncToggle(); });
+    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; syncToggle(); markSettingsDirty(); });
+    syncToggle();
 }
 
 function customSecretRow(key = '', value = '') {
@@ -93,11 +109,11 @@ function customSecretRow(key = '', value = '') {
     row.className = 'settings-custom-secret-row';
     row.dataset.customSecretRow = '1';
     row.innerHTML = `
-        <div class="form-field settings-custom-secret-key"><label>Ключ</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
-        <div class="form-field settings-custom-secret-value"><label>Значение</label><div class="secret-input-row">
+        <div class="form-field settings-custom-secret-key"><label>Key</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
+        <div class="form-field settings-custom-secret-value"><label>Value</label><div class="secret-input-row">
             <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Значение секрета">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Показать</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Очистить</button>
+            <button type="button" class="secret-icon-btn secret-toggle" data-row-secret-toggle aria-label="Показать секрет" title="Показать секрет"></button>
+            <button type="button" class="secret-icon-btn secret-clear" data-row-secret-clear aria-label="Очистить секрет" title="Очистить секрет"></button>
         </div><div class="settings-inline-note" data-custom-secret-error hidden></div></div>
         <button type="button" class="settings-ghost-btn settings-custom-secret-remove" data-custom-secret-remove>Удалить</button>`;
     wireSecretRow(row);
@@ -133,8 +149,8 @@ function renderRequestedSkillSecrets(root, skills, settings) {
         el.className = 'settings-requested-secret-row';
         el.innerHTML = `<div class="form-field"><label>${escapeHtml(key)}</label><div class="secret-input-row">
             <input id="${id}" data-secret-setting="${escapeHtml(key)}" class="secret-input" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Значение секрета">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Показать</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Очистить</button>
+            <button type="button" class="secret-icon-btn secret-toggle" data-row-secret-toggle aria-label="Показать секрет" title="Показать секрет"></button>
+            <button type="button" class="secret-icon-btn secret-clear" data-row-secret-clear aria-label="Очистить секрет" title="Очистить секрет"></button>
         </div></div>`;
         wireSecretRow(el); host.appendChild(el);
     });
@@ -300,6 +316,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
+    let fixedInfraModels = false;
     initMcpSettings({ onChange: updateSettingsDirtyState });
 
     function anthropicKeyConfigured() {
@@ -447,8 +464,47 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }, 3000);
     }
 
+    function applyFixedPolicyUi() {
+        const compatibleCard = page.querySelector('[data-provider-card="compatible"]');
+        if (compatibleCard) {
+            if (!compatibleCard.dataset.fixedLockBound) {
+                compatibleCard.addEventListener('toggle', () => {
+                    if (!compatibleCard.classList.contains('settings-provider-locked')) return;
+                    if (compatibleCard.open) compatibleCard.open = false;
+                });
+                compatibleCard.dataset.fixedLockBound = '1';
+            }
+            compatibleCard.classList.toggle('settings-provider-locked', fixedInfraModels);
+            compatibleCard.setAttribute('aria-disabled', fixedInfraModels ? 'true' : 'false');
+            if (fixedInfraModels && compatibleCard.open) compatibleCard.open = false;
+            compatibleCard.querySelectorAll('input, select, textarea, button').forEach((control) => {
+                control.disabled = fixedInfraModels;
+            });
+        }
+        const disableModelControl = (input, disabled) => {
+            if (!input) return;
+            input.disabled = disabled;
+            if (!disabled) input.removeAttribute('readonly');
+            const picker = input.closest('[data-model-picker]');
+            if (picker) picker.classList.toggle('settings-model-locked', disabled);
+            const card = input.closest('.settings-model-card');
+            if (card) card.classList.toggle('settings-model-locked', disabled);
+        };
+        setupModelSlots().forEach((slot) => {
+            disableModelControl(byId(slot.settingsInputId), fixedInfraModels);
+            const toggle = byId(slot.settingsToggleId);
+            if (toggle) toggle.disabled = fixedInfraModels;
+        });
+        const modelStatus = byId('settings-model-catalog-status');
+        if (modelStatus && fixedInfraModels) {
+            modelStatus.textContent = 'Модели зафиксированы политикой OUROBOROS_FIXED_INFRA_MODELS (режим только чтение).';
+            modelStatus.dataset.tone = 'muted';
+        }
+    }
+
     function applySettings(s) {
         setupContract = s?._meta?.setup_contract || setupContract || {};
+        fixedInfraModels = Boolean(s?._meta?.fixed_infra_models);
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
@@ -466,6 +522,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
+        applyFixedPolicyUi();
     }
 
     function _renderNetworkHint(meta) {
@@ -563,11 +620,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS: byId('s-auto-grant-reviewed-skills')?.checked ? 'true' : 'false',
             ...collectMcpSettings(),
         };
-        setupModelSlots().forEach((slot) => {
-            body[slot.settingKey] = fieldValue(slot.settingsInputId);
-            body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
-        });
+        if (!fixedInfraModels) {
+            setupModelSlots().forEach((slot) => {
+                body[slot.settingKey] = fieldValue(slot.settingsInputId);
+                body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
+            });
+        }
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => {
+            if (fixedInfraModels && MODEL_LOCKED_SETTING_KEYS.has(key)) return;
             const value = fieldValue(id).trim();
             body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || (key === 'CLAUDE_CODE_MODEL' ? fallback : '');
         });
@@ -706,6 +766,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     function renderSettingsModelPicker(input) {
+        if (!input || input.disabled) return;
         const picker = input.closest('[data-model-picker]');
         const panel = picker?.querySelector('.model-picker-results');
         if (!picker || !panel) return;
@@ -738,6 +799,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ? event.target.closest('[data-model-picker] input')
             : null;
         if (!input) return;
+        if (input.disabled) {
+            closeSettingsModelPickers();
+            return;
+        }
         const picker = input.closest('[data-model-picker]');
         closeSettingsModelPickers(picker);
         renderSettingsModelPicker(input);
@@ -749,6 +814,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ? event.target.closest('[data-model-picker] input')
             : null;
         if (!input) return;
+        if (input.disabled) return;
         const picker = input.closest('[data-model-picker]');
         closeSettingsModelPickers(picker);
         renderSettingsModelPicker(input);
@@ -761,7 +827,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (item) {
             const picker = item.closest('[data-model-picker]');
             const input = picker?.querySelector('input');
-            if (input) {
+            if (input && !input.disabled) {
                 event.preventDefault();
                 input.value = item.dataset.value || '';
                 closeSettingsModelPickers();

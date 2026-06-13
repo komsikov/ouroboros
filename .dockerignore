@@ -1,0 +1,48 @@
+.devcontainer
+.git
+.gitignore
+.vscode
+.idea
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+.env
+.env.*
+.python-version
+.tool-versions
+
+# Python caches / artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+.hypothesis/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+
+# Tooling / OS cruft
+.DS_Store
+Thumbs.db
+*.local
+*.sqlite
+
+# Repo-only files
+.github/
+agent-transcripts/
+.pytest_cache/
+.ruff_cache/

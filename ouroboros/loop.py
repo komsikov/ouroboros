@@ -26,6 +26,7 @@ from ouroboros.loop_tool_execution import (
     _DEFAULT_TOOL_RESULT_LIMIT,
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, estimate_cost
+from ouroboros.telemetry import agent_span, chain_span
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
 _call_llm_with_retry = call_llm_with_retry
@@ -524,6 +525,52 @@ def run_llm_loop(
     event_queue: Optional[queue.Queue] = None,
     initial_effort: str = "medium",
     drive_root: Optional[pathlib.Path] = None,
+    session_id: str = "",
+    user_id: str = "",
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Run the LLM-with-tools loop under a single root trace (one per task).
+
+    ``session_id`` is stamped as the OpenInference ``session.id`` attribute on
+    the agent span and propagated to every child span via OTel baggage so the
+    whole task groups into one session in Phoenix / Arize. When omitted, the
+    ``task_id`` is used as a fallback session identifier.
+    """
+    with agent_span(
+        name="agent.task",
+        task_id=task_id,
+        task_type=task_type,
+        session_id=session_id,
+        user_id=user_id,
+    ):
+        return _run_llm_loop_impl(
+            messages=messages,
+            tools=tools,
+            llm=llm,
+            drive_logs=drive_logs,
+            emit_progress=emit_progress,
+            incoming_messages=incoming_messages,
+            task_type=task_type,
+            task_id=task_id,
+            budget_remaining_usd=budget_remaining_usd,
+            event_queue=event_queue,
+            initial_effort=initial_effort,
+            drive_root=drive_root,
+        )
+
+
+def _run_llm_loop_impl(
+    messages: List[Dict[str, Any]],
+    tools: ToolRegistry,
+    llm: LLMClient,
+    drive_logs: pathlib.Path,
+    emit_progress: Callable[[str], None],
+    incoming_messages: queue.Queue,
+    task_type: str = "",
+    task_id: str = "",
+    budget_remaining_usd: Optional[float] = None,
+    event_queue: Optional[queue.Queue] = None,
+    initial_effort: str = "medium",
+    drive_root: Optional[pathlib.Path] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Run the LLM-with-tools loop and return final text, usage, and trace."""
     active_model = llm.default_model()
@@ -550,9 +597,18 @@ def run_llm_loop(
         MAX_ROUNDS = 200
         log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to 200")
     round_idx = 0
+    # Per-round CHAIN span. Opened at the top of each iteration and closed at
+    # the start of the next one (and in the finally), so each round nests its
+    # LLM/tool spans under one chain, all under the task's agent span.
+    _round_span_cm = None
     try:
         while True:
             round_idx += 1
+
+            if _round_span_cm is not None:
+                _round_span_cm.__exit__(None, None, None)
+            _round_span_cm = chain_span(name=f"round.{round_idx}")
+            _round_span_cm.__enter__()
 
             if round_idx > MAX_ROUNDS:
                 finish_reason = f"⚠️ Task exceeded MAX_ROUNDS ({MAX_ROUNDS}). Consider decomposing into subtasks via schedule_task."
@@ -693,6 +749,11 @@ def run_llm_loop(
                 return budget_result
 
     finally:
+        if _round_span_cm is not None:
+            try:
+                _round_span_cm.__exit__(None, None, None)
+            except Exception:
+                log.debug("Failed to close round chain span", exc_info=True)
         if stateful_executor:
             try:
                 from ouroboros.tools.browser import cleanup_browser

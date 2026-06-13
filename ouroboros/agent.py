@@ -378,6 +378,8 @@ class OuroborosAgent:
                         event_queue=self._event_queue,
                         initial_effort=initial_effort,
                         drive_root=self.env.drive_root,
+                        session_id=str(task.get("session_id") or ""),
+                        user_id=str(task.get("actor_id") or ""),
                     )
                 except Exception as e:
                     tb = traceback.format_exc()
