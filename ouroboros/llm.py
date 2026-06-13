@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
 import time
-import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ouroboros.guardrails_llm import apply_output as _guardrails_apply_output
+from ouroboros.guardrails_llm import enforce_input as _guardrails_enforce_input
 from ouroboros.provider_models import normalize_anthropic_model_id
+from ouroboros.telemetry import llm_span, record_llm_response
 
 log = logging.getLogger(__name__)
 
@@ -282,6 +285,30 @@ class LLMClient:
         return "openrouter", model_name
 
     @staticmethod
+    def _resolve_openai_compatible_credentials() -> Tuple[str, str]:
+        """Resolve credentials for OpenAI-compatible routing with dedicated priority."""
+        compatible_key = (os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+        compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
+        if compatible_key or compatible_base_url:
+            return compatible_key, compatible_base_url
+
+        legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+        legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+        return legacy_key, legacy_base_url
+
+    @staticmethod
+    def _sdk_api_key(target: Dict[str, Any]) -> str:
+        """Return API key value safe for OpenAI SDK initialization."""
+        api_key = str(target.get("api_key") or "")
+        provider = str(target.get("provider") or "")
+        # openai-python rejects empty api_key at client construction time.
+        # Some OpenAI-compatible servers run without auth, so we pass a
+        # placeholder key only to satisfy SDK validation.
+        if not api_key and provider == "openai-compatible":
+            return "compat-no-auth"
+        return api_key
+
+    @staticmethod
     def _qualified_model_name(provider: str, resolved_model: str) -> str:
         if provider == "openrouter":
             return resolved_model
@@ -337,16 +364,13 @@ class LLMClient:
             }
 
         if provider == "openai-compatible":
-            compatible_key = (os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-            compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
-            legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+            compatible_key, compatible_base_url = self._resolve_openai_compatible_credentials()
             return {
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": compatible_key or legacy_key,
-                "base_url": compatible_base_url or legacy_base_url,
+                "api_key": compatible_key,
+                "base_url": compatible_base_url,
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -375,7 +399,7 @@ class LLMClient:
 
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
-        api_key = str(target.get("api_key") or "")
+        api_key = self._sdk_api_key(target)
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
@@ -410,7 +434,7 @@ class LLMClient:
 
     def _get_async_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
-        api_key = str(target.get("api_key") or "")
+        api_key = self._sdk_api_key(target)
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
@@ -448,7 +472,7 @@ class LLMClient:
             timeout=cls._no_proxy_timeout(),
         )
         oa_client = OpenAI(
-            api_key=str(target.get("api_key") or ""),
+            api_key=cls._sdk_api_key(target),
             base_url=str(target.get("base_url") or ""),
             default_headers=dict(target.get("default_headers") or {}),
             http_client=http_client,
@@ -467,7 +491,7 @@ class LLMClient:
             timeout=cls._no_proxy_timeout(),
         )
         oa_client = AsyncOpenAI(
-            api_key=str(target.get("api_key") or ""),
+            api_key=cls._sdk_api_key(target),
             base_url=str(target.get("base_url") or ""),
             default_headers=dict(target.get("default_headers") or {}),
             http_client=http_client,
@@ -577,14 +601,44 @@ class LLMClient:
         no_proxy: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes."""
+        invocation_params = {
+            "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
+            "tool_choice": tool_choice,
+            "temperature": temperature,
+        }
         if use_local:
-            return self._chat_local(messages, tools, max_tokens, tool_choice)
+            with llm_span(
+                model=model or "local-model",
+                provider="local",
+                messages=messages,
+                invocation_params=invocation_params,
+                tools=tools,
+            ) as span:
+                _guardrails_enforce_input(messages)
+                msg, usage = self._chat_local(messages, tools, max_tokens, tool_choice)
+                msg, usage = _guardrails_apply_output(msg, usage)
+                record_llm_response(span, message=msg, usage=usage)
+                return msg, usage
 
         target = self._resolve_remote_target(model)
-        return self._chat_remote(
-            target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
-            no_proxy=no_proxy,
-        )
+        provider = str(target.get("provider") or "")
+        resolved_model = str(target.get("resolved_model") or model)
+        with llm_span(
+            model=resolved_model,
+            provider=provider,
+            messages=messages,
+            invocation_params=invocation_params,
+            tools=tools,
+        ) as span:
+            _guardrails_enforce_input(messages)
+            msg, usage = self._chat_remote(
+                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
+                no_proxy=no_proxy,
+            )
+            msg, usage = _guardrails_apply_output(msg, usage)
+            record_llm_response(span, message=msg, usage=usage)
+            return msg, usage
 
     async def chat_async(
         self,
@@ -601,54 +655,79 @@ class LLMClient:
         if tools:
             raise ValueError("chat_async does not support tool calls")
         target = self._resolve_remote_target(model)
-        if target.get("provider") == "anthropic":
-            return await asyncio.to_thread(
-                self._chat_anthropic,
-                target,
-                messages,
-                tools,
-                reasoning_effort,
-                max_tokens,
-                tool_choice,
-                temperature,
-                no_proxy,
-            )
-        if no_proxy:
-            _oa_client, _http_client = self._make_no_proxy_async_client(target)
-            try:
-                kwargs = self._build_remote_kwargs(
-                    target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
-                )
-                prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-                    kwargs.get("messages"),
-                    kwargs.get("tools"),
-                )
-                resp = await _oa_client.chat.completions.create(**kwargs)
-                return self._normalize_remote_response(
-                    resp.model_dump(),
+        provider = str(target.get("provider") or "")
+        resolved_model = str(target.get("resolved_model") or model)
+        invocation_params = {
+            "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
+            "tool_choice": tool_choice,
+            "temperature": temperature,
+        }
+        with llm_span(
+            model=resolved_model,
+            provider=provider,
+            messages=messages,
+            invocation_params=invocation_params,
+            tools=tools,
+        ) as span:
+            _guardrails_enforce_input(messages)
+            if target.get("provider") == "anthropic":
+                msg, usage = await asyncio.to_thread(
+                    self._chat_anthropic,
                     target,
-                    skip_cost_fetch=True,
-                    prompt_cache_ttl=prompt_cache_ttl,
+                    messages,
+                    tools,
+                    reasoning_effort,
+                    max_tokens,
+                    tool_choice,
+                    temperature,
+                    no_proxy,
                 )
-            finally:
+                msg, usage = _guardrails_apply_output(msg, usage)
+                record_llm_response(span, message=msg, usage=usage)
+                return msg, usage
+            if no_proxy:
+                _oa_client, _http_client = self._make_no_proxy_async_client(target)
                 try:
-                    await _http_client.aclose()
-                except Exception:
-                    pass
-        client = self._get_async_remote_client(target)
-        kwargs = self._build_remote_kwargs(
-            target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
-        )
-        prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-            kwargs.get("messages"),
-            kwargs.get("tools"),
-        )
-        resp = await client.chat.completions.create(**kwargs)
-        return self._normalize_remote_response(
-            resp.model_dump(),
-            target,
-            prompt_cache_ttl=prompt_cache_ttl,
-        )
+                    kwargs = self._build_remote_kwargs(
+                        target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
+                    )
+                    prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
+                        kwargs.get("messages"),
+                        kwargs.get("tools"),
+                    )
+                    resp = await _oa_client.chat.completions.create(**kwargs)
+                    msg, usage = self._normalize_remote_response(
+                        resp.model_dump(),
+                        target,
+                        skip_cost_fetch=True,
+                        prompt_cache_ttl=prompt_cache_ttl,
+                    )
+                    msg, usage = _guardrails_apply_output(msg, usage)
+                    record_llm_response(span, message=msg, usage=usage)
+                    return msg, usage
+                finally:
+                    try:
+                        await _http_client.aclose()
+                    except Exception:
+                        pass
+            client = self._get_async_remote_client(target)
+            kwargs = self._build_remote_kwargs(
+                target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
+            )
+            prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
+                kwargs.get("messages"),
+                kwargs.get("tools"),
+            )
+            resp = await client.chat.completions.create(**kwargs)
+            msg, usage = self._normalize_remote_response(
+                resp.model_dump(),
+                target,
+                prompt_cache_ttl=prompt_cache_ttl,
+            )
+            msg, usage = _guardrails_apply_output(msg, usage)
+            record_llm_response(span, message=msg, usage=usage)
+            return msg, usage
 
     def _prepare_messages_for_local_context(
         self,

@@ -67,6 +67,7 @@
     const MODEL_DEFAULTS = bootstrap.modelDefaults || {};
     const LOCAL_PRESETS = bootstrap.localPresets || {};
     const MODEL_SUGGESTIONS = bootstrap.modelSuggestions || [];
+    const FIXED_INFRA_MODELS = Boolean(bootstrap.fixedInfraModels);
     const INITIAL_STATE = bootstrap.initialState || {};
     const root = document.getElementById('root');
 
@@ -224,6 +225,7 @@
     }
 
     function applyModelDefaults(force) {
+        if (FIXED_INFRA_MODELS) return;
         if (state.modelsDirty && !force) return;
         const defaults = MODEL_DEFAULTS[activeProviderProfile()] || MODEL_DEFAULTS.openrouter || {};
         state.mainModel = defaults.main || '';
@@ -615,11 +617,11 @@
         `;
     }
 
-    function modelSuggestionField({ id, label, value, note }) {
+    function modelSuggestionField({ id, label, value, note, disabled }) {
         return `
             <div class="field wizard-model-field" data-wizard-model-field>
                 <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
-                <input id="${escapeHtml(id)}" value="${escapeHtml(value)}" autocomplete="off" spellcheck="false" data-wizard-model-input>
+                <input id="${escapeHtml(id)}" value="${escapeHtml(value)}" autocomplete="off" spellcheck="false" data-wizard-model-input ${disabled ? 'disabled' : ''}>
                 <div class="wizard-model-suggestions" hidden></div>
                 <div class="field-note">${escapeHtml(note)}</div>
             </div>
@@ -639,24 +641,25 @@
                 <h3>Текущий профиль</h3>
                 <p>${escapeHtml(
                     activeProviderProfile() === 'openai'
-                        ? 'Обнаружена конфигурация только OpenAI. Значения по умолчанию явные и официальные.'
-                        : activeProviderProfile() === 'cloudru'
-                            ? 'Обнаружена конфигурация только Cloud.ru. Значения по умолчанию используют явные ID моделей cloudru::.'
-                        : activeProviderProfile() === 'anthropic'
-                            ? 'Обнаружена конфигурация только Anthropic. Значения по умолчанию явные и официальные.'
-                        : activeProviderProfile() === 'direct-multi'
-                                ? 'Настроено несколько прямых провайдеров. Начните здесь, затем при необходимости распределите слоты моделей между ними.'
-                                : activeProviderProfile() === 'local'
-                                    ? 'Обнаружена только-локальная конфигурация. Проверьте значения моделей и локальную маршрутизацию перед запуском.'
-                                    : 'Маршрутизация в стиле OpenRouter остаётся активной. ID провайдеров без префикса, такие как openai/gpt-5.5 или anthropic/claude-sonnet-4.6, продолжают маршрутизироваться через OpenRouter.'
+                            ? 'Обнаружена конфигурация только OpenAI. Значения по умолчанию явные и официальные.'
+                            : activeProviderProfile() === 'cloudru'
+                                ? 'Обнаружена конфигурация только Cloud.ru. Значения по умолчанию используют явные ID моделей cloudru::.'
+                                : activeProviderProfile() === 'anthropic'
+                                    ? 'Обнаружена конфигурация только Anthropic. Значения по умолчанию явные и официальные.'
+                                    : activeProviderProfile() === 'direct-multi'
+                                            ? 'Настроено несколько прямых провайдеров. Начните здесь, затем при необходимости распределите слоты моделей между ними.'
+                                            : activeProviderProfile() === 'local'
+                                                ? 'Обнаружена только-локальная конфигурация. Проверьте значения моделей и локальную маршрутизацию перед запуском.'
+                                                : 'Маршрутизация в стиле OpenRouter остаётся активной. ID провайдеров без префикса, такие как openai/gpt-5.5 или anthropic/claude-sonnet-4.6, продолжают маршрутизироваться через OpenRouter.'
                 )}</p>
             </div>
             <div class="grid two">
-                ${modelSuggestionField({ id: 'main-model', label: 'Основная модель', value: state.mainModel, note: 'Основная для рассуждений и длинных задач.' })}
-                ${modelSuggestionField({ id: 'code-model', label: 'Модель кода', value: state.codeModel, note: 'Для задач с большим количеством инструментов.' })}
-                ${modelSuggestionField({ id: 'light-model', label: 'Лёгкая модель', value: state.lightModel, note: 'Быстрые резюме и лёгкие задачи.' })}
-                ${modelSuggestionField({ id: 'fallback-model', label: 'Запасная модель', value: state.fallbackModel, note: 'Используется, если основная модель недоступна.' })}
+                ${modelSuggestionField({ id: 'main-model', label: 'Основная модель', value: state.mainModel, note: 'Основная для рассуждений и длинных задач.', disabled: FIXED_INFRA_MODELS })}
+                ${modelSuggestionField({ id: 'code-model', label: 'Модель кода', value: state.codeModel, note: 'Для задач с большим количеством инструментов.', disabled: FIXED_INFRA_MODELS })}
+                ${modelSuggestionField({ id: 'light-model', label: 'Лёгкая модель', value: state.lightModel, note: 'Быстрые резюме и лёгкие задачи.', disabled: FIXED_INFRA_MODELS })}
+                ${modelSuggestionField({ id: 'fallback-model', label: 'Запасная модель', value: state.fallbackModel, note: 'Используется, если основная модель недоступна.', disabled: FIXED_INFRA_MODELS })}
             </div>
+            ${FIXED_INFRA_MODELS ? '<div class="wizard-inline-note">Слоты моделей зафиксированы через OUROBOROS_FIXED_INFRA_MODELS и доступны только для просмотра.</div>' : ''}
             <div class="wizard-inline-note">Прямые провайдеры используют <code>openai::gpt-5.5</code>, <code>cloudru::zai-org/GLM-4.7</code> и <code>anthropic::claude-sonnet-4-6</code>. Простые значения <code>openai/...</code> или <code>anthropic/...</code> остаются в стиле роутера по замыслу.</div>
         `;
     }
@@ -1007,8 +1010,16 @@
         syncCurrentStepActionState();
     }
 
-        function bindModelsStep() {
-            const modelInputMap = Object.fromEntries(MODEL_SLOTS.map((slot) => [slot.inputId, slot.stateKey]));
+    function bindModelsStep() {
+        if (FIXED_INFRA_MODELS) {
+            root.querySelectorAll('.wizard-model-suggestions').forEach((panel) => {
+                panel.hidden = true;
+                panel.innerHTML = '';
+            });
+            syncCurrentStepActionState();
+            return;
+        }
+        const modelInputMap = Object.fromEntries(MODEL_SLOTS.map((slot) => [slot.inputId, slot.stateKey]));
             function suggestionMatches(query) {
                 const needle = trim(query).toLowerCase();
                 return MODEL_SUGGESTIONS

@@ -112,6 +112,56 @@ def get_light_model() -> str:
         or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"])
     )
 
+
+def _truthy_env(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_fixed_infra_models() -> bool:
+    """Return True when infra-critical model slots are locked by policy."""
+    return _truthy_env(os.environ.get("OUROBOROS_FIXED_INFRA_MODELS", ""))
+
+
+def get_fixed_infra_model() -> str:
+    """Return the forced model value for infra-critical slots, if configured."""
+    return str(os.environ.get("OUROBOROS_FIX_INFRA_MODEL", "") or "").strip()
+
+
+def get_fixed_infra_baseurl() -> str:
+    """Return the forced OpenAI-compatible base URL, if configured."""
+    return str(os.environ.get("OUROBOROS_FIX_INFRA_BASEURL", "") or "").strip()
+
+
+def get_fixed_infra_apikey() -> str:
+    """Return the forced OpenAI-compatible API key, if configured."""
+    return str(os.environ.get("OUROBOROS_FIX_INFRA_APIKEY", "") or "").strip()
+
+
+_FIXED_INFRA_MODEL_KEYS = (
+    "OUROBOROS_MODEL",
+    "OUROBOROS_MODEL_CODE",
+    "OUROBOROS_MODEL_LIGHT",
+    "OUROBOROS_MODEL_FALLBACK",
+)
+
+
+def apply_fixed_infra_model_policy(settings: dict) -> dict:
+    """Apply fixed-infra policy overrides when enabled via env flags."""
+    normalized = dict(settings or {})
+    if not is_fixed_infra_models():
+        return normalized
+    fixed_model = get_fixed_infra_model()
+    if fixed_model:
+        for key in _FIXED_INFRA_MODEL_KEYS:
+            normalized[key] = fixed_model
+    fixed_baseurl = get_fixed_infra_baseurl()
+    if fixed_baseurl:
+        normalized["OPENAI_COMPATIBLE_BASE_URL"] = fixed_baseurl
+    fixed_apikey = get_fixed_infra_apikey()
+    if fixed_apikey:
+        normalized["OPENAI_COMPATIBLE_API_KEY"] = fixed_apikey
+    return normalized
+
 _VALID_EFFORTS = ("none", "low", "medium", "high")
 _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
@@ -506,7 +556,7 @@ def load_settings() -> dict:
             if key in loaded and settings.get(key) not in {None, ""}:
                 continue
             settings[key] = _coerce_setting_value(key, raw_env)
-        return settings
+        return apply_fixed_infra_model_policy(settings)
     finally:
         _release_settings_lock(fd)
 
@@ -562,12 +612,13 @@ def save_settings(settings: dict, *, allow_elevation: bool = False) -> None:
                 f"OUROBOROS_RUNTIME_MODE elevation refused: "
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
+        settings_to_save = apply_fixed_infra_model_policy(settings)
         try:
             tmp = SETTINGS_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(settings_to_save, indent=2), encoding="utf-8")
             os.replace(str(tmp), str(SETTINGS_PATH))
         except OSError:
-            SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            SETTINGS_PATH.write_text(json.dumps(settings_to_save, indent=2), encoding="utf-8")
     finally:
         _release_settings_lock(fd)
 
@@ -603,6 +654,7 @@ def get_mcp_tool_timeout_sec() -> int:
 
 def apply_settings_to_env(settings: dict) -> None:
     """Push settings into environment variables for supervisor modules."""
+    settings = apply_fixed_infra_model_policy(settings)
     env_keys = [
         "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
         "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",

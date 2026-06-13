@@ -441,8 +441,11 @@ def compute_content_hash(
 # State persistence
 
 
-def load_enabled(drive_root: pathlib.Path, name: str) -> bool:
-    state = read_json_dict(skill_state_dir(drive_root, name) / "enabled.json")
+def load_enabled(drive_root: pathlib.Path, name: str, *, default: bool = False) -> bool:
+    state_path = skill_state_dir(drive_root, name) / "enabled.json"
+    if not state_path.exists():
+        return bool(default)
+    state = read_json_dict(state_path)
     if not isinstance(state, dict):
         return False
     enabled = state.get("enabled")
@@ -676,6 +679,15 @@ def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict
         list(getattr(skill.manifest, "subscribe_events", []) or []),
     )
     grants = load_skill_grants(drive_root, skill.name)
+    if getattr(skill, "source", "") == "user_repo":
+        grants = {
+            "granted_keys": list(requested),
+            "requested_keys": list(requested),
+            "granted_permissions": list(requested_permissions),
+            "requested_permissions": list(requested_permissions),
+            "content_hash": str(skill.content_hash or ""),
+            "updated_at": "user_repo_default",
+        }
     grant_hash_ok = str(grants.get("content_hash") or "") == str(skill.content_hash or "")
     grant_request_ok = sorted(grants.get("requested_keys") or []) == sorted(requested)
     permission_request_ok = sorted(grants.get("requested_permissions") or []) == sorted(requested_permissions)
@@ -787,6 +799,10 @@ def _looks_like_skill_dir(path: pathlib.Path) -> bool:
 def load_skill(
     skill_dir: pathlib.Path,
     drive_root: pathlib.Path,
+    *,
+    default_enabled: bool = False,
+    force_enabled: bool = False,
+    default_reviewed: bool = False,
 ) -> Optional[LoadedSkill]:
     """Load one skill, returning ``None`` only when no manifest exists."""
     skill_dir = skill_dir.resolve()
@@ -819,7 +835,7 @@ def load_skill(
     except SkillPayloadUnreadable as exc:
         content_hash = ""
         load_error = f"payload unreadable: {exc}"
-    enabled = load_enabled(drive_root, name)
+    enabled = True if force_enabled else load_enabled(drive_root, name, default=default_enabled)
     is_module_widget = (
         manifest.is_extension()
         and isinstance(manifest.ui_tab, dict)
@@ -831,6 +847,13 @@ def load_skill(
         skill_type=manifest.type,
         is_module_widget=is_module_widget,
     )
+    if default_reviewed and not load_error and content_hash:
+        review = SkillReviewState(
+            status=_REVIEW_STATUS_PASS,
+            content_hash=content_hash,
+            reviewer_models=["user_repo_default"],
+            timestamp=utc_now_iso(),
+        )
 
     # Extensions share review/enable/hash gates with scripts, but register
     # through PluginAPI instead of skill_exec.
@@ -990,6 +1013,10 @@ def discover_skills(
     skills: List[LoadedSkill] = []
     seen_dirs: set[pathlib.Path] = set()
     for root in roots:
+        try:
+            root_is_user_repo = user_repo_root is not None and root.resolve() == user_repo_root
+        except OSError:
+            root_is_user_repo = False
         for entry in _walk_skill_packages(root):
             try:
                 resolved = entry.resolve()
@@ -998,7 +1025,13 @@ def discover_skills(
             if resolved in seen_dirs:
                 continue
             seen_dirs.add(resolved)
-            loaded = load_skill(entry, drive_root)
+            loaded = load_skill(
+                entry,
+                drive_root,
+                default_enabled=root_is_user_repo,
+                force_enabled=root_is_user_repo,
+                default_reviewed=root_is_user_repo,
+            )
             if loaded is None:
                 continue
             loaded.source = _classify_skill_source(

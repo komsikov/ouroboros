@@ -407,6 +407,14 @@ select:focus {
   box-shadow: var(--focus-ring);
 }
 
+input:disabled,
+select:disabled {
+  background: #f3f5f8;
+  color: var(--text-secondary);
+  border-color: #d6dde7;
+  cursor: not-allowed;
+}
+
 .selection-row,
 .footer-actions {
   display: flex;

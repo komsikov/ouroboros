@@ -128,6 +128,38 @@
   padding: 0 18px 18px;
 }
 
+.settings-provider-card.settings-provider-locked {
+  opacity: 0.72;
+  border-color: #d8dee8;
+  background: #f5f7fb;
+}
+
+.settings-provider-card.settings-provider-locked summary {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.settings-provider-card.settings-provider-locked .settings-provider-title,
+.settings-provider-card.settings-provider-locked .settings-provider-hint {
+  color: #8b9ab1;
+}
+
+.settings-provider-card.settings-provider-locked .settings-provider-hint::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 6px;
+  vertical-align: -2px;
+  background-repeat: no-repeat;
+  background-size: 14px 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24'%3E%3Cpath fill='%238b9ab1' d='M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2m-7-2a2 2 0 1 1 4 0v2h-4Zm7 13H7v-9h10Z'/%3E%3C/svg%3E");
+}
+
+.settings-provider-card.settings-provider-locked .settings-provider-body {
+  display: none;
+}
+
 .settings-extension-sections {
   display: flex;
   flex-direction: column;
@@ -412,14 +444,72 @@
 }
 
 .secret-input-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 10px;
-  align-items: stretch;
+  position: relative;
+  display: block;
 }
 
-.secret-input-row input {
+.settings-shell .secret-input-row input {
+  width: 100%;
   min-width: 0;
+  padding-right: 78px;
+}
+
+.secret-icon-btn {
+  position: absolute;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #7a8aa3;
+  transform: translateY(-50%);
+  cursor: pointer;
+}
+
+.secret-icon-btn:hover {
+  background: #eef3f8;
+  color: #4f6077;
+}
+
+.secret-icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.secret-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.secret-icon-btn::before {
+  content: "";
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin: 0 auto;
+  background-repeat: no-repeat;
+  background-size: 16px 16px;
+}
+
+.secret-toggle {
+  right: 40px;
+}
+
+.secret-toggle::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24'%3E%3Cpath d='M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Z' fill='none' stroke='%237a8aa3' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='12' r='3.2' fill='none' stroke='%237a8aa3' stroke-width='1.8'/%3E%3C/svg%3E");
+}
+
+.secret-toggle.is-revealed::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24'%3E%3Cpath d='M3.5 8.5C5.2 12 8.3 14.2 12 14.2S18.8 12 20.5 8.5' fill='none' stroke='%237a8aa3' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+.secret-clear {
+  right: 8px;
+}
+
+.secret-clear::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24'%3E%3Cpath d='M6 6l12 12M18 6 6 18' fill='none' stroke='%237a8aa3' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
 .settings-ghost-btn {
@@ -456,7 +546,7 @@
 }
 
 .settings-custom-secret-row .secret-input-row {
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: block;
 }
 
 .settings-custom-secret-remove {
@@ -530,6 +620,25 @@
 
 .model-picker input::placeholder {
   color: var(--text-muted);
+}
+
+.settings-hidden-by-policy {
+  display: none !important;
+}
+
+.settings-model-locked input,
+.settings-model-locked button,
+.settings-model-locked .local-toggle {
+  cursor: not-allowed !important;
+}
+
+.settings-model-locked input:disabled,
+.settings-model-locked input[readonly] {
+  background: #f3f5f8;
+  color: var(--text-secondary);
+  border-color: #d6dde7;
+  opacity: 0.75;
+  -webkit-text-fill-color: var(--text-secondary);
 }
 
 .model-picker-results {
@@ -750,7 +859,7 @@
   }
 
   .secret-input-row {
-    grid-template-columns: 1fr;
+    display: block;
   }
 
   .settings-card-head,

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-from ouroboros.config import SETTINGS_DEFAULTS, VALID_RUNTIME_MODES
+from ouroboros.config import (
+    SETTINGS_DEFAULTS,
+    VALID_RUNTIME_MODES,
+    is_fixed_infra_models,
+)
 from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
@@ -192,6 +196,7 @@ def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dic
 
 def build_setup_bootstrap(settings: dict, host_mode: str = "desktop") -> dict:
     normalized_host = "web" if host_mode == "web" else "desktop"
+    fixed_infra_models = is_fixed_infra_models()
     return {
         "hostMode": normalized_host,
         "supportsLocalRuntimeControls": normalized_host == "web",
@@ -199,12 +204,14 @@ def build_setup_bootstrap(settings: dict, host_mode: str = "desktop") -> dict:
         "modelDefaults": {key: dict(value) for key, value in _MODEL_DEFAULTS.items()},
         "localPresets": {key: dict(value) for key, value in _LOCAL_PRESETS.items()},
         "modelSuggestions": list(_MODEL_SUGGESTIONS),
+        "fixedInfraModels": fixed_infra_models,
         "contract": build_setup_contract(normalized_host),
         "initialState": build_initial_setup_state(settings, normalized_host),
     }
 
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
+    fixed_infra_models = is_fixed_infra_models()
     keys = {field["settingKey"]: _string(data.get(field["settingKey"])) for field in _PROVIDER_FIELDS}
     local_source = _string(data.get("LOCAL_MODEL_SOURCE"))
     local_filename = _string(data.get("LOCAL_MODEL_FILENAME"))
@@ -230,7 +237,19 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     if runtime_mode not in VALID_RUNTIME_MODES:
         return {}, f"Choose a runtime mode from {sorted(VALID_RUNTIME_MODES)}."
 
-    models = {slot["settingKey"]: _string(data.get(slot["settingKey"])) for slot in _MODEL_SLOTS}
+    models = {
+        slot["settingKey"]: (
+            _string(current_settings.get(slot["settingKey"]))
+            if fixed_infra_models
+            else _string(data.get(slot["settingKey"]))
+        )
+        for slot in _MODEL_SLOTS
+    }
+    if fixed_infra_models:
+        for slot in _MODEL_SLOTS:
+            key = slot["settingKey"]
+            if not models[key]:
+                models[key] = _string(SETTINGS_DEFAULTS.get(key))
     if not all(models.values()):
         return {}, "Confirm all four models before starting Ouroboros."
 
@@ -251,6 +270,13 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
         return {}, "Local model context length and GPU layers must be integers."
 
     use_local = local_routing_flags(local_routing_mode, has_local)
+    if fixed_infra_models:
+        use_local = (
+            _truthy(current_settings.get("USE_LOCAL_MAIN")),
+            _truthy(current_settings.get("USE_LOCAL_CODE")),
+            _truthy(current_settings.get("USE_LOCAL_LIGHT")),
+            _truthy(current_settings.get("USE_LOCAL_FALLBACK")),
+        )
     if has_local and not has_remote and not any(use_local):
         return {}, "Local-only setups must route at least one model to the local runtime."
 

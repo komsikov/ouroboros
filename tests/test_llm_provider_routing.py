@@ -1,6 +1,8 @@
-import pytest
-import ouroboros.pricing as pricing_module
 from unittest.mock import patch
+
+import pytest
+
+import ouroboros.pricing as pricing_module
 from ouroboros.llm import LLMClient
 
 
@@ -357,6 +359,7 @@ def test_build_anthropic_tools_deduplicates_tool_names():
 
 def test_chat_anthropic_sends_tool_cache_control_without_ttl(monkeypatch):
     from types import SimpleNamespace
+
     import requests
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
@@ -469,6 +472,36 @@ def test_resolve_openai_compatible_target_prefers_dedicated_credentials(monkeypa
     assert target["api_key"] == "compat-key"
     assert target["base_url"] == "https://compat.example/v1"
     assert target["usage_model"] == "openai-compatible/meta-llama/compatible"
+
+
+def test_resolve_openai_compatible_target_allows_dedicated_base_url_without_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "legacy-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://legacy.example/v1")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://compat.example/v1")
+
+    target = LLMClient()._resolve_remote_target("openai-compatible::meta-llama/compatible")
+
+    assert target["provider"] == "openai-compatible"
+    assert target["api_key"] == ""
+    assert target["base_url"] == "https://compat.example/v1"
+    assert target["usage_model"] == "openai-compatible/meta-llama/compatible"
+
+
+def test_sdk_api_key_uses_placeholder_for_openai_compatible_without_key():
+    target = {
+        "provider": "openai-compatible",
+        "api_key": "",
+    }
+    assert LLMClient._sdk_api_key(target) == "compat-no-auth"
+
+
+def test_sdk_api_key_keeps_empty_for_non_compatible_provider():
+    target = {
+        "provider": "openrouter",
+        "api_key": "",
+    }
+    assert LLMClient._sdk_api_key(target) == ""
 
 
 def test_resolve_cloudru_target_uses_default_base_url(monkeypatch):

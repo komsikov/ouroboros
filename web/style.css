@@ -2815,13 +2815,14 @@ body {
   display: none;
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgb(0 0 0 / 85%);
+  backdrop-filter: none;
   z-index: 1000;
   align-items: center;
   justify-content: center;
   flex-direction: column;
   gap: 12px;
-  color: var(--text-primary);
+  color: #ffffff;
   font-size: 14px;
   font-weight: 500;
 }
@@ -2831,10 +2832,13 @@ body {
 #reconnect-overlay .spinner {
   width: 32px;
   height: 32px;
-  border: 3px solid var(--divider);
-  border-top-color: var(--accent);
+  border: 3px solid #ffffff;
+  border-top-color: #00000000;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+#reconnect-overlay > div:last-child {
+  color: #ffffff;
 }
 @keyframes spin {
   to {
@@ -7463,13 +7467,17 @@ body.nav-collapsed .nav-budget-pill {
 
   /* Reconnect overlay — solid app background on mobile */
   #reconnect-overlay {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
+    background: rgb(0 0 0 / 85%);
+    color: #ffffff;
   }
 
   #reconnect-overlay .spinner {
-    border-color: var(--bg-tertiary);
-    border-top-color: var(--accent);
+    border: 3px solid #ffffff;
+    border-top-color: #00000000;
+  }
+
+  #reconnect-overlay > div:last-child {
+    color: #ffffff;
   }
 }
 

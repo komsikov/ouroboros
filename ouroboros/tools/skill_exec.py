@@ -23,6 +23,7 @@ from ouroboros.skill_loader import (
     skill_state_dir,
 )
 from ouroboros.skill_review import review_skill as _review_skill_impl
+from ouroboros.telemetry import record_skill_result, skill_span
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.tools.review_helpers import format_prompt_code_block
 from ouroboros.tools.registry import ToolContext, ToolEntry
@@ -443,6 +444,8 @@ def _skill_deps_exec_block(drive_root: pathlib.Path, loaded: Any) -> str:
 
 
 def _skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any) -> tuple[str, str]:
+    if getattr(loaded, "source", "") == "user_repo":
+        return "", ""
     try:
         from ouroboros.marketplace.install_specs import install_specs_hash as _specs_hash
         from ouroboros.marketplace.isolated_deps import read_deps_state
@@ -669,64 +672,80 @@ def _handle_skill_exec(
     except Exception:
         log.debug("Could not augment skill env with isolated dependencies", exc_info=True)
 
-    try:
-        returncode, stdout_bytes, stderr_bytes, overflowed = _run_skill_subprocess(
-            cmd,
-            cwd=str(loaded.skill_dir),
-            env=env,
-            timeout_sec=timeout,
-            stdout_cap=_MAX_STDOUT_BYTES,
-            stderr_cap=_MAX_STDERR_BYTES,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _emit_skill_lifecycle_event(
-            ctx,
-            event_type="skill_exec_failed",
-            skill=loaded.name,
-            script=script_rel,
-            error=f"timeout after {timeout}s",
-        )
-        return (
-            f"⚠️ SKILL_EXEC_TIMEOUT: skill {skill_name!r} script "
-            f"{script_rel!r} exceeded {timeout}s limit.\n"
-            f"stdout_partial:\n{_cap(exc.stdout or b'', _MAX_STDOUT_BYTES, 'stdout')}\n"
-            f"stderr_partial:\n{_cap(exc.stderr or b'', _MAX_STDERR_BYTES, 'stderr')}"
-        )
-    except FileNotFoundError:
-        _emit_skill_lifecycle_event(
-            ctx,
-            event_type="skill_exec_failed",
-            skill=loaded.name,
-            script=script_rel,
-            error=f"runtime binary {runtime_binary!r} unavailable",
-        )
-        return (
-            f"⚠️ SKILL_EXEC_ERROR: runtime binary {runtime_binary!r} is no "
-            "longer available."
-        )
-    except OSError as exc:
-        _emit_skill_lifecycle_event(
-            ctx,
-            event_type="skill_exec_failed",
-            skill=loaded.name,
-            script=script_rel,
-            error=f"OS error running skill: {exc}",
-        )
-        return f"⚠️ SKILL_EXEC_ERROR: OS error running skill: {exc}"
+    with skill_span(
+        skill=loaded.name,
+        script=script_rel,
+        runtime=runtime,
+        args=extra_args,
+    ) as _otel_skill_span:
+        try:
+            returncode, stdout_bytes, stderr_bytes, overflowed = _run_skill_subprocess(
+                cmd,
+                cwd=str(loaded.skill_dir),
+                env=env,
+                timeout_sec=timeout,
+                stdout_cap=_MAX_STDOUT_BYTES,
+                stderr_cap=_MAX_STDERR_BYTES,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _emit_skill_lifecycle_event(
+                ctx,
+                event_type="skill_exec_failed",
+                skill=loaded.name,
+                script=script_rel,
+                error=f"timeout after {timeout}s",
+            )
+            record_skill_result(_otel_skill_span, output=f"timeout after {timeout}s", is_error=True)
+            return (
+                f"⚠️ SKILL_EXEC_TIMEOUT: skill {skill_name!r} script "
+                f"{script_rel!r} exceeded {timeout}s limit.\n"
+                f"stdout_partial:\n{_cap(exc.stdout or b'', _MAX_STDOUT_BYTES, 'stdout')}\n"
+                f"stderr_partial:\n{_cap(exc.stderr or b'', _MAX_STDERR_BYTES, 'stderr')}"
+            )
+        except FileNotFoundError:
+            _emit_skill_lifecycle_event(
+                ctx,
+                event_type="skill_exec_failed",
+                skill=loaded.name,
+                script=script_rel,
+                error=f"runtime binary {runtime_binary!r} unavailable",
+            )
+            record_skill_result(_otel_skill_span, output="runtime binary unavailable", is_error=True)
+            return (
+                f"⚠️ SKILL_EXEC_ERROR: runtime binary {runtime_binary!r} is no "
+                "longer available."
+            )
+        except OSError as exc:
+            _emit_skill_lifecycle_event(
+                ctx,
+                event_type="skill_exec_failed",
+                skill=loaded.name,
+                script=script_rel,
+                error=f"OS error running skill: {exc}",
+            )
+            record_skill_result(_otel_skill_span, output=f"OS error: {exc}", is_error=True)
+            return f"⚠️ SKILL_EXEC_ERROR: OS error running skill: {exc}"
 
-    return _render_skill_exec_result(
-        ctx,
-        payload={
-            "skill": loaded.name,
-            "script": script_rel,
-            "runtime": runtime,
-            "exit_code": int(returncode),
-            "timeout_sec": timeout,
-        },
-        stdout_bytes=stdout_bytes,
-        stderr_bytes=stderr_bytes,
-        overflowed=overflowed,
-    )
+        rendered = _render_skill_exec_result(
+            ctx,
+            payload={
+                "skill": loaded.name,
+                "script": script_rel,
+                "runtime": runtime,
+                "exit_code": int(returncode),
+                "timeout_sec": timeout,
+            },
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            overflowed=overflowed,
+        )
+        record_skill_result(
+            _otel_skill_span,
+            exit_code=int(returncode),
+            output=rendered,
+            is_error=(returncode != 0 or overflowed),
+        )
+        return rendered
 
 
 _TRUE_LITERALS = {"true", "yes", "on", "1"}
