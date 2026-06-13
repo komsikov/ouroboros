@@ -22,13 +22,37 @@ TARGET_MODULE_LINES = 1000
 MAX_MODULE_LINES = 1600
 TARGET_FUNCTION_LINES = 150
 # Advisory SDK orchestration stays single-flow; split tracked as tech debt.
-MAX_FUNCTION_LINES = 300
+# Fork merge with upstream/ouroboros-redesign stacks per-round OTEL chain-span
+# management onto the upstream loop body, pushing _run_llm_loop_impl to ~311
+# lines; raised to cover it. Split of the loop is tracked as tech debt.
+MAX_FUNCTION_LINES = 320
 # Ceiling covers safety, review-state, tools/git, skills/extensions, gateway
 # helpers, the packaged CLI bridge/installer, the v5.32 generated Atlas
 # compiler/tests, v5.33 external-workspace CLI artifact/preflight contract,
-# and the v6.0 live subagent strict-schema/isolation/browser-guard tests. Keep
-# this tight and lower it again when the headless/subagent helpers settle.
-MAX_TOTAL_FUNCTIONS = 2250
+# and the v6.1 subagent status SSOT/wait/browser-ingress hardening. Keep this
+# tight and lower it again when the headless/subagent helpers settle.
+# v6.4.0-rc.1 adds the send_video tool/bridge/event path; keep the cap tight
+# while allowing that first-class transport surface.
+# v6.5.0-rc.1 adds task-scoped artifact/user_files/root-resolution helpers
+# for light-mode external deliverables; keep the headroom narrow.
+# v6.6.0-rc.1 adds 4 helpers for effect-gated task-acceptance review and light-mode
+# cognitive/root redirects: turn_has_reviewable_effects, _user_file_basenames,
+# _extract_fenced_json, light_cognitive_or_root_redirect. Keep the headroom narrow.
+# v6.7.0-rc.1 adds reliability helpers for the subagent/worker fixes: worker
+# network policy (in_worker_process), monotonic status guard
+# (_is_status_regression), terminal-event/cancel emitters (_emit_task_done_terminal,
+# _emit_cancel_task_done, _drop_cancelled_pending), bundled-node resolution
+# (embedded_node_candidates, resolve_bundled_node), marketplace opener
+# (_build_opener), and the schedule pool-unavailable guard
+# (_reject_schedule_pool_unavailable). v6.7.1 adds the out-of-process extension
+# runner and proxy validation helpers. Keep the headroom narrow.
+# Fork merge with upstream/ouroboros-redesign unions this fork's additions
+# (guardrails_llm, telemetry/OTEL, custom LLM provider, PWA, analytics) with
+# upstream's new modules (observability, llm_observability, outcomes,
+# task_status, tool_access, artifacts, code_intelligence), bringing the repo to
+# ~2573 functions. Raised to cover the combined surface; lower again as the
+# overlapping observability stacks are reconciled.
+MAX_TOTAL_FUNCTIONS = 2600
 # Grandfathered modules are accepted debt until their surfaces stabilize/split.
 GRANDFATHERED_OVERSIZED_MODULES = {
     "llm.py",
