@@ -13,7 +13,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from ouroboros.config import get_runtime_mode
+from ouroboros.config import get_runtime_mode, reviews_disabled
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
     format_protected_paths,
@@ -302,32 +302,41 @@ def _run_reviewed_stage_cycle(
             "message": msg,
             "block_reason": "core_protection_blocked",
         }
-    advisory_err = _check_advisory_freshness(
-        ctx,
-        commit_message,
-        skip_advisory_pre_review,
-        paths=advisory_paths,
-    )
-    if advisory_err:
-        run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
-        _record_commit_attempt(
+    review_disabled = reviews_disabled()
+    if not review_disabled:
+        advisory_err = _check_advisory_freshness(
             ctx,
             commit_message,
-            "blocked",
-            block_reason="no_advisory",
-            block_details=advisory_err,
-            duration_sec=time.time() - commit_start,
+            skip_advisory_pre_review,
+            paths=advisory_paths,
         )
-        return {
-            "status": "blocked",
-            "message": advisory_err,
-            "block_reason": "no_advisory",
-        }
+        if advisory_err:
+            run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+            _record_commit_attempt(
+                ctx,
+                commit_message,
+                "blocked",
+                block_reason="no_advisory",
+                block_details=advisory_err,
+                duration_sec=time.time() - commit_start,
+            )
+            return {
+                "status": "blocked",
+                "message": advisory_err,
+                "block_reason": "no_advisory",
+            }
+    else:
+        try:
+            ctx.emit_progress_fn(
+                "Reviews disabled by OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS; skipping advisory, triad, and scope review."
+            )
+        except Exception:
+            pass
 
     _advisory_bypassed = skip_advisory_pre_review or not os.environ.get("ANTHROPIC_API_KEY", "")
     _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
     _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
-    if _advisory_bypassed and not skip_tests and not _doc_only:
+    if not review_disabled and _advisory_bypassed and not skip_tests and not _doc_only:
         try:
             ctx.emit_progress_fn(
                 "Advisory bypassed — running test preflight before triad + scope review..."
@@ -362,7 +371,7 @@ def _run_reviewed_stage_cycle(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
-    elif _advisory_bypassed:
+    elif not review_disabled and _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"
         elif skip_tests:
@@ -400,6 +409,47 @@ def _run_reviewed_stage_cycle(
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="pending",
     )
+
+    if review_disabled:
+        post_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
+        if not post_fingerprint.get("ok"):
+            return {
+                "status": "blocked",
+                "message": _handle_revalidation_failure(
+                    ctx,
+                    commit_message,
+                    commit_start,
+                    pre_fingerprint=pre_fingerprint,
+                    post_fingerprint=post_fingerprint,
+                    kind="fingerprint_unavailable",
+                ),
+                "block_reason": "fingerprint_unavailable",
+                "pre_fingerprint": pre_fingerprint,
+                "post_fingerprint": post_fingerprint,
+            }
+        if post_fingerprint.get("fingerprint") != pre_fingerprint.get("fingerprint"):
+            return {
+                "status": "blocked",
+                "message": _handle_revalidation_failure(
+                    ctx,
+                    commit_message,
+                    commit_start,
+                    pre_fingerprint=pre_fingerprint,
+                    post_fingerprint=post_fingerprint,
+                    kind="revalidation_failed",
+                ),
+                "block_reason": "revalidation_failed",
+                "pre_fingerprint": pre_fingerprint,
+                "post_fingerprint": post_fingerprint,
+            }
+        ctx._review_degraded_reasons = list(getattr(ctx, "_review_degraded_reasons", []) or [])
+        ctx._review_degraded_reasons.append("reviews_disabled")
+        return {
+            "status": "passed",
+            "message": "",
+            "pre_fingerprint": pre_fingerprint,
+            "post_fingerprint": post_fingerprint,
+        }
 
     review_err, scope_result, triad_block_reason, triad_advisory = _run_parallel_review(
         ctx,
@@ -925,11 +975,17 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "Files are on disk in the active workspace. Do not commit; the headless runner will emit a patch artifact."
         )
     else:
-        result = (
-            f"✅ Written {len(written)} file(s): {summary}\n"
-            "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-            "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
-        )
+        if reviews_disabled():
+            result = (
+                f"✅ Written {len(written)} file(s): {summary}\n"
+                "Files are on disk but NOT committed. Run repo_commit when ready. Reviews are disabled by environment."
+            )
+        else:
+            result = (
+                f"✅ Written {len(written)} file(s): {summary}\n"
+                "Files are on disk but NOT committed. Run repo_commit when ready.\n"
+                "⚠️ Advisory pre-review is now stale — run advisory_pre_review before repo_commit."
+            )
     protected_written = [] if ctx.is_workspace_mode() else protected_paths_in(written_paths)
     if protected_written and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice(protected_written)
@@ -1074,9 +1130,15 @@ def _str_replace_editor(
     if data_skill_target is None and ctx.is_workspace_mode():
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
-        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        if reviews_disabled():
+            result += "\nRun repo_commit when ready. Reviews are disabled by environment."
+        else:
+            result += "\nRun repo_commit when ready.\n⚠️ Advisory pre-review is now stale — run advisory_pre_review before repo_commit."
     else:
-        result += "\nRun skill_review for this skill before enabling or declaring it ready."
+        if reviews_disabled():
+            result += "\nRun skill_preflight before enabling or declaring this skill ready. Skill review is disabled by environment."
+        else:
+            result += "\nRun review_skill for this skill before enabling or declaring it ready."
     if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice([norm])
     return result
@@ -1516,7 +1578,9 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Commit already-changed files. Requires a fresh advisory_review run first. "
                 "Includes unified pre-commit multi-model review before commit, "
-                "with configurable Advisory/Blocking enforcement, plus blocking scope review."
+                "with configurable Advisory/Blocking enforcement, plus blocking scope review. "
+                "When OUROBOROS_REVIEWS_DISABLED=true, or when it is unset and "
+                "OUROBOROS_FIXED_INFRA_MODELS=true, review surfaces are skipped."
             ),
             "parameters": {"type": "object", "properties": {
                 "commit_message": {"type": "string"},

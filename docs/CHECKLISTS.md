@@ -10,6 +10,11 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
 
 ## Advisory Pre-Review Workflow
 
+When `OUROBOROS_REVIEWS_DISABLED=true`, this workflow is bypassed together with
+triad, scope, plan, deep self-review, skill review, and hub install/update review
+surfaces. If unset, `OUROBOROS_FIXED_INFRA_MODELS=true` disables reviews by
+default; explicit `OUROBOROS_REVIEWS_DISABLED=false` keeps them enabled.
+
 **Correct sequence (mandatory):**
 
 ```
@@ -460,7 +465,8 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
     `blockers` are executable by operator choice. This changes
     `executable_review` only; it does not rewrite the verdict, suppress
     findings, or change `skill_review_status` semantics.
-  - `pending` and stale reviews are never executable.
+  - `pending` and stale reviews are never executable unless reviews are disabled
+    through `OUROBOROS_REVIEWS_DISABLED=true` or the fixed-infra fallback.
 - Review state stores findings and computes the verdict at load time. Agents
   and UI callers must use `review_gate.executable_review` / `executable_review`,
   not the raw status string, when deciding whether the skill is runnable.

@@ -924,6 +924,16 @@ def test_skill_review_gate_allows_warnings_under_blocking(monkeypatch):
     assert gate["review_enforcement"] == "blocking"
 
 
+def test_skill_review_gate_allows_pending_when_reviews_disabled(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
+
+    gate = skill_review_gate("pending", stale=True)
+
+    assert gate["executable_review"] is True
+    assert gate["blocking_reason"] == "reviews_disabled"
+    assert gate["stale"] is True
+
+
 def test_skill_review_gate_allows_legacy_advisory_pass(monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
 

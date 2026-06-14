@@ -606,6 +606,7 @@ async function fetchSkills() {
     return {
         skillsRepoConfigured,
         githubTokenConfigured,
+        reviewDisabled: Boolean(extResp.review_disabled),
         skills: mergeLifecycleEvents(extResp.skills || [], lifecycleEvents),
         live: extResp.live || {},
         queue: queueResp,
@@ -709,7 +710,8 @@ function updateQueueBadges(events) {
 
 
 async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(), repairingSkills = new Set()) {
-    const { skillsRepoConfigured, githubTokenConfigured, skills, live } = await fetchSkills();
+    const { skillsRepoConfigured, githubTokenConfigured, reviewDisabled, skills, live } = await fetchSkills();
+    syncReviewDisabledUi(reviewDisabled);
     if (!skills.length && !skillsRepoConfigured) {
         container.innerHTML = '';
         if (emptyEl) emptyEl.hidden = false;
@@ -723,7 +725,7 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
         live,
         { githubTokenConfigured },
     )).join('')
-        || '<div class="muted">Навыков пока нет. Добавьте из <b>ClawHub</b> или <b>OuroborosHub</b>.</div>';
+        || `<div class="muted">Навыков пока нет. Добавьте из <b>OuroborosHub</b>${reviewDisabled ? '' : ' или <b>ClawHub</b>'}.</div>`;
     // v5: surface unread native-skill upgrade migrations so the
     // operator is told when the launcher silently rewrote an
     // installed skill (e.g. weather 0.1 script -> 0.2 extension).
@@ -1268,6 +1270,26 @@ function activateTab(tabName) {
     chromeRows.forEach((row) => {
         row.hidden = row.dataset.chromePane !== tabName;
     });
+}
+
+
+function syncReviewDisabledUi(reviewDisabled) {
+    const hidden = Boolean(reviewDisabled);
+    const tab = document.querySelector('.skills-tab[data-tab="marketplace"]');
+    const panel = document.getElementById('skills-pane-marketplace');
+    const chrome = document.getElementById('skills-pane-marketplace-chrome');
+    if (tab) tab.hidden = hidden;
+    if (hidden && panel) panel.hidden = true;
+    if (hidden && chrome) chrome.hidden = true;
+    if (hidden && tab?.classList.contains('is-active')) {
+        activateTab('installed');
+    }
+    const empty = document.getElementById('skills-empty');
+    if (empty) {
+        empty.innerHTML = hidden
+            ? 'Навыков пока нет. Перейдите в <b>OuroborosHub</b>, чтобы добавить навык, или импортируйте пакет из вкладки «Файлы».'
+            : 'Навыков пока нет. Перейдите в <b>ClawHub</b> или <b>OuroborosHub</b>, чтобы добавить навык, или импортируйте пакет из вкладки «Файлы».';
+    }
 }
 
 

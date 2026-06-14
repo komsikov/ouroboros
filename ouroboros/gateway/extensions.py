@@ -35,7 +35,6 @@ from ouroboros.skill_loader import (
     grant_status_for_skill,
     requested_core_setting_keys,
     requested_skill_permissions,
-    review_status_allows_execution,
     save_skill_grants,
     skill_review_gate,
     _sanitize_skill_name,
@@ -174,6 +173,7 @@ async def api_skill_daemons(_request: Request) -> JSONResponse:
 
 def _build_extensions_index(drive_root, repo_path):
     """Threaded, request-scope-free body for ``GET /api/extensions``."""
+    from ouroboros.config import reviews_disabled
     from ouroboros.extension_loader import extension_name_prefix, runtime_state_for_loaded_skill
 
     live_snapshot = snapshot()
@@ -300,7 +300,7 @@ def _build_extensions_index(drive_root, repo_path):
                         "registry_url": prov.get("registry_url", ""),
                     })
         catalog.append(entry)
-    return {"skills": catalog, "live": live_snapshot}
+    return {"skills": catalog, "live": live_snapshot, "review_disabled": reviews_disabled()}
 
 
 async def api_extension_manifest(request: Request) -> JSONResponse:
@@ -802,7 +802,7 @@ async def api_skill_grants(request: Request) -> JSONResponse:
             }
         stale = loaded.review.is_stale_for(loaded.content_hash)
         gate = skill_review_gate(loaded.review.status, stale=stale)
-        if not review_status_allows_execution(loaded.review.status) or stale:
+        if not gate["executable_review"]:
             return {
                 "error": "key and permission grants require a fresh executable review",
                 "status_code": 409,

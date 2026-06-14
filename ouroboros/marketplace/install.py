@@ -581,7 +581,14 @@ def install_skill(
     deps_status = "not_required"
     deps_error = ""
     deps_fingerprint: Dict[str, Any] = {}
-    if auto_review:
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if auto_review and review_disabled:
+        review_status = "clean"
+    elif auto_review:
         _progress("Running security review…")
         review_status, review_findings, review_error = _run_skill_review(
             drive_root, repo_dir, adapter_result.sanitized_name

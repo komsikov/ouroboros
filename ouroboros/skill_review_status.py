@@ -148,6 +148,20 @@ def skill_review_gate(status: str, *, stale: bool = False, enforcement: Optional
         except Exception:
             enforcement = "blocking"
     enforcement = str(enforcement or "blocking").lower()
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if review_disabled:
+        return {
+            "status": raw_status or STATUS_PENDING,
+            "stale": bool(stale),
+            "executable_review": True,
+            "blocking_reason": "reviews_disabled",
+            "review_enforcement": enforcement,
+            "summary": "Review is disabled by environment; skill review verdict is not required for execution.",
+        }
     if raw_status == STATUS_PENDING:
         executable = False
         reason = "review_pending"

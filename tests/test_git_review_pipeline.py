@@ -44,6 +44,14 @@ def _get_registry_module():
     return importlib.import_module("ouroboros.tools.registry")
 
 
+def _get_plan_review_module():
+    return importlib.import_module("ouroboros.tools.plan_review")
+
+
+def _get_scope_review_module():
+    return importlib.import_module("ouroboros.tools.scope_review")
+
+
 def _get_git_ops_module():
     return importlib.import_module("supervisor.git_ops")
 
@@ -77,6 +85,54 @@ def git_ctx(tmp_path):
 def review_ctx(tmp_path):
     """Yield ``(review_module, ToolContext)``."""
     return _get_review_module(), _make_ctx(tmp_path)
+
+
+def test_direct_review_tools_skip_when_reviews_disabled(monkeypatch, review_ctx):
+    review_mod, ctx = review_ctx
+    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
+
+    raw = review_mod._handle_multi_model_review(
+        ctx,
+        content="content",
+        prompt="prompt",
+        models=["model-a", "model-b"],
+    )
+    payload = json.loads(raw)
+
+    assert payload["review_disabled"] is True
+    assert payload["status"] == "skipped"
+
+
+def test_plan_scope_and_deep_reviews_skip_when_reviews_disabled(monkeypatch, git_ctx):
+    _, ctx = git_ctx
+    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
+
+    plan_mod = _get_plan_review_module()
+    scope_mod = _get_scope_review_module()
+    deep_mod = importlib.import_module("ouroboros.deep_self_review")
+
+    assert "PLAN_REVIEW_SKIPPED" in plan_mod._handle_plan_task(
+        ctx,
+        plan="change one file",
+        goal="test skip",
+        files_to_touch=[],
+    )
+
+    scope = scope_mod.run_scope_review(ctx, commit_message="test skip")
+    assert scope.blocked is False
+    assert scope.status == "skipped"
+
+    progress = []
+    text, usage = deep_mod.run_deep_self_review(
+        pathlib.Path(ctx.repo_dir),
+        pathlib.Path(ctx.drive_root),
+        llm=object(),
+        emit_progress=progress.append,
+        event_queue=None,
+    )
+    assert "skipped" in text
+    assert usage == {}
+    assert progress == ["Deep self-review skipped because reviews are disabled."]
 
 
 # --- repo_write tool registration ---
@@ -1327,6 +1383,41 @@ class TestBypassPathTestsRun:
         # outcome["status"] depends on downstream stages (commit/push) — the
         # invariant tested here is that the preflight gate does not block.
         assert outcome.get("block_reason") != "tests_preflight_blocked"
+
+    def test_reviews_disabled_skips_all_commit_review_surfaces(self, tmp_path, monkeypatch):
+        from ouroboros.tools import git as git_mod
+
+        ctx = self._make_staged_repo(tmp_path)
+        monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
+        called = {"advisory": 0, "preflight": 0, "parallel": 0}
+
+        def _fake_advisory(*a, **kw):
+            called["advisory"] += 1
+            raise AssertionError("advisory gate should be disabled")
+
+        def _fake_preflight(*a, **kw):
+            called["preflight"] += 1
+            raise AssertionError("review preflight should be disabled")
+
+        def _fake_parallel(*a, **kw):
+            called["parallel"] += 1
+            raise AssertionError("triad + scope review should be disabled")
+
+        monkeypatch.setattr(git_mod, "_check_advisory_freshness", _fake_advisory)
+        monkeypatch.setattr(git_mod, "_run_review_preflight_tests", _fake_preflight)
+        monkeypatch.setattr(git_mod, "_run_parallel_review", _fake_parallel)
+
+        outcome = git_mod._run_reviewed_stage_cycle(
+            ctx,
+            commit_message="review disabled",
+            commit_start=0.0,
+            skip_advisory_pre_review=False,
+            skip_tests=False,
+        )
+
+        assert outcome["status"] == "passed"
+        assert called == {"advisory": 0, "preflight": 0, "parallel": 0}
+        assert "reviews_disabled" in getattr(ctx, "_review_degraded_reasons", [])
 
     def test_advisory_paths_include_rename_sources(self, tmp_path, monkeypatch):
         """Advisory freshness must see the same rename/copy source paths as

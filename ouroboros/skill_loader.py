@@ -128,9 +128,9 @@ class LoadedSkill:
         if not self.manifest.is_script():
             # instruction has no payload; extension runs through PluginAPI.
             return False
-        if not review_status_allows_execution(self.review.status):
-            return False
-        if self.review.is_stale_for(self.content_hash):
+        stale = self.review.is_stale_for(self.content_hash)
+        gate = skill_review_gate(self.review.status, stale=stale)
+        if not gate.get("executable_review"):
             return False
         from ouroboros.tools.skill_exec import _resolve_runtime_binary, _resolve_script_path
 
@@ -716,7 +716,8 @@ def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict
     granted_permissions = [perm for perm in requested_permissions if perm in persisted_permissions]
     missing = [key for key in requested if key not in set(granted)]
     missing_permissions = [perm for perm in requested_permissions if perm not in set(granted_permissions)]
-    review_ready = review_status_allows_execution(skill.review.status) and not skill.review.is_stale_for(skill.content_hash)
+    stale = skill.review.is_stale_for(skill.content_hash)
+    review_ready = bool(skill_review_gate(skill.review.status, stale=stale).get("executable_review"))
     # Scripts receive core keys via _scrub_env; extensions via PluginAPI.
     # Instruction skills cannot receive core keys.
     eligible_type = skill.manifest.is_script() or skill.manifest.is_extension()
@@ -764,9 +765,9 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         return outcome
     if skill.load_error:
         return outcome
-    if skill.review.is_stale_for(skill.content_hash):
-        return outcome
-    if not review_status_allows_execution(skill.review.status):
+    stale = skill.review.is_stale_for(skill.content_hash)
+    gate = skill_review_gate(skill.review.status, stale=stale)
+    if not gate.get("executable_review"):
         return outcome
     if normalize_skill_review_status(skill.review.status) == _REVIEW_STATUS_PENDING:
         return outcome
@@ -1140,10 +1141,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
         runnable = s.available_for_execution and readiness.ready
         available += int(runnable)
         blocked_by_grants += int(s.available_for_execution and not grants_usable)
-        pending_review += int(
-            s.review.status in (_REVIEW_STATUS_PENDING, "")
-            or (review_status_allows_execution(s.review.status) and stale)
-        )
+        pending_review += int(gate.get("blocking_reason") in {"review_pending", "review_stale"})
         blocker_review += int(s.review.status == _REVIEW_STATUS_FAIL)
         warning_review += int(s.review.status == _REVIEW_STATUS_ADVISORY)
         broken += int(bool(s.load_error))

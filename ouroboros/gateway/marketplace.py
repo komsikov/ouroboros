@@ -249,14 +249,22 @@ async def _apply_hub_review_and_deps(
     review_log_label: str,
     deps_log_label: str,
 ) -> tuple[str, str, str]:
-    progress.set("Running tri-model review…")
-    status, findings, error = await run_blocking_preserving_cancellation(
-        _run_skill_review,
-        drive_root,
-        repo_dir,
-        skill_name,
-        log_label=review_log_label,
-    )
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if review_disabled:
+        status, findings, error = "clean", [], ""
+    else:
+        progress.set("Running tri-model review…")
+        status, findings, error = await run_blocking_preserving_cancellation(
+            _run_skill_review,
+            drive_root,
+            repo_dir,
+            skill_name,
+            log_label=review_log_label,
+        )
     payload.update({"review_status": status, "review_findings": findings, "review_error": error})
     deps_status = "not_required"
     deps_error = ""

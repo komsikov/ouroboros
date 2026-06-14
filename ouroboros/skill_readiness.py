@@ -38,7 +38,7 @@ def skill_readiness_for_execution(
 
     stale = skill.review.is_stale_for(skill.content_hash)
     gate = skill_review_gate(skill.review.status, stale=stale)
-    if stale:
+    if stale and gate.get("blocking_reason") != "reviews_disabled":
         blockers.append("review_stale")
         agent_fixable.append("review_stale")
     elif not gate.get("executable_review"):

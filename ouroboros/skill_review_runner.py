@@ -745,7 +745,12 @@ def run_skill_review_lifecycle_blocking(
 
     def _run_review() -> SkillReviewOutcome:
         with _review_job_heartbeat(drive_root, skill_name):
-            progress.set("Running tri-model review…")
+            try:
+                from ouroboros.config import reviews_disabled
+                review_disabled = reviews_disabled()
+            except Exception:
+                review_disabled = False
+            progress.set("Review disabled…" if review_disabled else "Running tri-model review…")
             outcome = _call_review_with_lifecycle_guard(review_impl, ctx, skill_name)
             deps_status = "not_required"
             deps_error = ""

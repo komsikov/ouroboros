@@ -123,6 +123,14 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
 
 
+def test_skills_hides_clawhub_when_reviews_disabled():
+    skills = _read("web/modules/skills.js")
+    assert "reviewDisabled: Boolean(extResp.review_disabled)" in skills
+    assert "function syncReviewDisabledUi(reviewDisabled)" in skills
+    assert '.skills-tab[data-tab="marketplace"]' in skills
+    assert "tab.hidden = hidden" in skills
+
+
 # ---------------------------------------------------------------------------
 # Evolution / consciousness UI wiring
 # ---------------------------------------------------------------------------

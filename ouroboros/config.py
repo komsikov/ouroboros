@@ -255,6 +255,7 @@ _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
 # Runtime mode and review enforcement are separate axes.
 VALID_RUNTIME_MODES = ("light", "advanced", "pro")
+_TRUE_SETTING_VALUES = {"1", "true", "yes", "on"}
 
 # Context mode is an independent, owner-controlled working-context size profile
 # (low/max). Unlike runtime mode it is NOT boot-pinned — it is not a privilege
@@ -620,6 +621,19 @@ def get_task_review_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
     raw = (os.environ.get("OUROBOROS_TASK_REVIEW_MODE", default_val) or default_val).strip().lower()
     return raw if raw in {"off", "auto", "required"} else default_val
+
+
+def reviews_disabled() -> bool:
+    """Return whether every LLM review surface is disabled by environment.
+
+    ``OUROBOROS_REVIEWS_DISABLED`` is the explicit full-review kill switch.
+    When it is unset, fixed-infra mode disables reviews by default.
+    """
+    raw = os.environ.get("OUROBOROS_REVIEWS_DISABLED")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in _TRUE_SETTING_VALUES
+    fixed = os.environ.get("OUROBOROS_FIXED_INFRA_MODELS", "")
+    return str(fixed or "").strip().lower() in _TRUE_SETTING_VALUES
 
 
 def get_auto_grant_enabled() -> bool:

@@ -452,6 +452,8 @@ Task/chat reasoning defaults to `medium`. Scope review reasoning defaults to `hi
 
 Models are configurable in the Settings page. Runtime model slots can target OpenRouter, official OpenAI, OpenAI-compatible endpoints, Cloud.ru, GigaChat, or direct Anthropic. When only official OpenAI is configured and the shipped default model values are still untouched, Ouroboros auto-remaps them to official OpenAI defaults. In **OpenAI-only**, **Anthropic-only**, **Cloud.ru-only**, or **GigaChat-only** direct-provider mode, review-model lists are normalized automatically: the fallback shape is `[main_model, light_model, light_model]` (3 commit-triad slots) so both the commit triad and `plan_task` work out of the box. Explicit duplicate model IDs are valid reviewer slots for stochastic sampling; lower uniqueness means lower reviewer diversity, but the quorum gate counts configured slots rather than unique model IDs. Both the commit triad and `plan_task` route through the same `ouroboros/config.py::get_review_models` SSOT. OpenAI-compatible-only setups remain explicit model-selection flows because there is no single universal default model ID for arbitrary compatible endpoints.
 
+`OUROBOROS_REVIEWS_DISABLED=true` is the full review kill switch: it skips advisory, triad, scope, plan, deep self-review, skill review, and hub install/update review surfaces. If that variable is unset, `OUROBOROS_FIXED_INFRA_MODELS=true` disables reviews by default; set `OUROBOROS_REVIEWS_DISABLED=false` to keep reviews enabled in fixed-infra mode.
+
 ### File Browser Start Directory
 
 The web UI file browser is rooted at one configurable directory. Users can browse only inside that directory tree.

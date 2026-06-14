@@ -558,7 +558,7 @@ def _handle_skill_exec(
         )
     stale = loaded.review.is_stale_for(current_hash)
     gate = skill_review_gate(loaded.review.status, stale=stale)
-    if stale:
+    if stale and gate.get("blocking_reason") != "reviews_disabled":
         return (
             f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} was edited since "
             f"the last review. Re-run skill_review(skill={skill_name!r}) "

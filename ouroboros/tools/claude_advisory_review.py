@@ -1276,6 +1276,23 @@ def _handle_advisory_pre_review(
     task_id = str(getattr(ctx, "task_id", "") or "")
     state = load_state(drive_root)
 
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if review_disabled:
+        return _record_bypass(
+            ctx,
+            state,
+            snapshot_hash,
+            commit_message,
+            "reviews disabled by OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS",
+            task_id,
+            drive_root,
+            snapshot_paths=paths,
+        )
+
     # Auto-bypass missing Anthropic key with an audit record.
     if not os.environ.get("ANTHROPIC_API_KEY", ""):
         return _record_bypass(ctx, state, snapshot_hash, commit_message,
@@ -1491,11 +1508,21 @@ def _handle_review_status(
         projection["open_debts"],
         effective_is_fresh=projection["effective_is_fresh"],
     )
-    return json.dumps(
-        build_review_status_payload(projection, next_step=next_step, include_raw=include_raw),
-        ensure_ascii=False,
-        indent=2,
-    )
+    payload = build_review_status_payload(projection, next_step=next_step, include_raw=include_raw)
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if review_disabled:
+        payload["review_disabled"] = True
+        payload["repo_commit_ready"] = True
+        payload["next_step"] = (
+            "Reviews are disabled by OUROBOROS_REVIEWS_DISABLED/"
+            "OUROBOROS_FIXED_INFRA_MODELS; repo_commit skips advisory, triad, "
+            "and scope review while retaining deterministic safety checks."
+        )
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 _schema_param = lambda param_type, description, **extra: {"type": param_type, "description": description, **extra}
@@ -1509,7 +1536,7 @@ def get_tools() -> list:
             schema={
                 "name": "advisory_review",
                 "description": (
-                    "Run an advisory pre-commit review via Claude Agent SDK (read-only: Read, Grep, Glob only). MUST be called before commit_reviewed. Returns structured JSON findings. Findings are advisory (non-blocking), but commit_reviewed is blocked when ANY of the following holds: (a) no fresh matching advisory run for the current staged snapshot, (b) open obligations from prior blocked rounds remain unresolved, or (c) repo-scoped commit-readiness debt is still open (see review_status for details). Correct workflow: finish edits -> advisory_review(...) -> commit_reviewed(...) immediately. WARNING: any edit after advisory_review automatically marks advisory as stale and requires re-running it. Use skip_advisory_review=True to bypass the entire commit gate (bypass is durably audited). Open obligations and commit-readiness debt remain in state for review_status but do not block the bypassed commit."
+                    "Run an advisory pre-commit review via Claude Agent SDK (read-only: Read, Grep, Glob only). MUST be called before commit_reviewed unless reviews are disabled by OUROBOROS_REVIEWS_DISABLED=true or the OUROBOROS_FIXED_INFRA_MODELS fallback. Returns structured JSON findings. Findings are advisory (non-blocking), but commit_reviewed is blocked when ANY of the following holds: (a) no fresh matching advisory run for the current staged snapshot, (b) open obligations from prior blocked rounds remain unresolved, or (c) repo-scoped commit-readiness debt is still open (see review_status for details). Correct workflow: finish edits -> advisory_review(...) -> commit_reviewed(...) immediately. WARNING: any edit after advisory_review automatically marks advisory as stale and requires re-running it. Use skip_advisory_review=True to bypass the entire commit gate (bypass is durably audited). Open obligations and commit-readiness debt remain in state for review_status but do not block the bypassed commit."
                 ),
                 "parameters": {
                     "type": "object",

@@ -211,15 +211,21 @@ def _validate_local_skill(ctx: ToolContext, skill: str):
         raise ValueError(f"skill source {loaded.source!r} cannot be submitted to OuroborosHub")
     if loaded.load_error:
         raise ValueError(f"skill has a load error: {loaded.load_error}")
-    if normalize_skill_review_status(loaded.review.status) != STATUS_CLEAN:
-        raise ValueError("skill must have a fresh clean review before publishing")
     current_hash = compute_content_hash(
         loaded.skill_dir,
         manifest_entry=loaded.manifest.entry,
         manifest_scripts=loaded.manifest.scripts,
     )
-    if loaded.review.is_stale_for(current_hash):
-        raise ValueError("review is stale; re-review the skill first")
+    try:
+        from ouroboros.config import reviews_disabled
+        review_disabled = reviews_disabled()
+    except Exception:
+        review_disabled = False
+    if not review_disabled:
+        if normalize_skill_review_status(loaded.review.status) != STATUS_CLEAN:
+            raise ValueError("skill must have a fresh clean review before publishing")
+        if loaded.review.is_stale_for(current_hash):
+            raise ValueError("review is stale; re-review the skill first")
     if not str(loaded.manifest.version or "").strip():
         raise ValueError("skill manifest version is required")
     return safe, loaded

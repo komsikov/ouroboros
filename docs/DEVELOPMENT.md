@@ -260,6 +260,14 @@ engineering standards, you MUST:
 
 ## Review & Commit Protocol
 
+When `OUROBOROS_REVIEWS_DISABLED=true`, all LLM review surfaces are skipped:
+advisory pre-review, commit triad, scope review, plan review, deep self-review,
+skill review, and hub install/update reviews. If that variable is unset,
+`OUROBOROS_FIXED_INFRA_MODELS=true` applies the same default; explicit
+`OUROBOROS_REVIEWS_DISABLED=false` keeps reviews enabled in fixed-infra mode.
+Deterministic safety checks such as load errors, permission grants, dependency
+installation, and staged-fingerprint revalidation still run.
+
 Reviewed commits now have an explicit **two-step gate**:
 
 1. **Advisory freshness gate**: finish all edits, then run `advisory_review`.

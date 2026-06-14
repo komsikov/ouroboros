@@ -11,6 +11,7 @@ from ouroboros.config import (
     get_task_review_mode,
     get_auto_grant_enabled,
     get_context_mode,
+    reviews_disabled,
 )
 
 
@@ -321,6 +322,21 @@ def test_apply_settings_to_env_includes_context_mode(monkeypatch):
     apply_settings_to_env({"OUROBOROS_CONTEXT_MODE": "low"})
     assert os.environ.get("OUROBOROS_CONTEXT_MODE") == "low"
     os.environ.pop("OUROBOROS_CONTEXT_MODE", None)
+
+
+def test_reviews_disabled_env_overrides_fixed_infra(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_REVIEWS_DISABLED", raising=False)
+    monkeypatch.delenv("OUROBOROS_FIXED_INFRA_MODELS", raising=False)
+    assert reviews_disabled() is False
+
+    monkeypatch.setenv("OUROBOROS_FIXED_INFRA_MODELS", "true")
+    assert reviews_disabled() is True
+
+    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "false")
+    assert reviews_disabled() is False
+
+    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
+    assert reviews_disabled() is True
 
 
 def test_get_auto_grant_enabled(monkeypatch, tmp_path):

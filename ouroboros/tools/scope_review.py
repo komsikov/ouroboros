@@ -138,7 +138,7 @@ class ScopeReviewResult:
     # Canonical per-actor evidence.
     raw_text: str = ""
     model_id: str = ""
-    status: str = "responded"  # "responded"|"error"|"parse_failure"|"empty_response"|"budget_exceeded"|"omitted"|"empty"
+    status: str = "responded"  # "responded"|"skipped"|"error"|"parse_failure"|"empty_response"|"budget_exceeded"|"omitted"|"empty"
     prompt_chars: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
@@ -1011,6 +1011,20 @@ def run_scope_review(
     """Run normal blocking scope review or explicit supplemental degraded review."""
     repo_dir = pathlib.Path(ctx.repo_dir)
     scope_model_id = scope_model or _get_scope_model()
+    try:
+        from ouroboros.config import reviews_disabled
+        if reviews_disabled():
+            return ScopeReviewResult(
+                blocked=False,
+                model_id=scope_model_id,
+                status="skipped",
+                raw_text=(
+                    "Scope review skipped: reviews are disabled by "
+                    "OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS."
+                ),
+            )
+    except Exception:
+        pass
 
     try:
         prompt, context_status = _build_scope_prompt(

@@ -445,7 +445,10 @@ The recommended closed-loop workflow is:
 1. Edit the skill payload under `data/skills/external/<name>/`,
    `data/skills/clawhub/<name>/`, or `data/skills/ouroboroshub/<name>/`.
 2. Run `skill_preflight(skill="<name>")` for cheap syntax/manifest checks.
-3. Run `skill_review(skill="<name>")` and address every critical finding.
+3. Run `review_skill(skill="<name>")` and address every critical finding.
+   If `OUROBOROS_REVIEWS_DISABLED=true` (or it is unset while
+   `OUROBOROS_FIXED_INFRA_MODELS=true`), skill review is replaced by a synthetic
+   clean verdict for the current content hash.
 4. If `OUROBOROS_REVIEW_ENFORCEMENT=advisory`, inspect each advisory finding
    and either fix it or record why it is accepted for now.
 5. Enable the skill, grant required keys/permissions (or use the auto-grant
@@ -651,6 +654,8 @@ ClawHub tab in the Marketplace will install it via the
 `adapt_openclaw_skill` translation pipeline. Note that the adapter
 preserves the original `SKILL.openclaw.md` next to the translated
 `SKILL.md` so reviewers can cross-check both manifests.
+The ClawHub tab is hidden when reviews are disabled because third-party installs
+would otherwise bypass the normal review posture.
 
 ## Migration patterns
 

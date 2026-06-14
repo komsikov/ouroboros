@@ -1181,7 +1181,7 @@ def review_skill(
     """Run tri-model review on one skill, optionally persisting the verdict."""
     # Deferred import avoids the wide review.py graph until this tool runs.
     from ouroboros.tools.review import _handle_multi_model_review
-    from ouroboros.config import get_review_models
+    from ouroboros.config import get_review_models, reviews_disabled
 
     drive_root = pathlib.Path(getattr(ctx, "drive_root", pathlib.Path.home() / "Ouroboros" / "data"))
     skill = find_skill(drive_root, skill_name)
@@ -1216,6 +1216,40 @@ def review_skill(
                 "permissions or remove the unreadable file and re-run."
             ),
         )
+    if reviews_disabled():
+        outcome = SkillReviewOutcome(
+            skill_name=skill.name,
+            status=STATUS_CLEAN,
+            findings=[],
+            reviewer_models=["reviews_disabled"],
+            content_hash=content_hash,
+            raw_result="Skill review disabled by OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS.",
+        )
+        if persist:
+            save_review_state(
+                drive_root,
+                skill.name,
+                SkillReviewState(
+                    status=outcome.status,
+                    content_hash=content_hash,
+                    findings=[],
+                    reviewer_models=list(outcome.reviewer_models),
+                    timestamp=utc_now_iso(),
+                    prompt_chars=0,
+                    cost_usd=0.0,
+                    raw_result=outcome.raw_result,
+                    raw_actor_records=[],
+                ),
+            )
+            _append_skill_review_history(
+                drive_root,
+                skill.name,
+                status=outcome.status,
+                content_hash=content_hash,
+                findings=[],
+                raw_actor_records=[],
+            )
+        return outcome
     manifest_dump = json.dumps(
         {
             "name": skill.manifest.name,

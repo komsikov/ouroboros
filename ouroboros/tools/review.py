@@ -171,6 +171,15 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 prompt: str = "", models: list = None) -> str:
     if models is None:
         models = []
+    if _cfg.reviews_disabled():
+        return json.dumps({
+            "review_disabled": True,
+            "status": "skipped",
+            "message": (
+                "Review skipped: reviews are disabled by "
+                "OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS."
+            ),
+        }, ensure_ascii=False)
     try:
         try:
             asyncio.get_running_loop()

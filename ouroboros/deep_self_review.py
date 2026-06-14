@@ -238,6 +238,14 @@ def run_deep_self_review(
     client with trust_env=False in llm.py; regular task calls are unaffected.
     """
     try:
+        from ouroboros.config import reviews_disabled
+        if reviews_disabled():
+            emit_progress("Deep self-review skipped because reviews are disabled.")
+            return (
+                "Deep self-review skipped: reviews are disabled by "
+                "OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS."
+            ), {}
+
         emit_progress("Building generated review atlas and memory pack...")
         pack_text, stats = build_review_pack(
             repo_dir,

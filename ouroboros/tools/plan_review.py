@@ -139,6 +139,13 @@ def _handle_plan_task(
 
     files_to_touch = files_to_touch or []
 
+    from ouroboros.config import reviews_disabled
+    if reviews_disabled():
+        return (
+            "PLAN_REVIEW_SKIPPED: reviews are disabled by "
+            "OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS."
+        )
+
     try:
         try:
             asyncio.get_running_loop()
