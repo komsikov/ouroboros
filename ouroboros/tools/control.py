@@ -232,7 +232,7 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
         })
         if str(ctx.current_task_type or "") == "evolution":
             try:
-                from supervisor.queue import update_evolution_transaction
+                from supervisor.evolution_lifecycle import update_evolution_transaction
 
                 update_evolution_transaction(
                     str(ctx.task_id or ""),
@@ -790,7 +790,7 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
-    mem.append_identity_journal({
+    append_jsonl(mem.identity_journal_path(), {
         "ts": utc_now_iso(),
         "task_id": str(getattr(ctx, "task_id", "") or ""),
         "source_type": str((getattr(ctx, "task_metadata", {}) or {}).get("delegation_role", "task")) if isinstance(getattr(ctx, "task_metadata", {}), dict) else "task",
@@ -822,7 +822,7 @@ def _toggle_evolution(ctx: ToolContext, enabled: bool, objective: str = "") -> s
         # Reflect the light-mode hard block in the tool's own result so the agent
         # is not told "ON" while the supervisor silently refuses it.
         try:
-            from supervisor.queue import evolution_block_reason
+            from supervisor.evolution_lifecycle import evolution_block_reason
 
             block = evolution_block_reason()
         except Exception:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 import threading
 import time
@@ -33,58 +32,8 @@ from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact 
 log = logging.getLogger(__name__)
 
 
-def _resolve_task_summary_model(default_model: str) -> str:
-    prefix_to_provider = {
-        "openai::": "openai",
-        "anthropic::": "anthropic",
-        "cloudru::": "cloudru",
-        "gigachat::": "gigachat",
-        "openai-compatible::": "openai-compatible",
-        "openrouter::": "openrouter",
-    }
-    provider_env_keys: dict[str, list[str]] = {
-        "openai": ["OPENAI_API_KEY"],
-        "anthropic": ["ANTHROPIC_API_KEY"],
-        "cloudru": ["CLOUDRU_FOUNDATION_MODELS_API_KEY"],
-        "gigachat": ["GIGACHAT_CREDENTIALS"],
-        "openrouter": ["OPENROUTER_API_KEY"],
-    }
-
-    def model_has_credentials(model: str) -> bool:
-        name = str(model or "").strip()
-        provider = "openrouter"
-        for prefix, candidate_provider in prefix_to_provider.items():
-            if name.startswith(prefix):
-                provider = candidate_provider
-                break
-        if provider == "openai-compatible":
-            compat = str(os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-            legacy_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
-            legacy_base = str(os.environ.get("OPENAI_BASE_URL", "") or "").strip()
-            return bool(compat or (legacy_key and legacy_base))
-        if provider == "gigachat":
-            creds = str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip()
-            user = str(os.environ.get("GIGACHAT_USER", "") or "").strip()
-            password = str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip()
-            return bool(creds or (user and password))
-        for env_key in provider_env_keys.get(provider, ["OPENROUTER_API_KEY"]):
-            if str(os.environ.get(env_key, "") or "").strip():
-                return True
-        return False
-
-    if model_has_credentials(default_model):
-        return default_model
-
-    for env_name in (
-        "OUROBOROS_MODEL_LIGHT",
-        "OUROBOROS_MODEL_FALLBACK",
-        "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_CODE",
-    ):
-        candidate = str(os.environ.get(env_name, "") or "").strip()
-        if candidate and model_has_credentials(candidate):
-            return candidate
-    return default_model
+# Credential-aware model selection lives in the provider registry SSOT.
+from ouroboros.provider_models import resolve_credentialed_model as _resolve_task_summary_model
 
 
 def build_trace_summary(llm_trace: dict) -> str:
@@ -237,12 +186,14 @@ def _run_post_task_processing_async(
     drive_logs: pathlib.Path,
     *,
     blocking: bool = False,
-) -> None:
+) -> Dict[str, Any] | None:
     """Run best-effort LLM-heavy post-task memory work off the reply path."""
     task_snapshot = json.loads(json.dumps(task, ensure_ascii=False, default=str))
     usage_snapshot = json.loads(json.dumps(usage, ensure_ascii=False, default=str))
     trace_snapshot = json.loads(json.dumps(llm_trace, ensure_ascii=False, default=str))
     review_evidence_snapshot = json.loads(json.dumps(review_evidence, ensure_ascii=False, default=str))
+
+    result: Dict[str, Any] = {}
 
     def _run() -> None:
         try:
@@ -263,32 +214,67 @@ def _run_post_task_processing_async(
                 env, llm_client, task_snapshot, usage_snapshot,
                 trace_snapshot, review_evidence_snapshot,
             )
+            result["reflection_entry"] = reflection_entry
             from ouroboros.project_facts import resolve_project_id
 
             _pid = resolve_project_id(task_snapshot)
-            # The improvement backlog is Ouroboros's GLOBAL improvement queue: skip it
-            # for a project-scoped task so project work never writes to canonical memory
-            # (outbound leak guard). Project facts go only to the per-project store.
-            if not _pid:
-                _update_improvement_backlog(env, reflection_entry)
+            # Project facts stay project-scoped, but the improvement backlog is
+            # Ouroboros's GLOBAL queue of lessons about its own tooling. A
+            # workspace task can reveal generic friction (bad tools, poor
+            # prompts, broken lifecycle) that should feed post-task evolution
+            # without leaking project facts into canonical memory.
+            _update_improvement_backlog(env, reflection_entry)
             _apply_reflection_memory_actions(env, reflection_entry, project_id=_pid)
-            # A project-scoped task must not trigger GLOBAL self-evolution (that would
-            # write project-derived work into canonical evolution state). Promotion is
-            # only for non-project tasks.
-            if not _pid:
-                try:
-                    from ouroboros.post_task_evolution import maybe_promote
+            try:
+                from ouroboros.post_task_evolution import maybe_promote
 
-                    maybe_promote(env, task_snapshot, reflection_entry, llm_client)
-                except Exception:
-                    log.debug("Post-task evolution promotion failed", exc_info=True)
+                maybe_promote(env, task_snapshot, reflection_entry, llm_client)
+            except Exception:
+                log.debug("Post-task evolution promotion failed", exc_info=True)
         except Exception:
             log.warning("Async post-task processing failed", exc_info=True)
 
     if blocking:
         _run()
-    else:
-        threading.Thread(target=_run, daemon=True).start()
+        return result.get("reflection_entry")
+    threading.Thread(target=_run, daemon=True).start()
+    return None
+
+
+def _run_global_backlog_promotion_only(
+    env: Any,
+    task: Dict[str, Any],
+    reflection_entry: Dict[str, Any] | None,
+    llm: Any,
+) -> None:
+    """Feed canonical improvement backlog/promotion without leaking project memory."""
+
+    if not reflection_entry:
+        return
+    try:
+        candidates = [
+            item for item in (reflection_entry.get("backlog_candidates") or [])
+            if isinstance(item, dict) and str(item.get("summary") or "").strip()
+        ]
+        if not candidates:
+            return
+        sanitized_entry = {
+            "reflection": "\n".join(f"- {str(item.get('summary') or '').strip()}" for item in candidates),
+            "backlog_candidates": candidates,
+            "memory_actions": [],
+        }
+        _update_improvement_backlog(env, sanitized_entry)
+        from ouroboros.post_task_evolution import maybe_promote
+
+        global_task = {
+            "id": str(task.get("id") or ""),
+            "type": str(task.get("type") or "task"),
+            "source": "project_scoped_global_improvement",
+            "metadata": {"globalized_from_project_task": True},
+        }
+        maybe_promote(env, global_task, sanitized_entry, llm)
+    except Exception:
+        log.debug("Canonical post-task promotion-only path failed", exc_info=True)
 
 
 def emit_task_results(
@@ -398,39 +384,43 @@ def emit_task_results(
         post_usage["reason_code"] = reason_code
         _run_chat_consolidation(env, memory, llm, task, drive_logs)
         _run_scratchpad_consolidation(env, memory, llm)
+        from ouroboros.project_facts import resolve_project_id
+
+        _project_scoped = bool(resolve_project_id(task))
         # LLM-heavy memory work stays off the reply critical path.
-        _run_post_task_processing_async(
+        reflection_entry = _run_post_task_processing_async(
             env, task, post_usage, llm_trace, review_evidence, drive_logs,
             blocking=(
                 str(task.get("type") or "") == "evolution"
                 or bool(str(task.get("workspace_root") or "").strip())
                 or bool(str(task.get("workspace_mode") or "").strip())
+                or _project_scoped
             ),
         )
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         # Leak guard (Phase 3b / red-team R3.1): a project-scoped task must NEVER
         # write its learnings to the canonical parent drive — project facts live
         # only in the per-project store. Suppress the canonical dual-run for it.
-        from ouroboros.project_facts import resolve_project_id
-
-        _project_scoped = bool(resolve_project_id(task))
         if (
-            not _project_scoped
-            and budget_drive_root
+            budget_drive_root
             and str(pathlib.Path(budget_drive_root).resolve(strict=False)) != str(pathlib.Path(env.drive_root).resolve(strict=False))
         ):
             from types import SimpleNamespace
 
             parent_env = SimpleNamespace(repo_dir=env.repo_dir, drive_root=pathlib.Path(budget_drive_root), drive_path=lambda rel: pathlib.Path(budget_drive_root) / rel)
-            _run_post_task_processing_async(
-                parent_env,
-                {**task, "drive_root": budget_drive_root, "child_drive_root": str(env.drive_root)},
-                post_usage,
-                llm_trace,
-                review_evidence,
-                pathlib.Path(budget_drive_root) / "logs",
-                blocking=True,
-            )
+            parent_task = {**task, "drive_root": budget_drive_root, "child_drive_root": str(env.drive_root)}
+            if _project_scoped:
+                _run_global_backlog_promotion_only(parent_env, parent_task, reflection_entry, llm)
+            else:
+                _run_post_task_processing_async(
+                    parent_env,
+                    parent_task,
+                    post_usage,
+                    llm_trace,
+                    review_evidence,
+                    pathlib.Path(budget_drive_root) / "logs",
+                    blocking=True,
+                )
 
 
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
@@ -544,6 +534,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             subagent_envelope=subagent_envelope,
             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
             result=text or "",
+            final_answer=str(loop_outcome.get("final_answer") or ""),
             trace_summary=trace_summary,
             trace_refs=loop_outcome.get("trace_refs") or {},
             cost_usd=round(float(usage.get("cost") or 0), 6),

@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import pathlib
-import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
@@ -20,6 +19,19 @@ BLOCK_SIZE = 100                          # Messages per consolidation block
 MAX_SUMMARY_BLOCKS = 10                   # Compress into era when exceeded
 ERA_COMPRESS_COUNT = 4                    # Oldest blocks to compress per era
 CONSOLIDATION_MODEL = "google/gemini-3.5-flash"
+
+
+def _consolidation_model() -> str:
+    """Credential-aware consolidation model (Provider Independence invariant).
+
+    The default routes through OpenRouter; on single-direct-provider installs
+    that would silently fail every consolidation pass and freeze long-term
+    memory (offset never advances). Resolve through the provider registry so
+    any credentialed configured lane keeps memory consolidation alive.
+    """
+    from ouroboros.provider_models import resolve_credentialed_model
+
+    return resolve_credentialed_model(CONSOLIDATION_MODEL)
 CONSOLIDATION_REASONING_EFFORT = "medium"
 
 def should_consolidate(
@@ -136,7 +148,7 @@ def _run_block_consolidation(
     if not new_blocks:
         meta["last_consolidated_offset"] = last_offset + processed
         meta["chat_log_signature"] = _chat_log_signature(source_path)
-        _save_meta(meta_path, meta)
+        atomic_write_json(meta_path, meta)
         return total_usage if total_usage["cost"] > 0 else None
 
     existing_blocks = _load_blocks(blocks_path)
@@ -153,12 +165,12 @@ def _run_block_consolidation(
                 total_usage[key] += era_usage.get(key, 0)
             total_usage["cost"] += era_usage.get("cost", 0)
 
-    _save_blocks(blocks_path, all_blocks)
+    _write_locked_json(blocks_path, all_blocks)
 
     meta["last_consolidated_offset"] = last_offset + processed
     meta["last_consolidated_at"] = utc_now_iso()
     meta["chat_log_signature"] = _chat_log_signature(source_path)
-    _save_meta(meta_path, meta)
+    atomic_write_json(meta_path, meta)
 
     log.info("Block consolidation: %d messages -> %d new blocks (total %d)",
              processed, len(new_blocks), len(all_blocks))
@@ -169,7 +181,7 @@ def _call_consolidation_llm(llm_client: Any, prompt: str, label: str) -> Tuple[s
     try:
         msg, usage = llm_client.chat(
             messages=[{"role": "user", "content": prompt}],
-            model=CONSOLIDATION_MODEL,
+            model=_consolidation_model(),
             tools=None,
             reasoning_effort="low",
             max_tokens=16384,
@@ -283,23 +295,58 @@ def _load_blocks(path: pathlib.Path) -> List[Dict[str, Any]]:
     try:
         return json.loads(read_text(path))
     except (json.JSONDecodeError, ValueError):
-        log.warning("Corrupt blocks file %s, starting fresh", path)
+        # Memory loss must never be silent (P1): quarantine the corrupt store
+        # for forensic recovery instead of overwriting it on the next write.
+        quarantine = path.with_name(f"{path.name}.corrupt-{utc_now_iso().replace(':', '')}.bak")
+        try:
+            os.replace(path, quarantine)
+            log.error("Corrupt blocks file %s — quarantined to %s, starting fresh", path, quarantine)
+        except OSError:
+            log.error("Corrupt blocks file %s — quarantine failed, starting fresh", path, exc_info=True)
+        try:
+            from ouroboros.utils import append_jsonl
+
+            append_jsonl(path.parent.parent / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "memory_store_corrupt",
+                "path": str(path),
+                "quarantine": str(quarantine),
+            })
+        except Exception:
+            log.debug("Failed to emit memory_store_corrupt event", exc_info=True)
         return []
 
 
-def _save_blocks(path: pathlib.Path, blocks: List[Dict[str, Any]]) -> None:
-    _write_locked_json(path, blocks)
-
-
 def _write_locked_json(path: pathlib.Path, payload: Any) -> None:
+    """Write JSON under the cross-process write lock, atomically.
+
+    The lock serializes concurrent consolidators; the write itself goes
+    through a temp file + rename so a crash mid-write can never leave a
+    truncated dialogue_blocks.json (the long-term memory store).
+    """
+    _mutate_locked_json_list(path, lambda _current: payload)
+
+
+def _mutate_locked_json_list(path: pathlib.Path, mutator: Any) -> Any:
+    """Locked read-modify-write for a JSON list store (atomic replace).
+
+    ``mutator(current_list) -> new_list`` runs while the sidecar lock is held,
+    so concurrent appenders cannot be lost between the re-read and the write.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = None
     try:
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
         _lock_ex(fd)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        current: Any = []
+        if path.exists():
+            try:
+                current = json.loads(read_text(path))
+            except (json.JSONDecodeError, ValueError):
+                current = []
+        updated = mutator(current if isinstance(current, list) else [])
+        atomic_write_json(path, updated)
+        return updated
     finally:
         if fd is not None:
             try:
@@ -312,23 +359,7 @@ def _load_meta(path: pathlib.Path) -> Dict[str, Any]:
     return read_json_dict(path) or {}
 
 
-def _save_meta(path: pathlib.Path, meta: Dict[str, Any]) -> None:
-    atomic_write_json(path, meta)
-
-
-def _chat_log_signature(path: pathlib.Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        stat = path.stat()
-        with path.open("r", encoding="utf-8") as handle:
-            first = next((line.strip() for line in handle if line.strip()), "")
-        return {
-            "first_line_sha256": hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest(),
-            "size": int(stat.st_size),
-        }
-    except OSError:
-        return {}
+from ouroboros.utils import jsonl_generation_signature as _chat_log_signature
 
 
 def _count_lines(path: pathlib.Path) -> int:
@@ -376,7 +407,9 @@ def _rebuild_knowledge_index(knowledge_dir: pathlib.Path) -> None:
     except Exception:
         log.warning("Failed to rebuild knowledge index", exc_info=True)
 
-SCRATCHPAD_CONSOLIDATION_THRESHOLD = 30000
+from ouroboros.context_budget import (
+    SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS as SCRATCHPAD_CONSOLIDATION_THRESHOLD,
+)
 
 
 def should_consolidate_scratchpad(memory: Any) -> bool:
@@ -413,7 +446,6 @@ def _consolidate_scratchpad_blocks(
 
     compress_count = max(2, len(blocks) // 2)
     old_blocks = blocks[:compress_count]
-    recent_blocks = blocks[compress_count:]
 
     old_content = "\n\n---\n\n".join(
         f"[{b.get('ts', '?')[:16]} \u2014 {b.get('source', '?')}]\n{b.get('content', '')}"
@@ -447,7 +479,7 @@ Respond with JSON only (no fences):
     try:
         msg, usage = llm_client.chat(
             messages=[{"role": "user", "content": prompt}],
-            model=CONSOLIDATION_MODEL,
+            model=_consolidation_model(),
             reasoning_effort="low",
             max_tokens=16384,
             use_local=os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1"),
@@ -471,9 +503,23 @@ Respond with JSON only (no fences):
             "source": "consolidation",
             "content": compressed_text.strip(),
         }
-        new_blocks = [compressed_block] + recent_blocks
 
-        _write_locked_json(memory.scratchpad_blocks_path(), new_blocks)
+        # Merge-aware replace UNDER the write lock: blocks appended DURING the
+        # slow LLM call live only on disk — building the new list from the
+        # pre-call snapshot would silently drop them. Re-read inside the lock
+        # and keep every block outside the compressed window (ts+source key).
+        compressed_keys = {
+            (str(b.get("ts") or ""), str(b.get("source") or "")) for b in old_blocks
+        }
+
+        def _merge_survivors(live_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            survivors = [
+                b for b in live_blocks
+                if (str(b.get("ts") or ""), str(b.get("source") or "")) not in compressed_keys
+            ]
+            return [compressed_block] + survivors
+
+        new_blocks = _mutate_locked_json_list(memory.scratchpad_blocks_path(), _merge_survivors)
         memory.regenerate_scratchpad_md()
 
         log.info("Scratchpad blocks consolidated: %d blocks (%d chars) -> %d blocks (%d chars)",

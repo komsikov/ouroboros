@@ -1,4 +1,4 @@
-# Ouroboros v6.24.0-rc.4 — Architecture & Reference
+# Ouroboros v6.31.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -25,6 +25,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── workers.py           ← Multiprocessing worker pool (fork/spawn by platform)
   │   ├── state.py             ← Persistent state (state.json) with file locking
   │   ├── queue.py             ← Task queue management (PENDING/RUNNING lists)
+  │   ├── schedule_time.py     ← Cron/timezone schedule time parsing helpers
+  │   ├── evolution_lifecycle.py ← Evolution campaign state + transaction lifecycle (moved from queue.py in v6.30.0): campaign file IO, start/pause, begin/update transaction, cycle-outcome recording, deterministic no_op/abandoned worktree cleanup, owner cycle reports, supervisor auto-restart request
   │   ├── events.py            ← Event dispatcher (worker→supervisor events)
   │   └── git_ops.py           ← Git operations (clone, checkout, rescue, rollback, push, credential helper)
   │
@@ -45,9 +47,11 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── loop.py              ← High-level LLM tool loop
       ├── loop_llm_call.py     ← Single-round LLM call + usage accounting
       ├── loop_tool_execution.py ← Tool dispatch and tool-result handling
+      ├── deadline_utils.py    ← Shared deadline parsing/remaining-time helpers for loop milestones and process-tool timeouts
       ├── observability.py     ← Private forensic execution ledger: redaction, gzip CAS blobs, call manifests, trace refs
       ├── outcomes.py          ← Typed loop/task outcome, artifact bundle, verification ledger helpers
-      ├── code_intelligence.py ← Internal code inventory v1: file facts, hashes, Python symbols/imports, JS/TS heuristics
+      ├── code_intelligence.py ← Internal code inventory v2: derived-only file facts, hashes, Python/JS/TS symbols, imports, call/reference facts, and incremental JSON cache (no raw source)
+      ├── code_search_rg.py    ← Optional ripgrep-backed search helper for search_code; every match is post-filtered through Ouroboros protected/secret gates
       ├── pricing.py           ← Model pricing, cost estimation, usage events
       ├── llm.py               ← Multi-provider LLM routing (OpenRouter/OpenAI/compatible/Cloud.ru/GigaChat/Anthropic) with adaptive request-parameter normalization for provider capabilities/rejections
       ├── mcp_client.py        ← HTTP/SSE MCP client manager: parses MCP_SERVERS, validates URLs/auth headers, masks tokens, normalizes external tool names as mcp_<server>__<tool>, refreshes tool lists, and dispatches calls through the guarded Python mcp SDK import
@@ -68,7 +72,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── workspace_preflight.py ← Read-only external-workspace git/manifest/toolchain snapshot used by gateway task creation
       ├── local_model.py       ← Local LLM lifecycle (llama-cpp-python)
       ├── local_model_autostart.py ← Local model startup helper
-      ├── deep_self_review.py   ← Deep self-review: Generated Deep Self-Review Atlas repository context + full memory whitelist → 1M-context model
+      ├── deep_self_review.py   ← Deep self-review: Generated Deep Self-Review Atlas repository context + full memory whitelist → 1M-context model. Guaranteed-fit assembly (v6.27.1): the in-prompt OMITTED-files section is bounded (counts per reason + capped sample; full coverage stays in the persisted atlas manifest) and reserved inside the atlas fixed budget; atlas budget_exceeded retries once with the compact manifest, and a final-shrink rebuild (tighter hard budget by the measured overage) replaces the historical fatal 'Review pack too large' error — the gate remains as the fail-closed last assertion. File selection is ranked by import-graph centrality (reverse-import in-degree from code_intelligence, additive bonus ≤600, deep-review-only)
       ├── review.py            ← Code collection, complexity metrics, pre-commit review
       ├── preflight_runner.py  ← Hermetic reviewed-change pytest runner: disposable git worktree, candidate diff replay, temp data/settings/pycache env, and launcher-env scrub so review tests cannot mutate live repo/data
       ├── review_substrate.py  ← Shared reviewer-slot coordinator for task acceptance and the migration target for remaining review surfaces; duplicate model ids are independent slots
@@ -76,7 +80,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── triad_review.py      ← Shared multi-model review primitives: JSON-array extraction is reused by repo + skill review; per-actor records, quorum/degraded accounting, and model-error events power the skill-review path
       ├── onboarding_wizard.py ← Shared desktop/web onboarding bootstrap + validation
       ├── settings_setup_contract.py ← SSOT for Settings/Onboarding setup contract, derived bootstrap state, and setup payload validation
-      ├── owner_inject.py      ← Per-task user message mailbox (compat module name)
+      ├── owner_mailbox.py      ← Per-task user message mailbox (compat module name)
       ├── launcher_bootstrap.py ← Bundle-to-repo bootstrap and managed sync helpers (used by launcher.py)
       ├── provider_models.py   ← Provider-specific model ID helpers, direct-provider defaults (OpenAI, Anthropic, Cloud.ru, GigaChat)
       ├── runtime_mode_policy.py ← Runtime-mode protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by registry, git tools, and Claude gateway guards
@@ -113,7 +117,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── workspace_executor.py ← Host-owned local/docker_exec workspace process backend, path mapping, executor traces, and executor service lifecycle
       ├── tool_capabilities.py ← SSOT for tool sets (core, parallel-safe, truncation, browser)
       ├── tool_access.py       ← Tool API v2 policy matrix: ToolProfile × ResourceRoot × Operation
-      ├── tool_policy.py       ← Tool access policy and gating (imports from tool_capabilities)
+      ├── tool_policy.py       ← Round-one tool visibility policy (tool sets live in tool_capabilities)
       ├── utils.py             ← Shared utilities; v5.8.3-rc.2 SSOT for JSON atomic writes/reads, UTC timestamps, hashes, log sanitization, and subprocess helpers
       ├── world_profiler.py    ← System profile generator (WORLD.md)
       ├── contracts/           ← Frozen ABI (Phase 1 Protocols + TypedDicts + SkillManifest; Phase 4 adds plugin_api.py with PluginAPI + ExtensionRegistrationError + permission/route-method/forbidden-settings tuples)
@@ -162,16 +166,29 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── parallel_review.py ← Parallel triad+scope orchestration and verdict aggregation (extracted from git.py)
       │   ├── plan_review.py     ← Pre-implementation design review (adaptive context levels, shared ReviewCoordinator slots, duplicate model IDs allowed, plan_task tool)
       │   ├── review.py          ← Task acceptance review tool plus multi-review adapters backed by the shared review substrate
-      │   ├── review_context_atlas.py ← Deterministic bounded-context compiler for scope_review, plan_task, and deep_self_review; raw-inlines selected files and accounts for every tracked path in the manifest
+      │   ├── review_context_atlas.py ← Deterministic bounded-context compiler for scope_review, plan_task, and deep_self_review; raw-inlines selected files and accounts for every tracked path in the manifest. Optional additive `centrality_scores` (rel_path→bonus) consumed in candidate scoring; empty default keeps scope/plan selection byte-identical (deep self-review is the only producer)
+      │   ├── query_code.py     ← Read-only structured code intelligence tool (`query_code`) over the code inventory: symbols, definitions, references, callers/callees, impact, structural search, and relevant file ranking
       │   ├── review_helpers.py  ← Shared review helpers (section loader, touched/head packs, intent, pytest preflight via agent interpreter)
       │   ├── review_revalidation.py ← Reviewed-commit fingerprint revalidation helpers (blocks when staged diff changes after review)
       │   ├── scope_review.py   ← Scope reviewer (enforcement-aware, budget-aware)
       │   ├── services.py        ← Task-scoped long-running service mini-manager: start/status/logs/stop with process-group cleanup and retained private log blobs
       │   ├── skill_exec.py      ← Phase 3 external-skill surface: list_skills, skill_review, toggle_skill, skill_exec (subprocess runner with cwd confinement, env scrubbing, timeout, runtime allowlist python/python3/bash/node/deno/ruby/go; gated by enabled + fresh executable review + fresh content hash — v5.1.2 Frame A: runtime_mode no longer blocks execution)
-      │   ├── skill_publish.py   ← Agent-callable `submit_skill_to_hub` tool: validates a fresh clean-reviewed local skill (sources `external`/`self_authored`/`user_repo`/`ouroboroshub`/`clawhub`; `native` only when no `.seed-origin` marker), infers OuroborosHub from `OUROBOROS_HUB_CATALOG_URL`, commits payload + catalog update to the user's fork via GitHub GraphQL, and opens a PR without mutating the local Ouroboros repo. For marketplace-managed sources the generated PR body is force-prefixed with a `## Provenance` block read from the local sidecar (`.ouroboroshub.json` slug / `.clawhub.json` clawhub_slug); when no sidecar exists the source is reclassified as `external` by skill_loader and submit proceeds without the block.
+      │   ├── skill_publish.py   ← Agent-callable `submit_skill_to_hub` tool: validates a fresh no-blocker review — `clean` or advisory-only `warnings` (v6.27.1; advisory findings are disclosed in the PR body under `## Known advisory findings`; blockers/pending/stale still refuse) — for a local skill (sources `external`/`self_authored`/`user_repo`/`ouroboroshub`/`clawhub`; `native` only when no `.seed-origin` marker), infers OuroborosHub from `OUROBOROS_HUB_CATALOG_URL`, commits payload + catalog update to the user's fork via GitHub GraphQL, and opens a PR without mutating the local Ouroboros repo. For marketplace-managed sources the generated PR body is force-prefixed with a `## Provenance` block read from the local sidecar (`.ouroboroshub.json` slug / `.clawhub.json` clawhub_slug); when no sidecar exists the source is reclassified as `external` by skill_loader and submit proceeds without the block.
       │   ├── skill_preflight.py ← v5.7.0 heal-safe, read-only skill payload preflight validator (manifest parse + Python compile() / node --check / bash -n; no review-state mutation)
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       └── platform_layer.py    ← Cross-platform process/path/locking helpers
+
+      ouroboros/process_custody.py ← Supervised spawning + durable orphan ledger
+      (v6.26.0): `spawn_supervised()` records every long-lived child in
+      `data/state/process_ledger.jsonl` ({pid, pgid, fingerprint{start_time,
+      cmd_sha256}, purpose, scope task|session|daemon, owner_task, session_id});
+      the reaper (server startup + 10-min supervisor tick) kills entries whose
+      generation/task owner is gone, matching by STRICT fingerprint only —
+      never by command-line class, so dev and packaged instances can coexist.
+      `start_parent_lifeline()` gives our python entrypoints (workers,
+      extension runner, claude readonly child) a ppid watchdog that
+      group-suicides when the parent dies. Panic layers (`_active_subprocesses`,
+      port sweeps, Windows Job Objects) are unchanged complements.
 
 # Build & CI (not part of runtime)
 .github/workflows/ci.yml     ← Four-tier CI (quick / full / integration / build+release)
@@ -181,7 +198,8 @@ build_windows.ps1             ← Windows build (PyInstaller → .zip)
 scripts/build_repo_bundle.py  ← Builds `repo.bundle` + `repo_bundle_manifest.json` for packaged releases
 scripts/run_external_review.py ← v5.1.2 dev-loop tool: invokes `ouroboros.tools.parallel_review.run_parallel_review` from outside the runtime against `git diff --cached`. Reads `~/Ouroboros/data/settings.json` for `OPENROUTER_API_KEY` / `OUROBOROS_REVIEW_MODELS` / `OUROBOROS_SCOPE_REVIEW_MODELS`, builds a minimal `ToolContext`, prints FULL raw triad+scope output (no truncation). Used to dry-run the same review pipeline `commit_reviewed` triggers before any actual commit. Output: stdout (and optional `--output PATH`). Not part of the runtime gate; review-exempt dev tool.
 scripts/cleanup_test_pollution.py ← Dry-run-first cleanup utility for local test-pollution artifacts: known test skill state dirs, stale `__extension_imports`, and accidental `MagicMock`-named repo-root files. Use `--apply` only after inspecting planned removals.
-devtools/benchmarks/        ← Tracked operator benchmark tooling (ProgramBench, Terminal-Bench/Harbor, SWE-bench, SWE-bench Pro, OSWorld logs/preflight skeleton). It is reviewed when touched, is manifest-accounted by Atlas, is not imported by runtime core, and is not packaged as runtime app code. Adapters write generated run sidecars (manifest/result-ledger schemas using adapter-specific default filenames such as `run_manifest.json`, `result_index.jsonl`, `<predictions>.run_manifest.json`, `<predictions>.ledger.jsonl`, or `osworld_preflight.*`) only under explicit benchmark output roots outside `repo/` and outside live runtime `data/`. The cross-task self-evolution drivers (`swe_bench_pro/evolve_pro.py`, `evolve_smoke.py`) are SERVER-DRIVEN via the shared `common/server_runner.py::IsolatedServer`: each spawns a REAL isolated `server.py` on an OS-assigned free port against a throwaway `git clone` (its `origin` is removed so an isolated self-mod can never push back) + an isolated data root, then drives the production loop over the HTTP API while the live body/repo/memory/budget are never touched. KNOWN LIMITATION (v6.24.0-rc.3, owner-deferred): benchmark instances are external workspaces → project-scoped, and the Phase-3 leak guard (`agent_task_pipeline` runs `maybe_promote` only when `not project_id`) intentionally skips post-task promotion for project tasks, so the between-instance self-evolution loop does NOT fire for benchmark instances yet (driver = isolation + solve + capture; real cross-task evolution is a tracked follow-up — see `swe_bench_pro/METHODOLOGY.md` §3). Between instances the driver calls `supervisor.state.reset_per_task_budget`, which is guarded (BIBLE P8): it zeroes the per-task budget ONLY in a data root that carries the explicit sentinel file `.ouroboros_isolated_benchmark` (`supervisor.state.ISOLATED_BENCHMARK_SENTINEL`) which the drivers write into their throwaway root; a live data root — the default `~/Ouroboros/data` OR a custom/Drive-backed `OUROBOROS_DATA_DIR` — never has the sentinel, so its budget can never be reset.
+devtools/benchmarks/        ← Tracked operator benchmark tooling (ProgramBench, Terminal-Bench/Harbor, SWE-bench, SWE-bench Pro, OSWorld step-loop/log tools, harness_bench_fast wrapper). It is reviewed when touched, is manifest-accounted by Atlas, is not imported by runtime core, and is not packaged as runtime app code. Adapters write generated run sidecars (manifest/result-ledger schemas using adapter-specific default filenames such as `run_manifest.json`, `result_index.jsonl`, `<predictions>.run_manifest.json`, `<predictions>.ledger.jsonl`, `osworld_preflight.*`, or E1v2 summaries) only under explicit benchmark output roots outside `repo/` and outside live runtime `data`. Terminal-Bench uses `terminal_bench/run_tb.py` / `harbor_installed_agent.py` for installed full-Ouroboros runs and leaderboard-shaped k-trial submission trees. OSWorld uses `osworld/run_step_agent.py` for official env.step trajectories with native screenshot attachments. SWE-bench Pro frozen prepared-repo predictions use `pro_predictions.py`; evolutionary E1v2 runs live under `swe_bench_pro/e1v2/` and carry `obo-data` + `obo-repo` volumes across tasks. Post-task evolution can now receive GLOBAL improvement-backlog/promotion signals from project-scoped workspace tasks while project facts still stay isolated in the per-project store; this removes the earlier `no_promotion` limitation without weakening the project-fact leak guard. Between instances drivers still reset only per-task budget inside isolated benchmark roots that carry the explicit `.ouroboros_isolated_benchmark` sentinel; live data roots are never budget-reset.
+skills/unix_computer_use/   ← Bundled extension skill payload for supervised local desktop observation/input on macOS/Linux (screenshot with coordinate normalization, window_list, click/drag/type/key/move/scroll, mouse_down/up, hold_key, cursor_position, wait, best-effort AX set-of-marks). Launcher-seeded native skills receive a hash-pinned native-trust review verdict at seed time and zero-grant ones auto-enable (OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS); it reports missing platform backends instead of guessing, and is not required by the OSWorld step-loop adapter. Windows support is a future separate skill (P7).
 packaging/cli/                ← Packaged CLI shell/cmd wrappers and user-local installer launchers copied into desktop artifacts
 Dockerfile                    ← Docker image (web UI runtime)
 ```
@@ -257,6 +275,14 @@ packaged app. `platform_layer.resolve_bundled_node()` prefers this bundled node
 over a PATH (e.g. Homebrew) node for `node`-runtime skills and the `node --check`
 preflight; in dev builds without the bundle it falls back to PATH node.
 
+Packaged artifacts also bundle **ripgrep** under `ripgrep-standalone/` (pruned
+to `bin/rg` or `rg.exe`). The build scripts fetch it via
+`scripts/download_ripgrep_standalone.sh`/`.ps1` before PyInstaller;
+`search_code` resolves it through `platform_layer.resolve_bundled_ripgrep()`
+before falling back to PATH `rg` and then the Python scanner. Unlike raw shell
+`rg`, the first-class tool enumerates allowed files first and keeps the existing
+protected/secret/subagent filters.
+
 External workspace tasks keep `Env.repo_dir` pinned to the Ouroboros repo for
 prompts, BIBLE, architecture/development docs, skills, and review policy.
 `ToolContext` carries an optional `workspace_root`; contextual repo tools resolve
@@ -271,9 +297,11 @@ configured depth/cap limits, and descendants deeper than the first child level
 are forced onto the light model lane. Enabled/reviewed extension and
 MCP tools remain callable by owner policy, subject to `task_contract`
 resource constraints such as `web=false` or `network=false`. The target workspace
-is left dirty by design and exported as a patch artifact; Ouroboros does not
-commit inside external repositories, and shell execution reports a hard warning if
-git refs move.
+may be left dirty or may contain task-local git commits/branches/tags/pushes when
+the task itself requires them; Ouroboros still blocks git operations that target
+the Ouroboros repo/data roots. Workspace patch artifacts are captured against the
+preflight git base, while acting self-worktree subagents remain strict patch-only
+and still fail if their HEAD moves.
 The CLI downloads patch artifacts through the task artifact endpoint, waits for
 artifact finalization in `--patch` / `--patch-out` mode, and fails nonzero when
 the patch is missing, empty, or failed. `--no-stream` suppresses live progress
@@ -535,7 +563,7 @@ finalization states.
 │   │   ├── server_process.json ← Launcher-owned server PID/process-group identity record for relaunch cleanup
 │   │   ├── advisory_review.json ← Durable advisory/review ledger (runs, attempts, obligations, commit-readiness debts)
 │   │   ├── deep_self_review_context.json ← Last deep self-review Generated Deep Self-Review Atlas manifest and model metadata
-│   │   ├── code_intel/<repo_key>/inventory.json ← Internal Code Inventory v1 facts (file hashes, dispositions, symbols/imports; no raw source cache)
+│   │   ├── code_intel/<repo_key>/inventory.json ← Internal Code Inventory v2 facts (file hashes, dispositions, symbols/imports/calls/references; no raw source cache)
 │   │   ├── evolution_metrics_cache.json ← Cached per-tag Evolution metrics (schema 1; regenerated by `/api/evolution-data` / `collect_evolution_metrics`)
 │   │   ├── evolution_campaign.json ← Active/paused Evolution Campaign objective, progress, cycle history, and budget counters
 │   │   ├── evolution_checkpoints.jsonl ← Append-only per-evolution-cycle checkpoints with git/memory hashes and status/cost facts
@@ -642,7 +670,8 @@ Shown when `settings.json` does not contain any supported remote provider key an
   Web onboarding uses `/api/claude-code/status` and `/api/claude-code/install`.
 - The wizard blocks progression if nothing runnable is configured.
 - When OpenRouter is absent and official OpenAI is the only configured remote runtime, untouched default model values are auto-remapped to `openai::gpt-5.5` / `openai::gpt-5.5-mini` so first-run startup does not strand the app on OpenRouter-only defaults.
-- `web_search` uses the official OpenAI Responses API only. It requires `OPENAI_API_KEY` and treats any non-empty `OPENAI_BASE_URL` as an incompatible custom runtime configuration rather than a fallback. Results are JSON with `answer` and `sources[]` when citation annotations are available; usage events include task/root/parent/delegation attribution and `source=web_search`.
+- `web_search` uses the best configured backend in order: official OpenAI Responses, OpenRouter `openrouter:web_search` server tool, Anthropic `web_search_20250305`, then optional `ddgs`. Results are JSON with `answer`, `sources[]`, and `backend`; usage events include task/root/parent/delegation attribution and `source=web_search` when the backend reports usage. Missing credentials surface as an explicit unavailable-backends JSON error, not as repeated opaque tool failures. An empty OpenAI result (no answer text and no sources) falls through to the next backend rather than returning a fake `(no answer)` success, so a degenerate first leg cannot shadow a working one.
+- v6.27.0 benchmark-harness hardening (rationale, so future maintainers need not dig commits): (1) **Service `keep_alive` / `service_teardown=keep`** lets a service deliberately outlive its task so an external verifier can connect; it stays custody-ledgered and dies on session change/panic, and cancel/hard-timeout worker kills now spare ledgered keep services (`kill_pid_tree(exclude_pids=...)`, POSIX-only — on Windows `kill_pid_tree` tree-kills via `taskkill /T` and does not honor exclusions, so `service_teardown=keep` is not preserved across Windows cancel/hard-timeout). (2) **Safety parse** does a robust bracket-scan + one same-slot repair retry, then fails closed — the worst-status object across candidates wins so an echoed `SAFE` cannot mask a `DANGEROUS` verdict. (3) **Deadline milestones** (50/25/10% remaining) and the deadline-derived `run_command` cap fire only when a task carries `deadline_at`; they are inert on Terminal-Bench leaderboard runs by design (Harbor owns task timeouts). (4) **External-workspace git policy** allows full local git in a task workspace while deterministically blocking any git that targets the Ouroboros self-repo/data via cwd, `-C`, `--git-dir`/`--work-tree`, `GIT_DIR`/`GIT_WORK_TREE` env, positional path, or glued/newline-separated segments. (5) **`search_code`** pre-enumerates a policy-gated file list (each path filtered through `path_allowed` before rg sees it — a security property), skips non-regular and oversized files, caps the scan at `MAX_SEARCH_FILES_SCANNED` with an explicit "scan stopped at N files" note, and hands the list to rg in batches (`batch_size=400`) to stay under `ARG_MAX`, so a search whose root resolves to `/` cannot OOM or `E2BIG` the worker. (6) **Review enforcement** (advisory vs blocking) is owner-only; the agent must not hardcode findings to always-block (BIBLE P3), pinned by item-agnostic invariant tests in the frozen contract suite.
 - When Cloud.ru is the only configured remote runtime, first-run model defaults use explicit `cloudru::...` IDs from `provider_models.CLOUDRU_DIRECT_DEFAULTS`. OpenAI-compatible endpoints are first-run capable but never receive guessed defaults: the wizard asks for the base URL/key, can proxy `/models` through `/api/openai-compatible/models`, and requires explicit `openai-compatible::...` model slot values because arbitrary compatible endpoints have no universal safe model ID.
 - Closing the wizard without saving is non-fatal: the main app still launches and the user can finish configuration in Settings.
 
@@ -685,8 +714,9 @@ advisory/commit review from writing live `data/settings.json` or triggering
 launcher-managed reset behavior against the live repo.
 
 Safety-critical protection is no longer implemented as "copy these files from the
-bundle on every launch". The runtime guardrails are the hardcoded sandbox /
-post-edit revert in `registry.py` plus the launcher-managed repo integrity checks.
+bundle on every launch". The runtime guardrails are the runtime-mode protected-path
+policy enforced by the `registry.py` dispatcher plus the launcher-managed repo
+integrity checks.
 
 ### Single-source rescue on startup (v4.36.1+)
 
@@ -779,7 +809,7 @@ History sync is intentionally two-pass: progress/system entries are replayed fir
 
 ### Files
 
-`web/modules/files.js` is the browser file manager: directory tree, breadcrumbs, preview/editor, upload/download, copy/move, and write guards. Backend policy lives in `gateway/files.py`: root confinement is lexical; symlink targets may intentionally resolve outside the root; owner-only state and skill control-plane sidecars are protected.
+`web/modules/files.js` is the browser file manager: directory tree, breadcrumbs, preview/editor, upload/download, copy/move, and write guards. Backend policy lives in `gateway/files.py`: root confinement is enforced on the RESOLVED path (v6.26.0) — symlinks whose target leaves the configured root are listed but not readable/writable/traversable; owner-only state and skill control-plane sidecars are protected.
 
 ### Skills, Marketplace, Widgets
 
@@ -802,6 +832,10 @@ Chart.js is bundled locally as `web/chart.umd.min.js`; no CDN dependency by desi
 
 `ouroboros/llm_observability.py` is the LLM-side adapter: it persists provider request/response payloads before compaction can discard them and returns manifest refs for usage/outcome ledgers. `ouroboros/outcomes.py` is the typed result layer over the lifecycle record: `task_contract`, `outcome_axes`, `reason_code`, `loop_outcome`, `artifact_bundle`, and `verification_ledger` keep lifecycle, execution health, artifacts, objective evaluation, review status, and recovered tool failures separate. Objective success is filled only by the LLM-first `task_acceptance_review` evaluator; if that evaluator did not run, objective is `not_evaluated`. Historical stored records with `result_status` are read through a compatibility normalizer, but new public task-result/API output uses `outcome_axes`; duplicate scheduling rejections are warning/degraded execution states, not red task failures. `task_results/<task_id>.json` remains the compatibility record; large verification details may spill to task-scoped artifacts.
 
+Forced finalization is an honest positive shelf (v6.29.0). When a deadline grace window, budget stop, or round limit forces the final answer, the loop stamps the typed reason code (`finalization_grace` / `budget_exhausted` / `round_limit`) plus a typed `_best_effort_extracted` fact set ONLY when a real model answer came back, and `derive_loop_outcome` lands the result on `EXECUTION_BEST_EFFORT` when that fact is set and the final text is non-empty and not an error marker — a deterministic runtime-facts gate (P5-safe: no prose classification, no whitewash; host fallback strings such as budget rejection notices never set the fact and stay `failed`). `best_effort` is not "terminal success": CLI `_is_terminal_success` and the effective-status failure projection treat it as a non-failed, non-clean completion. The supervisor cooperates: when the grace window opens, `supervisor/queue.py` writes a typed `finalize_now` control into the task's owner mailbox (`ouroboros/owner_mailbox.py` entries carry a `kind`; control entries are routed structurally, never injected as owner prose), and the loop routes it to `_handle_forced_finalization` — one tool-less final answer inside the grace window, so a deadline never returns emptiness. On the hard-kill path the supervisor additionally salvages the last persisted assistant text from observability (`latest_llm_response_text`) into the terminal result. Budget exhaustion (`budget_remaining <= 0` past round 1) attempts one bounded tool-less best-effort extraction before rejecting.
+
+Task acceptance review is a completion coach (v6.29.0): with `classify_outcome_tier` policy, reviewer slots classify the deliverable tier — `solved` / `best_effort` / `blocked_with_evidence` — and name the single highest-value change to move one tier up, while the veto over FALSE `solved` claims is preserved (a `solved` tier with a FAIL verdict maps to objective `fail`). The objective axis consumes the aggregated worst-tier-wins classification: `solved`→`pass`, `best_effort`→`best_effort`, `blocked_with_evidence`→`fail`; without a tier the legacy verdict mapping applies. Final messages may carry a machine-readable `FINAL ANSWER: <answer>` line (SYSTEM.md protocol); `extract_final_answer` lifts it into the typed `final_answer` field of the loop outcome and task result record for exact-match deliverable consumers.
+
 Rationale: logs are UI projections, not the source of truth. The private ledger preserves exact replay evidence locally while redacted projections keep operator-facing surfaces safe. Typed outcomes prevent benchmark adapters, CLI waiters, and the Web UI from treating non-empty error text as semantic success.
 
 ### Settings
@@ -813,6 +847,13 @@ Settings has Providers, Secrets, Models, Behavior, Advanced, and About. It handl
 If `OUROBOROS_NETWORK_PASSWORD` is configured, non-loopback HTTP/WebSocket access requires authentication; `/api/health` stays public. With no password, non-loopback access remains open by explicit operator choice.
 
 The executable route SSOT is `ouroboros/gateway/router.py`; file-browser routes come from `gateway/files.py::file_browser_routes()`, the contract index is `gateway/contracts.py::HTTP_ENDPOINTS`, and Host Service routes come from `gateway/host_service.py::create_host_service_app`.
+
+File-browser symlink containment (v6.26.0): every `/api/files/*` endpoint
+resolves the requested path and rejects it when the RESOLUTION leaves the
+configured root (`Path escapes file browser root`). In-root symlinks keep
+working; symlinks pointing outside the root are listed (with
+`is_symlink: true`) but cannot be read, written, deleted, or traversed —
+the old pass-through behavior was a root escape.
 
 | Method | Path | Handler |
 |---|---|---|
@@ -929,11 +970,18 @@ Each iteration (0.5s sleep):
 2. `ensure_workers_healthy()` — respawn dead workers, detect crash storms
 3. Drain event queue (worker→supervisor events via multiprocessing.Queue)
 4. `enforce_task_timeouts()` — soft/hard timeout handling
-5. `enqueue_evolution_task_if_needed()` — auto-queue evolution if enabled
-6. `assign_tasks()` — match pending tasks to free workers
-7. `persist_queue_snapshot()` — save queue state for crash recovery
-8. Poll `LocalChatBridge` inbox for user messages
-9. Route messages: slash commands → supervisor handlers; text → agent
+5. Periodic custody reap (every 600s) and periodic zombie reconcile (every 300s,
+   `server.py::_periodic_zombie_reconcile`): heals `review_job.json` files and
+   `task_results/<id>.json` records stuck at `running` after a worker died
+   mid-flight (crash/SIGKILL/manual stop). Both reconciles are liveness-gated
+   (pid-dead / queue-snapshot-present + task-absent + worker-boot-after-task
+   evidence + grace), so a live review or task is never touched; the same
+   reconciles also run once at server startup (lifespan).
+6. `enqueue_evolution_task_if_needed()` — auto-queue evolution if enabled
+7. `assign_tasks()` — match pending tasks to free workers
+8. `persist_queue_snapshot()` — save queue state for crash recovery
+9. Poll `LocalChatBridge` inbox for user messages
+10. Route messages: slash commands → supervisor handlers; text → agent
 
 ### Worker crash handling and retry limits
 
@@ -991,9 +1039,13 @@ In `runtime_mode=light`, generic writes to cognitive memory and absolute home pa
 
 Rationale: tool classification drift caused subtle bugs; every hardcoded set now has one canonical home. Review outputs and cognitive artifacts are exempt from generic truncation because they are process memory, not transport noise.
 
-Context compaction policy is deliberately profile-aware. `context_budget.py` owns the thresholds: max mode keeps remote models on emergency-only compaction above ~1.2M chars to preserve raw tool outputs, process memory, and prompt-cache hit rate; low context mode lowers the emergency threshold to ~400K chars and enables routine compaction after round 6 / >40 messages even on remote routes, matching the smaller 200K/local horizon. Local models also compact aggressively under the same routine path. Manual pending compaction is always honored, and every manual/emergency/routine branch persists a forensic checkpoint before summarizing so low mode changes granularity without silent truncation.
+Context compaction policy is deliberately profile-aware AND window-aware (v6.30.0). `context_budget.py` owns the thresholds: max mode keeps remote models on emergency-only compaction, with the emergency threshold derived from the ACTIVE model's real context window (`provider_models.context_window_tokens`, ~60% of the window in chars, profile constant ~1.2M chars as the ceiling for 1M-window models) so a 200K-window model triggers emergency compaction near ~480K chars instead of silently overflowing at the 1.2M default; known small-window (≤260K tokens) remote models additionally get the routine compaction path even in max mode. Low context mode lowers the emergency threshold to ~400K chars and enables routine compaction after round 6 / >40 messages even on remote routes, matching the smaller 200K/local horizon. Local models also compact aggressively under the same routine path. Manual pending compaction is always honored, and every manual/emergency/routine branch persists a forensic checkpoint before summarizing so low mode changes granularity without silent truncation.
 
 Provider context-window overflows in max mode do not silently switch modes. `loop_llm_call.py` classifies local/remote overflow errors, records a durable `context_overflow_suggest_low` event in `events.jsonl`, sets a one-time usage flag, and lets `loop.py` render an owner-visible recovery hint suggesting low context mode for the next attempt/task. Quota/auth/billing, hard bad-request, and request-too-large failures are also classified as non-retryable for the identical request, recorded in LLM usage/error events, and surfaced as recovery hints instead of consuming retry rounds. In low mode context overflow is reported without suggesting another downgrade.
+
+LLM retry budgets are per failure class (v6.28.0). Transient provider failures — empty/incomplete responses (the `finish_reason=null` glitch and content-empty `llm_empty_response` shapes both retry under this budget) and `provider_transient` exceptions (429/5xx/overloaded) — retry the SAME model with a larger attempt budget (`transient_retry_max`, env `OUROBOROS_TRANSIENT_RETRY_MAX`, default 6, floored at the caller's budget) and exponential backoff capped at 60s, while permanent classes (auth, quota, bad request, request-too-large) keep failing fast at the base budget. Backoff sleeps are deadline-bounded: when the task deadline (`task_metadata.deadline_at`) cannot absorb the next sleep plus a useful follow-up attempt, the retry loop stops with a durable `llm_retry_deadline_exhausted` event — emitted by BOTH transient paths (the finish_reason=null/empty-response branch and the classified-exception branch) — instead of burning the remaining budget sleeping. No cross-model fallback is introduced by this policy — single-model setups (all slots one model, empty fallback) stay clean by design, and the final failure text reports the real attempts used. The OpenRouter strip-and-retry matcher also covers gpt-5-style "encrypted reasoning item"/"encrypted content for item rs_…" 400s, reusing the same one-shot reasoning-metadata strip as thought-signature errors.
+
+Context compaction is failure-isolated (v6.28.0). `context_compaction.py` summarizes old rounds in batches with per-batch isolation: a failed batch leaves only its own rounds raw and its spend is still accounted (`_BatchSummaryError` carries usage); a round whose summary is missing degrades individually instead of failing the batch. The summarizer prefers a structured `emit_round_summaries` tool protocol (`tool_choice="required"`, reliable `round_id` keying) and falls back to the legacy `[round:N]` text protocol — automatically for local light models, or per-response when a model answers in prose. ⚠️-protection scans the first two non-empty lines of a tool result (shell autocorrect notes — with or without a blank separator line — can prefix the marker), and `⚠️ SHELL_EXIT_ERROR` rounds are deliberately compactable — failed-command trial-and-error history is exactly what must compact, with the summarizer instructed to keep the first error line verbatim. Emergency compaction in `loop.py` adapts `keep_recent` to `min(50, max(6, spans//2), max(1, spans-1))` — halve the history with floor 6, always clamped below the span count — so an oversized transcript with few huge rounds actually compacts instead of no-opping at the `len(spans) <= keep_recent` gate (a single round has nothing older to summarize).
 
 Prompt-cache markers are provider-gated in `llm.py`. Anthropic-compatible routes keep message-block cache markers and tool-schema cache markers; OpenRouter Gemini routes keep message-block markers only; other OpenRouter, direct OpenAI/OpenAI-compatible/Cloud.ru, and local routes receive copied payloads with unsupported cache metadata removed. Ouroboros sends only `{"type": "ephemeral"}` and does not send cache TTLs. OpenRouter reasoning round-trip fields (`reasoning`, `reasoning_details`, `response_id`) are preserved only on OpenRouter payloads and stripped from direct/local provider copies so provider-specific continuity does not leak across routes. If an OpenRouter conversation already carries `reasoning_details`, `LLMClient` sets `provider.allow_fallbacks=false` so endpoint-bound thought signatures cannot silently fail over to a different upstream; a signature/corrupted-thought 400 gets one retry for that call with OpenRouter reasoning metadata stripped.
 
@@ -1014,6 +1066,31 @@ with git/memory hashes, `outcome_axes`, and per-cycle cost/rounds for future
 eval curves. Task attempts/campaign tasks are counted separately from absorbed
 evolution cycles: an absorbed cycle requires a reviewed self-mod commit plus
 successful startup restart verification of that commit.
+The evolution redesign (v6.30.0) closes the structural feedback and hygiene
+gaps. Campaign state and the transaction lifecycle live in
+`supervisor/evolution_lifecycle.py` (queue.py keeps queueing only).
+Solve-capability ledger: because a commit-bearing cycle is recorded
+`waiting_for_restart` at task-done, the later absorb/abandon resolution
+(restart verification or boot reconcile, `agent_startup_checks.py`) appends a
+`kind="cycle_outcome"` tag row to the checkpoints ledger (join key `task_id`),
+and `build_solve_capability_digest` feeds the absorbed-vs-failed objective
+history (explicit omission notes — never silent truncation) into the post-task
+promotion prompt. The ledger is therefore schema-additive: classic absorb
+checkpoints carry git/identity hashes while `cycle_outcome` tag rows do not,
+and the `/api/evolution-data` checkpoints projection filters tag rows out so
+the Dashboard view renders absorb checkpoints only. Deterministic cycle cleanup: a no_op/abandoned cycle restores
+the worktree to the transaction's `base_head` —
+dirty files are stashed (`evolution-cycle-cleanup-<tx>`), an ahead HEAD is
+preserved as a local `evolution-leftover-*` branch, both refs are recorded on
+the transaction; the reset is skipped (with a recorded reason) while other tasks
+run in the shared worktree, under pytest against the live repo, or via the
+`OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false` kill-switch. `commit_reviewed`
+refuses another triad+scope run after 3 genuine review-verdict blocks of a
+byte-identical staged diff (`attempt_cap_reached`; diff-scoped so a new task
+cannot reset the streak; preflight blocks neither count nor break; a changed
+diff or a `review_rebuttal` lifts it). The hard-kill path also cleans the task
+owner-mailbox so a stale `finalize_now` can never instantly force-finalize a
+same-id subagent retry.
 Post-task self-evolution (V4 envelope + V5 promotion, `post_task_evolution.py`) is
 an owner-gated, default-OFF way to trigger a cycle BETWEEN tasks instead of only
 when idle. After a qualifying task (never an evolution/`deep_self_review`/subagent
@@ -1069,7 +1146,7 @@ artifacts.
 
 ### Safety and runtime mode
 
-Every tool call passes hardcoded registry sandbox first, then policy-based LLM safety when required. `runtime_mode_policy.py` defines protected paths: safety-critical files, frozen contracts, release/build/managed-repo invariants. Light mode blocks Ouroboros self-repo/control-plane mutation, not ordinary user-file creation: `write_file(root=user_files|task_drive|artifact_store)`, process cwd under those roots, and `claude_code_edit` in external user/task/artifact directories remain valid. In external workspace mode, the light-mode dirty tripwire snapshots the Ouroboros system repo, while the separate workspace git-ref guard still watches the active workspace for commits/tags/resets. Light still blocks `runtime_data` as an artifact workaround, direct repo writes, native/control-plane skill paths, state/memory/settings, VCS mutation, and runtime-mode self-elevation. Advanced can evolve normal app code; pro can leave protected edits on disk but the commit still requires review.
+Every tool call passes hardcoded registry sandbox first, then policy-based LLM safety when required. `runtime_mode_policy.py` defines protected paths: safety-critical files, frozen contracts, release/build/managed-repo invariants. Light mode blocks Ouroboros self-repo/control-plane mutation, not ordinary user-file creation: `write_file(root=user_files|task_drive|artifact_store)`, process cwd under those roots, and `claude_code_edit` in external user/task/artifact directories remain valid. In external workspace mode, task-local git is allowed while runtime repo/data paths remain protected; patch artifacts are captured against the preflight git base. Light still blocks `runtime_data` as an artifact workaround, direct repo writes, native/control-plane skill paths, state/memory/settings, VCS mutation against the Ouroboros repo, and runtime-mode self-elevation. Advanced can evolve normal app code; pro can leave protected edits on disk but the commit still requires review.
 
 Task contracts can declare `resource_policy.protected_artifacts[]` for
 execute-only black-box reference artifacts. Declared paths may be executed, but
@@ -1084,7 +1161,7 @@ Rationale: runtime mode is a self-modification boundary, not an OS sandbox. It p
 `gateways/claude_code.py` wraps `claude-agent-sdk` for edit and read-only
 advisory paths. Edit-mode delegation runs in the worker process with
 `ClaudeSDKClient` lifecycle hooks, SDK-level path/tool guards, stderr capture,
-normalized usage, and registry post-edit revert as defense in depth.
+normalized usage, and the dispatcher's protected-path policy as defense in depth.
 
 Read-only advisory review is a separate crash boundary: `run_readonly()` starts
 the same module as a Python child (`--readonly-child`) over JSON stdin/stdout.
@@ -1114,6 +1191,19 @@ Rationale: commit review is the immune system's blocking feedback loop. The stag
 
 Rationale: diff reviewers catch line-level mistakes; scope reviewer catches cross-module contracts and forgotten touchpoints. Running both on the same staged snapshot prevents one reviewer result from hiding the other.
 
+Structural smoke gates (deterministic, BIBLE P3 "codebase size" component): the
+constants live in `ouroboros/review.py` (`MAX_TOTAL_FUNCTIONS`,
+`MAX_MODULE_LINES`/`GRANDFATHERED_OVERSIZED_MODULES`, `MAX_FUNCTION_LINES`) and
+are enforced by `tests/test_smoke.py` both in CI (quick-test on every push) and
+in the hermetic pytest preflight that runs before every self-commit review.
+`tests/`, `devtools/`, and the frozen `launcher.py` shell are excluded from the
+function-count walk; grandfathered modules are an explicit debt register, not a
+loophole. Growth must be acknowledged: raising a gate value requires a
+deliberate edit of the constant with a one-line justification (never hardcode
+the number elsewhere). These gates caught externally merged PRs that bypassed
+the in-process review path — they are the last deterministic line of the immune
+system, so weakening them requires the owner's explicit decision.
+
 The shared hard prompt-size SSOT is `REVIEW_PROMPT_TOKEN_BUDGET = 920_000` in
 `ouroboros/tools/review_helpers.py`. `review_context_atlas.py` targets 850K
 estimated total prompt tokens for scope review, plan review, and deep
@@ -1124,20 +1214,63 @@ Scope review additionally reserves output headroom inside the reviewer's 1M
 window. The 920K SSOT governs INPUT, but the scope reviewer also reserves
 `_SCOPE_MAX_TOKENS` (100K) for OUTPUT and a tokenizer headroom margin because
 provider accounting can exceed the local estimator on atlas-heavy prompts. 920K
-input + 100K output exceeds 1M, which the provider rejects with a hard 400 that
-fails closed and blocks every commit. So `scope_review.py` gates the assembled
-INPUT prompt on
+input + 100K output exceeds 1M, which the provider rejects with a hard 400
+(historically fail-closed; since v6.30.0 the tightly-matched oversize class
+downgrades to the non-blocking `budget_exceeded` skip described below). So
+`scope_review.py` gates the assembled INPUT prompt on
 `_SCOPE_INPUT_TOKEN_LIMIT = min(920K, 1M − _SCOPE_MAX_TOKENS − margin)`, with a
 substantial tokenizer headroom margin (currently 155K tokens) — the 920K
-SSOT itself is left untouched. Before routing to the existing NON-blocking
-`budget_exceeded` skip, scope review retries once with a compact Atlas prompt:
-the durable `context_manifest` keeps full per-file coverage, while the visible
-prompt keeps a full compact path/disposition coverage index plus bounded
-per-disposition samples so the reviewer still sees the omission surface. On a
-repo whose compact atlas still approaches the cap, scope review may therefore
-legitimately skip (advisory) while triad remains the gate; the P3-aligned remedy
-is to shrink the repo, never to lower the reviewer model below the 1M context
-floor.
+SSOT itself is left untouched. The cap is additionally MODEL-FAMILY-CALIBRATED
+(v6.27.1): the chars/4 estimator tracks GPT-style tokenizers within that 155K
+margin, but Claude-family tokenizers cut code-heavy packs at ~2.5 chars/token —
+a real scope pack estimated at 739,508 tokens measured 1,166,914 REAL tokens
+(1.58x) and was rejected 400 `prompt is too long` by every upstream. The
+calibration SSOT is `review_helpers.calibrated_input_token_limit` (+
+`is_claude_family_model`, ratio 1.65): for Claude-family reviewers it returns
+`(window − output_reserve) / 1.65` (≈545K estimated tokens for the 1M scope
+window) so the assembled prompt fits the model's real tokenizer inside the same
+window. Both `scope_review._effective_scope_input_limit` (per scope slot) and
+`deep_self_review.run_deep_self_review` (deep reviewer resolved before pack
+build) consume it. Since v6.30.0 the scope cap is also WINDOW-AWARE: a known
+reviewer window from `provider_models.context_window_tokens` replaces the
+assumed 1M when computing the effective input cap, so a small-window scope
+reviewer overflows into the visible non-blocking `budget_exceeded` skip instead
+of a deterministic provider 400. And if the estimate-based gate passes but the
+provider's REAL tokenizer still rejects the prompt as oversize, the tightly
+matched oversize error class (`prompt is too long`, `context_length_exceeded`,
+…) downgrades to the SAME non-blocking `budget_exceeded` advisory skip — it is
+the same failure class as the pre-call budget gate; every other provider or
+transport error keeps the fail-closed blocking path, and genuine review
+findings are never skippable this way (P3). The calibration shrinks the PROMPT
+for the same pinned reviewer — never the reviewer model or the ≥1M window floor
+(P3). Plan review fans one shared prompt across mixed-family triad slots and
+degrades per-slot non-blockingly; its per-model window sizing is planned
+follow-up work.
+Non-responded scope actor records also surface the provider failure text
+(`error` field in `build_scope_actor_record`) so a deterministic 400 is visible
+in the verdict without observability digging. The scope coverage contract
+requires explicit `severity` only on FAIL rows (it decides blocking and stays
+fail-closed); PASS rows default to `advisory` like the triad parser.
+
+Scope prompt assembly is GUARANTEED-FIT (v6.30.0): the owner directive is that
+scope review must actually run, so the assembler walks a deterministic
+degradation ladder instead of skipping. 1) full atlas; 2) compact atlas (the
+durable `context_manifest` keeps full per-file coverage while the visible
+prompt keeps a compact path/disposition coverage index); 3) inside the atlas a
+required file that cannot fit degrades to an explicit `budget_omitted`
+manifest entry instead of failing the whole pack (`budget_exceeded` survives
+only when even the content-free manifest cannot fit); 4) the largest touched
+files degrade to diff-only — their full post-change snapshots are replaced by
+an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` while their complete
+changes remain visible in the staged diff. Every step is a disclosed omission
+(P1), never silent. Only the irreducible prompt (checklist + canonical docs +
+staged diff) failing to fit remains, and that fails CLOSED
+(`fixed_overflow` blocks the commit and tells the owner to split the diff or
+configure a larger-window reviewer). The historical non-blocking
+`budget_exceeded` skip and the provider-oversize-400 downgrade remain only as
+practically-unreachable safety nets; the P3-aligned remedy for a structurally
+oversized repo stays shrinking the repo, never lowering the reviewer below the
+1M context floor.
 
 `OUROBOROS_SCOPE_REVIEW_DEGRADED=true` enables an additional low-context-only
 advisory reviewer path when the owner has selected `OUROBOROS_CONTEXT_MODE=low`.
@@ -1223,7 +1356,7 @@ Runtime floors:
 | Chat block consolidation, era compression, scratchpad consolidation | 16,384 |
 | Execution reflection and pattern-register update | 16,384 |
 | Improvement-backlog grooming (`improvement_backlog.groom_backlog`) | 8,192 |
-| Post-task evolution promotion decision (`post_task_evolution`) | 2,048 |
+| Post-task evolution promotion decision (`post_task_evolution`) | 8,192 |
 | Task summary and chat/history summary tool | 16,384 |
 | Context compaction round summaries | 32,768 |
 | Skill publish PR body generation | 8,192 |
@@ -1268,7 +1401,7 @@ Runtime floors:
 | OUROBOROS_SUBAGENT_PROJECTS_ROOT | (empty) | Durable root for genesis ("from scratch") subagent projects; empty = ~/Ouroboros/projects (outside repo/ and data/). Never age-pruned. |
 | OUROBOROS_GC_RETENTION_DAYS | 7 | Unified age (days) for startup garbage collection of ALL disposable runtime artifacts: acting worktrees, terminal task drives, and leftover service logs (hard max 365; math SSOT in `ouroboros/retention.py`). Deprecated per-subsystem retention keys are migrated into this on settings load. |
 | OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC | 120 | Poll-slice wait for required `plan_task` planning subagents; the wait extends progress-aware up to the max-wait ceiling |
-| OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC | 900 | Generous ceiling for progress-aware planning-swarm waiting; keeps extending while a scout is RUNNING with a fresh heartbeat, then fails closed (`stalled`/`saturated`/`ceiling`). Lower values apply as-is; values above the default are clamped to the `plan_task` tool/wrapper budget (raise those module constants to extend the real ceiling). |
+| OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC | 900 | Generous ceiling for progress-aware planning-swarm waiting; keeps extending while a scout is RUNNING with a fresh heartbeat. Capacity-class endings (`saturated`/`ceiling`, or <2 workers) degrade to ONE inline light-lane critique pass explicitly labeled DEGRADED (v6.30.0); worker-health failures (`stalled`) and infra errors stay fail-closed. Lower values apply as-is; values above the default are clamped to the `plan_task` tool/wrapper budget (raise those module constants to extend the real ceiling). |
 | OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC | 120 | A running planning scout with a queue-snapshot `heartbeat_lag_sec` below this is treated as "progressing" (keeps the adaptive wait extending); at/above it the scout is stale. |
 | TOTAL_BUDGET | 10.0 | Total budget in USD |
 | OUROBOROS_PER_TASK_COST_USD | 20.0 | Per-task soft threshold in USD |
@@ -1284,6 +1417,7 @@ Runtime floors:
 | OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 300 | Wall-clock timeout (seconds) for the hermetic reviewed-change pytest preflight (`preflight_runner.run_hermetic_pytest`), the single source shared by the review preflight (`review_helpers`) and the pre-push gate (`tools/git.py`). On timeout (or any crash/exception path) the runner guarantees full process-tree teardown — process group, recursive PID tree, captured escaped-session groups, and a temp-root command-line sweep — so no orphaned test processes survive. |
 | OUROBOROS_REVIEWS_DISABLED | unset | Full review kill switch. `true` skips advisory, triad, scope, plan, deep self-review, skill review, and hub install/update review calls. If unset, `OUROBOROS_FIXED_INFRA_MODELS=true` disables reviews by default; explicit `false` keeps reviews enabled. |
 | OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Owner-confirmed setting; default-on as of v6.10.0 (installs without an explicit choice are enabled; existing explicit choices are preserved). When enabled, a fresh executable skill review grants only the manifest-declared settings keys and host permissions for that exact content hash so closed-loop skill development can run without repeated manual grants. Under `blocking`, blocker reviews are not executable and do not auto-grant; under `advisory`, blocker findings may auto-grant only because the current enforcement mode makes the review executable. Plain `/api/settings` POST drops this key; desktop uses the launcher confirmation bridge and web uses `/api/owner/auto-grant`. |
+| OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Named, hash-pinned, audited exception to manual first review (v6.31.0, CHECKLISTS §Skills): when the LAUNCHER writes a bundled native skill payload (bootstrap seed, post-bootstrap new seed, version resync — all `.seed-origin`-marked), it stamps `review.json` `status=clean` with `reviewer_models=["repo_commit_gate"]` and `review_profile="native_seed"` because those exact bytes passed the repo triad+scope commit gate; zero-grant skills (no secret keys, no privileged permissions, only tool/subprocess surface) also auto-enable when no explicit owner enable/disable choice exists yet. Any later payload edit flips the verdict stale (only the TOP-LEVEL `.seed-origin` marker is hash-exempt), and a `native_seed` verdict whose marker is gone reads back as pending. The flag acts ONLY at launcher seed/resync moments over repo-reviewed bytes — flipping it at runtime grants nothing until the next launcher seeding event, which is why it ships without a dedicated owner-only settings gate (the generic settings self-change detectors still apply). Set to false to keep manual review for native seeds. |
 | OUROBOROS_CONTEXT_MODE | max | Owner-selected context horizon: `max` targets the full 1M-class path, while `low` targets 200K/local windows through doc-tiering, earlier emergency compaction, and routine compaction. Plain `/api/settings` POST drops this key; chat uses `/api/owner/context-mode` for immediate switching, Behavior settings saves through the same owner endpoint, and CLI uses `ouroboros settings context-mode`. Low mode never shortens recent dialogue unless older dialogue is already represented by valid consolidation. |
 | OUROBOROS_SCOPE_REVIEW_DEGRADED | false | Opt-in low-context supplemental advisory scope-review path. Active only when `OUROBOROS_CONTEXT_MODE=low` and the normal full-cap scope prompt cannot fit; it constrains a second atlas/prompt attempt to the smaller low profile, reports partial coverage, and forces findings advisory-only so the BIBLE P3 1M blocking scope-review floor remains intact. |
 | OUROBOROS_RUNTIME_MODE | advanced | Three-layer refactor axis: `light`, `advanced`, or `pro`. Orthogonal to `OUROBOROS_REVIEW_ENFORCEMENT`. Clamped via `normalize_runtime_mode` on both save and read paths. `light` is a compatibility/self-modification guard: it blocks repo-mutation tools at the `ToolRegistry.execute` gate, mutative direct git through `run_command`, shallow argv writer commands with explicit repo-local targets, and post-execution repo dirtiness from `run_command` (`LIGHT_MODE_REPO_WRITE_BLOCKED`, no automatic rollback). It also refuses runtime_mode self-elevation through the owner chokepoints (`save_settings`, `_data_write` settings.json block, `/api/settings` POST drop). Reviewed + enabled skills (script + extension) execute in light. `advanced` can evolve the application layer but blocks protected core/contract/release paths. `pro` may edit those protected surfaces directly, but committing them still requires the normal triad + scope review gate, whose blocking/advisory behavior follows `OUROBOROS_REVIEW_ENFORCEMENT`. Runtime mode is owner-only: desktop uses native confirmation, while web uses `/api/owner/runtime-mode` to persist the next-boot value; neither mutates the current boot baseline. |
@@ -1311,14 +1445,16 @@ Runtime floors:
 | USE_LOCAL_LIGHT | false | Route light model to local server |
 | USE_LOCAL_CONSCIOUSNESS | false | Route background consciousness model slot to local server |
 | USE_LOCAL_FALLBACK | false | Route fallback model to local server |
+| OUROBOROS_MAX_ROUNDS | 200 | Main-loop LLM round ceiling per task (hot-reloadable) |
+| OUROBOROS_TRANSIENT_RETRY_MAX | 6 | Same-model attempt budget for transient provider failures (finish_reason=null, 429/5xx); floored at the base retry budget |
+| OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC | 1800 | Skill lifecycle lane deadline before a wedged job fails loudly |
 | OUROBOROS_BG_MAX_ROUNDS | 10 | Max LLM rounds per consciousness cycle |
 | OUROBOROS_BG_WAKEUP_MIN | 30 | Min wakeup interval (seconds) |
 | OUROBOROS_BG_WAKEUP_MAX | 7200 | Max wakeup interval (seconds) |
-| OUROBOROS_EVO_COST_THRESHOLD | 0.10 | Reserved: intended min cost per evolution cycle. Persisted + surfaced in Settings, but not yet read by any runtime gate. |
-| OUROBOROS_POST_TASK_EVOLUTION | false | Owner-gated, default-OFF post-task self-evolution envelope (V4). When on, a qualifying task may promote ONE improvement into the existing gated evolution campaign. The owner toggles it in Settings → Behavior → Post-Task Self-Evolution (it rides the generic `/api/settings` path like `ALLOW_MUTATIVE_SUBAGENTS`). The agent's ordinary self-enable channels are blocked — shell (`_detect_evolution_owner_control_self_change`), browser JS (`_blocks_post_task_evolution_js`), the `POST /api/settings` route guard, `DATA_WRITE_BLOCKED` on settings.json, plus the SAFETY supervisor and SAFETY.md. A deliberate first-party script that bypasses these string-based guards is a residual, owner-accepted edge case (parity with `ALLOW_MUTATIVE_SUBAGENTS`; the SAFETY supervisor remains the semantic backstop). |
-| OUROBOROS_POST_TASK_EVOLUTION_CADENCE | llm | Post-task evolution cadence: `off` \| `llm` (LLM decides per task) \| `every_n:<k>`. Unknown/malformed values normalize to `llm` (a typo can never force an evolution cycle after every task). The Settings UI exposes Off / LLM / Every-N + an N field. |
-| OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD | 0.0 | Optional per-window budget floor; if >0 a post-task cycle starts only when at least this much budget remains (0 = rely on the existing evolution reserve) |
-| OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE | "" | Optional owner standing steer APPENDED (as a non-overriding bias) to EVERY evolution campaign's objective (`supervisor/queue.py::build_evolution_task_text`), not only post-task ones; it never overrides the LLM-first promotion, and any biased cycle still passes full triad+scope review. Empty = pure LLM choice. Because it steers self-evolution, it is owner-only like `OUROBOROS_POST_TASK_EVOLUTION` — the same shell + browser-JS + POST-`/api/settings`-route self-change detectors and SAFETY.md cover it, so the agent cannot self-set it (it rides the generic settings merge so the owner Settings UI can still set it). |
+| OUROBOROS_POST_TASK_EVOLUTION | false | Owner-gated, default-OFF post-task self-evolution envelope (V4). The Settings UI presents this together with cadence as one Self-Improvement Trigger selector, but the persisted backend shape remains this boolean plus `OUROBOROS_POST_TASK_EVOLUTION_CADENCE`. When enabled, after an eligible task the worker may ask the main-model slot (medium effort — choosing the next evolution objective is a high-leverage decision, upgraded off the light lane in v6.30.0) whether to promote ONE improvement into the existing gated evolution campaign; it writes a durable request and the supervisor applies it later on an idle tick through the normal gates. Eligibility intentionally includes ordinary/trivial tasks; `every_n:1` means Ouroboros considers evolution after every eligible task. The agent's self-enable channels are blocked by shell/browser/settings/data-write guards plus SAFETY. |
+| OUROBOROS_POST_TASK_EVOLUTION_CADENCE | llm | Post-task self-improvement trigger cadence: `llm` (after each eligible task, LLM decides whether to promote) or `every_n:<k>` (the counter is due every k eligible tasks, with `k=1` meaning every task). Unknown/malformed values normalize to `llm`; Off is represented by `OUROBOROS_POST_TASK_EVOLUTION=false`. |
+| OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD | 0.0 | Optional start-floor for post-task cycles; if >0 a post-task cycle starts only when at least this much global budget remains. `0` means rely on the normal gates. Running evolution tasks still inherit the normal per-task soft cost note (`OUROBOROS_PER_TASK_COST_USD`) and global budget guards; there is no separate per-evolution-cycle cost cap. |
+| OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE | "" | Optional owner standing steer appended (as a non-overriding bias) to EVERY evolution campaign's objective (`supervisor/evolution_lifecycle.py::build_evolution_task_text`), not only post-task ones; it never overrides the LLM-first promotion, and any biased cycle still passes full triad+scope review. Empty = pure LLM choice. Because it steers self-evolution, it is owner-only like `OUROBOROS_POST_TASK_EVOLUTION` — the same shell + browser-JS + POST-`/api/settings`-route self-change detectors and SAFETY.md cover it, so the agent cannot self-set it. |
 | LOCAL_MODEL_PORT | 8766 | Port for local llama-cpp server |
 | OUROBOROS_HOST_SERVICE_PORT | 8767 | Loopback-only Host Service API port used by reviewed skills/companions to call back into the host. Must not be exposed in Docker/LAN port mappings. |
 | LOCAL_MODEL_CHAT_FORMAT | "" | Chat format for local model (`""` = auto-detect) |

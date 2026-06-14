@@ -61,6 +61,7 @@
  * @property {string=} sender_session_id
  * @property {string=} client_message_id
  * @property {boolean=} force_plan
+ * @property {Array<Object>=} attachments  // [{filename, display_name, mime}] — image uploads become native blocks (v6.26.0)
  */
 
 /**
@@ -227,6 +228,7 @@
  * @property {Object=} allowed_resources
  * @property {Object=} resource_policy
  * @property {ExecutorRef=} executor_ref
+ * @property {"stop"|"keep"=} service_teardown Task service finalization policy; `keep` is for external verifiers/owners that need live services after task completion. POSIX-only: on Windows a cancel/hard-timeout tree-kills all task processes, so `keep` is not preserved there.
  * @property {string=} deadline_at
  * @property {number=} timeout_sec
  * @property {number=} timeout
@@ -312,4 +314,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.24.0-rc.4';
+export const GATEWAY_CONTRACT_VERSION = '6.31.0';

@@ -9,7 +9,7 @@ import pathlib
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from ouroboros.runtime_mode_policy import (
     PROTECTED_RUNTIME_PATH_PREFIXES,
@@ -64,9 +64,6 @@ _FORCE_INCLUDE_PREFIXES = (
     "ouroboros/contracts/",
 )
 
-_JS_IMPORT_RE = re.compile(
-    r"""(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]+\s+from\s+|import\()\s*['"]([^'"]+)['"]"""
-)
 _ROUTE_RE = re.compile(r"""['"](/(?:api|ws|owner|static|assets)/[^'"\s{}]+)['"]""")
 
 
@@ -83,6 +80,11 @@ class ReviewContextAtlasRequest:
     title: str = "Generated Scope Atlas"
     drive_root: pathlib.Path | None = None
     compact_manifest: bool = False
+    # Optional additive per-path score bonus (rel_path -> bonus), e.g. import-graph
+    # centrality. Default empty = selection identical to the heuristic baseline;
+    # scope/plan review never pass it (deep self-review is the only producer).
+    # Additive on top of — never replacing — the anchor-relative scoring.
+    centrality_scores: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -200,10 +202,17 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
         if rel
     }
     _score_relationships(facts_by_path, anchors)
+    # Optional graph-centrality bonus (deep self-review only; empty for
+    # scope/plan). Strictly additive so anchor-relative scoring is untouched.
+    if req.centrality_scores:
+        for rel, facts in facts_by_path.items():
+            bonus = float(req.centrality_scores.get(rel) or 0.0)
+            if bonus > 0.0:
+                facts.score += bonus
+                facts.reasons.append("graph_centrality")
 
     selected_paths: list[str] = []
     used_tokens = 0
-    mandatory_overflow = False
 
     candidates = [
         facts
@@ -228,9 +237,11 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             used_tokens += facts.token_count
             continue
         if facts.required:
+            # Guaranteed-fit: a required file that cannot fit degrades to an
+            # explicit manifest entry instead of failing the whole atlas.
+            # The omission stays visible (P1) via disposition + reason.
             facts.disposition = "budget_omitted"
-            facts.reason = "required file did not fit atlas hard budget"
-            mandatory_overflow = True
+            facts.reason = "required file exceeded the atlas hard budget; degraded to manifest entry"
         else:
             facts.disposition = "manifest_only"
             facts.reason = "not selected within atlas target budget"
@@ -239,11 +250,22 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     token_count = estimate_tokens(text)
 
     if token_count > hard_context_tokens:
+        # Shrink waves: non-required content first, then required content
+        # (largest first) — the atlas always converges to at worst a
+        # manifest-only pack instead of giving up with budget_exceeded.
         removable = [path for path in reversed(selected_paths) if not facts_by_path[path].required]
+        removable += sorted(
+            (path for path in selected_paths if facts_by_path[path].required),
+            key=lambda path: -facts_by_path[path].token_count,
+        )
         for path in removable:
             facts = facts_by_path[path]
-            facts.disposition = "manifest_only"
-            facts.reason = "removed to keep atlas below hard budget"
+            if facts.required:
+                facts.disposition = "budget_omitted"
+                facts.reason = "required file removed to keep atlas below hard budget; degraded to manifest entry"
+            else:
+                facts.disposition = "manifest_only"
+                facts.reason = "removed to keep atlas below hard budget"
             selected_paths.remove(path)
             text = _render_atlas_text(req, facts_by_path, selected_paths, status_hint="")
             token_count = estimate_tokens(text)
@@ -263,9 +285,15 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             if token_count <= target_text_tokens:
                 break
 
-    if mandatory_overflow or token_count > hard_context_tokens:
+    # budget_exceeded survives ONLY when even the content-free atlas (manifest
+    # alone) cannot fit the hard budget; degraded required files are a
+    # budget_constrained pack, not a failure.
+    if token_count > hard_context_tokens:
         status: Literal["ok", "under_target", "budget_constrained", "budget_exceeded"] = "budget_exceeded"
-    elif any(facts.disposition == "manifest_only" and facts.content for facts in facts_by_path.values()):
+    elif any(
+        facts.disposition in ("manifest_only", "budget_omitted") and facts.content
+        for facts in facts_by_path.values()
+    ):
         status = "budget_constrained"
     elif int(req.fixed_prompt_tokens) + token_count < int(req.target_total_tokens):
         status = "under_target"
@@ -516,7 +544,9 @@ def _extract_js_imports(rel: str, content: str) -> tuple[tuple[str, ...], int]:
         return (), 0
     parent = pathlib.PurePosixPath(rel).parent
     found: set[str] = set()
-    for spec in _JS_IMPORT_RE.findall(content):
+    from ouroboros.code_intelligence import extract_js_imports
+
+    for spec in extract_js_imports(content):
         if not spec.startswith("."):
             continue
         base = (parent / spec).as_posix()

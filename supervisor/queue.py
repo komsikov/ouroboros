@@ -10,19 +10,27 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from supervisor.state import (
-    load_state, save_state, append_jsonl, atomic_write_text,
-    QUEUE_SNAPSHOT_PATH, budget_pct, TOTAL_BUDGET_LIMIT,
-    budget_remaining, EVOLUTION_BUDGET_RESERVE, reconstruct_task_cost,
+    load_state, append_jsonl, atomic_write_text,
+    QUEUE_SNAPSHOT_PATH, budget_remaining, EVOLUTION_BUDGET_RESERVE, reconstruct_task_cost,
 )
 from supervisor.message_bus import send_with_budget
 from ouroboros.config import FINALIZATION_GRACE_DEFAULT_SEC, get_finalization_grace_sec
 from ouroboros.contracts.task_contract import attach_task_contract, build_task_contract, normalize_allowed_resources
 from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.outcomes import EXECUTION_INFRA_FAILED, normalize_outcome_axes, terminal_outcome_axes
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_json_dict, truncate_review_artifact, utc_now_iso
+from supervisor.evolution_lifecycle import (
+    _read_evolution_campaign,
+    _write_evolution_campaign,
+    begin_evolution_transaction,
+    build_evolution_task_text,
+    evolution_block_reason,
+    notify_owner_cycle_outcome,
+    pause_evolution_campaign,
+    start_evolution_campaign,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +41,6 @@ HARD_TIMEOUT_SEC: int = 1800
 HEARTBEAT_STALE_SEC: int = 120
 QUEUE_MAX_RETRIES: int = 1
 FINALIZATION_GRACE_SEC: int = FINALIZATION_GRACE_DEFAULT_SEC
-EVOLUTION_CAMPAIGN_FILE = pathlib.Path("state") / "evolution_campaign.json"
 SCHEDULED_TASKS_FILE = pathlib.Path("state") / "scheduled_tasks.json"
 
 
@@ -133,18 +140,20 @@ def drain_all_pending() -> list:
 
 
 def enqueue_task(task: Dict[str, Any], front: bool = False) -> Dict[str, Any]:
-    """Add task to PENDING."""
+    """Add task to PENDING (thread-safe: HTTP handlers enqueue concurrently
+    with the supervisor main loop, so the mutation must hold the queue lock)."""
     t = dict(task)
     attach_task_contract(t)
-    QUEUE_SEQ_COUNTER_REF["value"] += 1
-    seq = QUEUE_SEQ_COUNTER_REF["value"]
-    t.setdefault("priority", _task_priority(str(t.get("type") or "")))
-    _att = t.get("_attempt")
-    t.setdefault("_attempt", int(_att) if _att is not None else 1)
-    t["_queue_seq"] = -seq if front else seq
-    t["queued_at"] = utc_now_iso()
-    PENDING.append(t)
-    sort_pending()
+    with _queue_lock:
+        QUEUE_SEQ_COUNTER_REF["value"] += 1
+        seq = QUEUE_SEQ_COUNTER_REF["value"]
+        t.setdefault("priority", _task_priority(str(t.get("type") or "")))
+        _att = t.get("_attempt")
+        t.setdefault("_attempt", int(_att) if _att is not None else 1)
+        t["_queue_seq"] = -seq if front else seq
+        t["queued_at"] = utc_now_iso()
+        PENDING.append(t)
+        sort_pending()
     return t
 
 
@@ -160,26 +169,12 @@ def queue_has_task_type(task_type: str) -> bool:
     return False
 
 
-def _evolution_campaign_path() -> pathlib.Path:
-    return pathlib.Path(DRIVE_ROOT) / EVOLUTION_CAMPAIGN_FILE
-
-
-def _read_evolution_campaign() -> Dict[str, Any]:
-    data = read_json_dict(_evolution_campaign_path()) or {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_evolution_campaign(data: Dict[str, Any]) -> None:
-    path = _evolution_campaign_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, data, trailing_newline=True)
-
-
 def _scheduled_tasks_path(drive_root: pathlib.Path | None = None) -> pathlib.Path:
     return pathlib.Path(drive_root or DRIVE_ROOT) / SCHEDULED_TASKS_FILE
 
 
-def _read_scheduled_tasks(drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
+def list_scheduled_tasks(drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
+    """Return the persisted scheduled task table."""
     data = read_json_dict(_scheduled_tasks_path(drive_root)) or {}
     if not isinstance(data, dict):
         data = {}
@@ -196,15 +191,10 @@ def _write_scheduled_tasks(data: Dict[str, Any], drive_root: pathlib.Path | None
     atomic_write_json(path, data, trailing_newline=True)
 
 
-def list_scheduled_tasks(drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
-    """Return the persisted scheduled task table."""
-    return _read_scheduled_tasks(drive_root)
-
-
 def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
     """Create or replace a scheduled task record."""
     with _queue_lock:
-        data = _read_scheduled_tasks(drive_root)
+        data = list_scheduled_tasks(drive_root)
         tasks = [item for item in data.get("tasks") or [] if isinstance(item, dict)]
         incoming = dict(record)
         schedule_id = str(incoming.get("id") or "").strip() or uuid.uuid4().hex[:8]
@@ -227,7 +217,7 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
     if not wanted:
         return False
     with _queue_lock:
-        data = _read_scheduled_tasks(drive_root)
+        data = list_scheduled_tasks(drive_root)
         tasks = [item for item in data.get("tasks") or [] if isinstance(item, dict)]
         kept = [item for item in tasks if str(item.get("id") or "") != wanted]
         if len(kept) == len(tasks):
@@ -240,7 +230,7 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
 def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
     """Sync reviewed skill manifest scheduled_tasks into the core schedule table."""
     with _queue_lock:
-        data = _read_scheduled_tasks(drive_root)
+        data = list_scheduled_tasks(drive_root)
         tasks = [item for item in data.get("tasks") or [] if isinstance(item, dict)]
         by_id = {str(item.get("id") or ""): dict(item) for item in tasks}
         touched: list[str] = []
@@ -343,48 +333,14 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
     )
 
 
-def _timezone_for_schedule(record: Dict[str, Any]) -> datetime.tzinfo:
-    raw = str(record.get("timezone") or "").strip()
-    if raw:
-        try:
-            return ZoneInfo(raw)
-        except Exception:
-            log.warning("Invalid schedule timezone %r; falling back to local time", raw)
-    # Blank timezone -> DST-aware system local zone (platform-layer SSOT).
-    from ouroboros.platform_layer import local_zoneinfo
-
-    return local_zoneinfo()
-
-
-def _parse_schedule_time(value: Any, tz: datetime.tzinfo) -> Optional[datetime.datetime]:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=tz)
-    return parsed.astimezone(tz)
-
-
-def _next_cron_time(expr: str, base: datetime.datetime) -> datetime.datetime:
-    from croniter import croniter
-
-    return croniter(str(expr or ""), base).get_next(datetime.datetime)
-
-
-def _schedule_next_run(record: Dict[str, Any], *, base: Optional[datetime.datetime] = None) -> str:
-    trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-    if str(trigger.get("type") or "cron") != "cron":
-        return ""
-    expr = str(trigger.get("expr") or record.get("cron") or "").strip()
-    if not expr:
-        return ""
-    tz = _timezone_for_schedule(record)
-    base_dt = base.astimezone(tz) if base is not None else datetime.datetime.now(tz)
-    return _next_cron_time(expr, base_dt).isoformat()
+# Cron/timezone schedule helpers live in supervisor/schedule_time.py (P7
+# module-size relief); imported under their historical private names.
+from supervisor.schedule_time import (  # noqa: E402
+    next_cron_time as _next_cron_time,
+    parse_schedule_time as _parse_schedule_time,
+    schedule_next_run as _schedule_next_run,
+    timezone_for_schedule as _timezone_for_schedule,
+)
 
 
 def _schedule_running_or_queued(schedule_id: str) -> bool:
@@ -458,7 +414,7 @@ def check_scheduled_tasks() -> None:
                 resync_skill_schedules(DRIVE_ROOT)
             except Exception:
                 log.debug("Failed to sync skill schedules during scheduler tick", exc_info=True)
-        data = _read_scheduled_tasks()
+        data = list_scheduled_tasks()
         changed = False
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         for record in list(data.get("tasks") or []):
@@ -535,212 +491,48 @@ def check_scheduled_tasks() -> None:
             _write_scheduled_tasks(data)
             persist_queue_snapshot(reason="scheduled_tasks")
 
-def evolution_block_reason() -> str:
-    """Refusal message when evolution may not run in the current runtime mode.
 
-    Evolution campaigns are self-modification work, so they require runtime
-    mode ``advanced`` or ``pro``. In ``light`` (conversation-only) mode they are
-    hard-blocked before any campaign state, queue entry, or expensive round.
-    Returns ``""`` when evolution is allowed.
-    """
-    from ouroboros.config import get_runtime_mode
-
-    if get_runtime_mode() == "light":
-        return (
-            "🧬 Evolution campaigns are self-modification work and require runtime "
-            "mode 'advanced' or 'pro'. The runtime is in 'light' mode "
-            "(self-modification is disabled), so no campaign was started. Switch "
-            "the runtime mode in Settings to evolve."
-        )
-    return ""
+def _task_drive_for_task(task: Dict[str, Any], task_id: str) -> pathlib.Path:
+    """Active drive of a running task (child drive for forked/workspace tasks,
+    canonical otherwise) — where its mailbox and observability actually live.
+    Resolution mirrors forward_to_worker: task fields, then the result record."""
+    task = task if isinstance(task, dict) else {}
+    child = str(task.get("child_drive_root") or task.get("drive_root") or "").strip()
+    if not child:
+        try:
+            from ouroboros.task_results import load_task_result
+            record = load_task_result(pathlib.Path(DRIVE_ROOT), str(task_id)) or {}
+            child = str(record.get("child_drive_root") or record.get("headless_child_drive_root") or record.get("drive_root") or "").strip()
+        except Exception:
+            child = ""
+    return pathlib.Path(child) if child else pathlib.Path(DRIVE_ROOT)
 
 
-def start_evolution_campaign(objective: str = "", *, source: str = "owner") -> Dict[str, Any]:
-    """Start or resume the active evolution campaign."""
-    campaign = _read_evolution_campaign()
-    now = utc_now_iso()
-    objective = str(objective or "").strip()
-    if campaign.get("status") not in {"active", "paused"}:
-        campaign = {
-            "schema_version": 1,
-            "id": uuid.uuid4().hex[:8],
-            "status": "active",
-            "objective": objective or "Autonomously improve Ouroboros by acting on the highest-value backlog or process-memory signal.",
-            "source": source,
-            "started_at": now,
-            "updated_at": now,
-            "cycles_done": 0,
-            "absorbed_cycles_done": 0,
-            "budget_spent_usd": 0.0,
-            "last_task_id": "",
-            "progress_notes": "",
-            "completed_at": "",
-            "completion_reason": "",
-        }
-    else:
-        if objective:
-            campaign["objective"] = objective
-        campaign["status"] = "active"
-        campaign["updated_at"] = now
-    _write_evolution_campaign(campaign)
-    return campaign
-
-
-def pause_evolution_campaign(reason: str = "") -> Dict[str, Any]:
-    """Pause the active evolution campaign without deleting its state."""
-    campaign = _read_evolution_campaign()
-    if campaign:
-        campaign["status"] = "paused"
-        campaign["updated_at"] = utc_now_iso()
-        campaign["pause_reason"] = str(reason or "")
-        _write_evolution_campaign(campaign)
-    return campaign
-
-
-def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach a compact self-modification transaction to the active campaign."""
+def _kept_service_pids() -> "set[int]":
+    """PIDs of deliberately-kept (session-scope) services to spare from a worker
+    tree-kill on cancel/hard-timeout. Best-effort; never raises."""
     try:
-        from supervisor import git_ops
-
-        rc_head, head, _ = git_ops.git_capture(["git", "rev-parse", "HEAD"])
-        rc_branch, branch, _ = git_ops.git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        base_head = head.strip() if rc_head == 0 else ""
-        base_branch = branch.strip() if rc_branch == 0 else ""
+        from ouroboros.process_custody import live_kept_service_pids
+        return live_kept_service_pids(pathlib.Path(DRIVE_ROOT))
     except Exception:
-        base_head = ""
-        base_branch = ""
-    transaction = {
-        "schema_version": 1,
-        "transaction_id": uuid.uuid4().hex[:12],
-        "campaign_id": str((campaign or {}).get("id") or ""),
-        "task_id": str(task_id or ""),
-        "cycle": int(cycle or 0),
-        "created_at": utc_now_iso(),
-        "updated_at": utc_now_iso(),
-        "base_head": base_head,
-        "base_branch": base_branch,
-        "preflight_status": "pending",
-        "advisory_status": "pending",
-        "triad_scope_status": "pending",
-        "commit_sha": "",
-        "push_status": "pending",
-        "restart_decision": "",
-        "restart_required": False,
-        "restart_verified": False,
-        "restart_verified_at": "",
-        "rescue_ref": "",
-        "rescue_path": "",
-        "recovery_hint": "",
-    }
-    current = _read_evolution_campaign()
-    if current.get("id") == campaign.get("id"):
-        current["active_transaction"] = transaction
-        current["updated_at"] = utc_now_iso()
-        _write_evolution_campaign(current)
-    return transaction
-
-
-def update_evolution_transaction(task_id: str, **updates: Any) -> None:
-    """Best-effort update of the active/lightweight evolution transaction."""
-    campaign = _read_evolution_campaign()
-    tx = campaign.get("active_transaction")
-    if not isinstance(tx, dict) or str(tx.get("task_id") or "") != str(task_id or ""):
-        return
-    for key, value in updates.items():
-        if value is not None:
-            tx[key] = value
-    tx["updated_at"] = utc_now_iso()
-    campaign["active_transaction"] = tx
-    campaign["updated_at"] = utc_now_iso()
-    _write_evolution_campaign(campaign)
-
-
-def update_evolution_campaign_after_task(
-    task_id: str,
-    *,
-    cost_usd: float,
-    outcome_axes: Dict[str, Any],
-    rounds: int,
-    transaction: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Record an evolution cycle outcome in the active campaign file."""
-    campaign = _read_evolution_campaign()
-    if campaign.get("status") not in {"active", "paused"}:
-        return {}
-    metadata_tx = transaction if isinstance(transaction, dict) else {}
-    active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if str(active_tx.get("task_id") or "") == str(task_id or ""):
-        tx = {**metadata_tx, **active_tx}
-    elif str(metadata_tx.get("task_id") or "") == str(task_id or ""):
-        tx = dict(metadata_tx)
-    else:
-        tx = {}
-    axes = normalize_outcome_axes({"outcome_axes": outcome_axes or {}})
-    tx_id = str(tx.get("transaction_id") or "") if tx else ""
-    for existing in list(campaign.get("history") or []):
-        if not isinstance(existing, dict) or str(existing.get("task_id") or "") != str(task_id or ""):
-            continue
-        existing_tx = existing.get("transaction") if isinstance(existing.get("transaction"), dict) else {}
-        if not tx_id or str(existing_tx.get("transaction_id") or "") == tx_id:
-            return {**dict(campaign.get("active_transaction") or existing_tx or tx), "_replay": True}
-    if tx:
-        tx["outcome_axes"] = axes
-        tx["updated_at"] = utc_now_iso()
-    history = list(campaign.get("history") or [])
-    row = {
-        "task_id": str(task_id or ""),
-        "ts": utc_now_iso(),
-        "cost_usd": float(cost_usd or 0.0),
-        "outcome_axes": axes,
-        "rounds": int(rounds or 0),
-    }
-    if tx:
-        row["transaction"] = tx
-    history.append(row)
-    campaign["history"] = history[-50:]
-    if tx:
-        has_commit = bool(str(tx.get("commit_sha") or "").strip())
-        restart_verified = bool(tx.get("restart_verified"))
-        has_rescue = bool(str(tx.get("rescue_ref") or "").strip())
-        if not has_commit or restart_verified or has_rescue:
-            tx_history = list(campaign.get("transaction_history") or [])
-            tx_history.append(tx)
-            campaign["transaction_history"] = tx_history[-50:]
-        if str((campaign.get("active_transaction") or {}).get("task_id") or "") == str(task_id or ""):
-            if has_commit and restart_verified:
-                campaign["absorbed_cycles_done"] = int(campaign.get("absorbed_cycles_done") or 0) + 1
-                campaign.pop("active_transaction", None)
-            elif has_rescue:
-                campaign.pop("active_transaction", None)
-            else:
-                tx["recovery_hint"] = tx.get("recovery_hint") or (
-                    "Task ended without a reviewed commit plus restart verification; active "
-                    "transaction retained until restart verifies, repo state is recovered, or it is superseded."
-                )
-                if has_commit:
-                    tx["restart_required"] = True
-                campaign["active_transaction"] = tx
-    campaign["last_task_id"] = str(task_id or "")
-    campaign["cycles_done"] = int(campaign.get("cycles_done") or 0) + 1
-    execution_status = str((axes.get("execution") or {}).get("status") or "unknown")
-    objective_status = str((axes.get("objective") or {}).get("status") or "not_evaluated")
-    campaign["progress_notes"] = (
-        f"Last cycle {task_id}: execution={execution_status}, objective={objective_status}, "
-        f"rounds={int(rounds or 0)}, cost=${float(cost_usd or 0.0):.4f}."
-    )
-    campaign["budget_spent_usd"] = round(
-        float(campaign.get("budget_spent_usd") or 0.0) + float(cost_usd or 0.0),
-        6,
-    )
-    campaign["updated_at"] = utc_now_iso()
-    _write_evolution_campaign(campaign)
-    return tx
+        return set()
 
 
 def persist_queue_snapshot(reason: str = "") -> None:
-    """Persist queue snapshot for restart/recovery diagnostics."""
+    """Persist queue snapshot for restart/recovery diagnostics.
+
+    Snapshots PENDING/RUNNING under the queue lock: iterating the live dicts
+    while HTTP handlers mutate them raised "dictionary changed size during
+    iteration" in the supervisor loop (counted toward its crash limit).
+    """
+    with _queue_lock:
+        pending_items = [dict(t) for t in PENDING]
+        running_items = [
+            (task_id, dict(meta) if isinstance(meta, dict) else {})
+            for task_id, meta in RUNNING.items()
+        ]
     pending_rows = []
-    for t in PENDING:
+    for t in pending_items:
         pending_rows.append({
             "id": t.get("id"), "type": t.get("type"), "priority": t.get("priority"),
             "attempt": t.get("_attempt"), "queued_at": t.get("queued_at"),
@@ -777,7 +569,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
         })
     running_rows = []
     now = time.time()
-    for task_id, meta in RUNNING.items():
+    for task_id, meta in running_items:
         task = meta.get("task") if isinstance(meta, dict) else {}
         started = float(meta.get("started_at") or 0.0) if isinstance(meta, dict) else 0.0
         hb = float(meta.get("last_heartbeat_at") or 0.0) if isinstance(meta, dict) else 0.0
@@ -791,7 +583,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
     payload = {
         "ts": utc_now_iso(),
         "reason": reason,
-        "pending_count": len(PENDING), "running_count": len(RUNNING),
+        "pending_count": len(pending_items), "running_count": len(running_items),
         "pending": pending_rows, "running": running_rows,
     }
     try:
@@ -1005,17 +797,17 @@ def cancel_task_by_id(task_id: str) -> bool:
                     prompt_tokens=c_prompt, completion_tokens=c_completion,
                 )
                 from ouroboros.platform_layer import kill_pid_tree
-                # Kill the worker's whole process tree FIRST (matching the
-                # hard-timeout / kill_workers paths). A bare terminate() lets a
-                # worker that exits promptly leave its foreground subprocess tree
-                # (started in its own process group) orphaned after cancel.
+                # Tree-kill the worker (a bare terminate() can orphan its
+                # foreground subprocess tree), but spare deliberately-kept
+                # services: a cancel is neither a session change nor a panic.
+                _keep = _kept_service_pids()
                 if w.proc.pid:
-                    kill_pid_tree(w.proc.pid)
+                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
                 elif w.proc.is_alive():
                     w.proc.terminate()
                 w.proc.join(timeout=5)
                 if w.proc.is_alive() and w.proc.pid:
-                    kill_pid_tree(w.proc.pid)
+                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
                     w.proc.join(timeout=2)
                 try:
                     from ouroboros.tools.services import archive_task_service_logs
@@ -1023,6 +815,14 @@ def cancel_task_by_id(task_id: str) -> bool:
                 except Exception:
                     log.debug("Failed to archive service logs for cancelled task %s", task_id, exc_info=True)
                 workers.respawn_worker(w.wid)
+                # Free a cancelled subagent's child drive now (the worker is dead);
+                # otherwise it lingers until the next startup prune + retention.
+                if str(task.get("delegation_role") or "") == "subagent":
+                    try:
+                        from ouroboros.headless import remove_subagent_task_drive
+                        remove_subagent_task_drive(DRIVE_ROOT, str(task_id))
+                    except Exception:
+                        log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
                 persist_queue_snapshot(reason="cancel_running")
                 return True
 
@@ -1079,16 +879,29 @@ def cancel_running_evolution_tasks(reason: str = "evolution stopped") -> List[st
 
 
 def enforce_task_timeouts() -> None:
-    """Enforce soft/hard timeouts for running tasks."""
+    """Enforce soft/hard timeouts for running tasks.
+
+    Holds the queue lock for the whole pass: RUNNING pops and worker respawn
+    decisions raced with HTTP cancel handlers (double respawn → orphaned
+    worker; wrong-task dequeue). The RLock keeps nested respawn/assign calls
+    re-entrant.
+    """
     # Avoid circular dependency during module load.
     from supervisor import workers
-    
+
     if not RUNNING:
         return
     now = time.time()
     st = load_state()
     owner_chat_id = int(st.get("owner_chat_id") or 0)
 
+    with _queue_lock:
+        _enforce_task_timeouts_locked(workers, now, owner_chat_id, st)
+
+
+def _enforce_task_timeouts_locked(
+    workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
+) -> None:
     for task_id, meta in list(RUNNING.items()):
         if not isinstance(meta, dict):
             continue
@@ -1132,6 +945,14 @@ def enforce_task_timeouts() -> None:
             meta["finalization_requested_at"] = now
             meta["finalization_reason"] = terminal_reason
             RUNNING[task_id] = meta
+            # Typed finalize_now control -> cooperative tool-less final answer
+            # inside the grace window. Written to the task's ACTIVE drive (the
+            # one the loop drains; child drive for forked/workspace tasks).
+            try:
+                from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+                write_owner_message(_task_drive_for_task(task, str(task_id)), terminal_reason, str(task_id), kind=KIND_FINALIZE_NOW)
+            except Exception:
+                log.debug("Failed to write finalize_now control for %s", task_id, exc_info=True)
             if owner_chat_id:
                 send_with_budget(
                     owner_chat_id,
@@ -1165,14 +986,18 @@ def enforce_task_timeouts() -> None:
         if worker_id in workers.WORKERS:
             w = workers.WORKERS[worker_id]
             try:
+                from ouroboros.platform_layer import kill_pid_tree
+                # Spare deliberately-kept services (this task's + earlier pooled
+                # tasks') so a hard-timeout kill leaves verifier-facing services
+                # alive; they reparent to init and the custody reaper governs them.
+                _keep = _kept_service_pids()
                 if w.proc.pid:
-                    from ouroboros.platform_layer import kill_pid_tree
-                    kill_pid_tree(w.proc.pid)
+                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
                 elif w.proc.is_alive():
                     w.proc.terminate()
                 w.proc.join(timeout=5)
                 if w.proc.is_alive() and w.proc.pid:
-                    kill_pid_tree(w.proc.pid)
+                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
                     w.proc.join(timeout=2)
             except Exception:
                 log.warning("Failed to terminate worker %d during hard timeout", worker_id, exc_info=True)
@@ -1187,6 +1012,28 @@ def enforce_task_timeouts() -> None:
         # rollup/terminal event: the killed worker never finalized, so the event
         # would otherwise carry zeros and understate per-task + campaign metrics.
         recon_cost, recon_rounds, recon_prompt, recon_completion = reconstruct_task_cost(str(task_id))
+
+        # Salvage the last persisted assistant text (read-only, from the task's
+        # ACTIVE drive) so a hard kill surfaces real progress, not emptiness.
+        salvage_note = ""
+        try:
+            from ouroboros.observability import latest_llm_response_text
+            salvaged = latest_llm_response_text(_task_drive_for_task(task, str(task_id)), str(task_id))
+            if salvaged:
+                salvage_note = ("\n\nLast agent output (salvaged best-effort, unreviewed):\n"
+                                + truncate_review_artifact(salvaged, 4000))
+        except Exception:
+            log.debug("Failed to salvage last LLM response for %s", task_id, exc_info=True)
+
+        # A hard-killed worker never reaches the loop's mailbox cleanup, leaking
+        # the finalize_now control file. Remove it unconditionally: a subagent
+        # retry reuses the same task id and drive, and a stale finalize_now
+        # would instantly force-finalize the fresh attempt.
+        try:
+            from ouroboros.owner_mailbox import cleanup_task_mailbox
+            cleanup_task_mailbox(_task_drive_for_task(task, str(task_id)), str(task_id))
+        except Exception:
+            log.debug("Failed to clean owner mailbox for killed task %s", task_id, exc_info=True)
 
         will_retry = attempt <= QUEUE_MAX_RETRIES and isinstance(task, dict) and not deadline_reached
         # A stopped evolution campaign breaks the auto-retry chain: a hard-timeout
@@ -1220,7 +1067,7 @@ def enforce_task_timeouts() -> None:
                 result=(
                     f"Task killed by {terminal_reason} after {int(runtime_sec)}s. Retrying."
                     if will_retry
-                    else f"Task killed by {terminal_reason} after {int(runtime_sec)}s."
+                    else f"Task killed by {terminal_reason} after {int(runtime_sec)}s.{salvage_note}"
                 ),
             )
             if will_retry and retry_task_id and retry_task_id != task_id:
@@ -1321,50 +1168,6 @@ def enforce_task_timeouts() -> None:
         persist_queue_snapshot(reason="task_hard_timeout")
 
 
-def build_evolution_task_text(cycle: int) -> str:
-    """Build the next evolution-campaign task prompt."""
-    campaign = _read_evolution_campaign()
-    if campaign.get("status") == "active":
-        parts = [
-            f"EVOLUTION CAMPAIGN {campaign.get('id') or 'active'} — CYCLE #{cycle}",
-            "",
-            "## Objective",
-            str(campaign.get("objective") or "Autonomously improve Ouroboros."),
-        ]
-        from ouroboros.config import get_evolution_persistent_objective
-
-        steer = get_evolution_persistent_objective()
-        if steer:
-            parts.extend([
-                "",
-                "## Owner Standing Steer (optional bias — does NOT override the Objective above)",
-                steer,
-            ])
-        progress = str(campaign.get("progress_notes") or "").strip()
-        if progress:
-            parts.extend(["", "## Progress So Far", progress])
-        history = list(campaign.get("history") or [])[-3:]
-        if history:
-            parts.extend(["", "## Recent Campaign Cycles"])
-            for row in history:
-                axes = normalize_outcome_axes(row)
-                execution_status = str((axes.get("execution") or {}).get("status") or "unknown")
-                objective_status = str((axes.get("objective") or {}).get("status") or "not_evaluated")
-                parts.append(
-                    f"- {row.get('task_id')}: execution={execution_status}, objective={objective_status}; "
-                    f"rounds={row.get('rounds', 0)}; cost=${float(row.get('cost_usd') or 0):.4f}"
-                )
-        parts.extend([
-            "",
-            "## Execution Contract",
-            "- Work as a normal Ouroboros self-improvement task.",
-            "- Use standard tests and the normal advisory + triad + scope review flow before committing code.",
-            "- If the best next step is memory/identity/backlog rather than code, update those durable artifacts with provenance, but do not treat that as an absorbed self-evolution cycle.",
-            "- A true absorbed self-evolution cycle requires one reviewed self-modification commit followed by successful restart verification before the next campaign cycle.",
-            "- If the objective is complete or needs owner input, say so clearly in the final result.",
-        ])
-        return "\n".join(parts)
-    return f"EVOLUTION #{cycle}"
 
 
 def queue_deep_self_review_task(reason: str, model: str = "", force: bool = False, chat_id: Optional[int] = None) -> Optional[str]:
@@ -1477,8 +1280,29 @@ def get_evolution_status_snapshot() -> Dict[str, Any]:
     }
 
 
+def _deliver_pending_owner_report() -> None:
+    """Deliver a WS-13.5 owner report staged by a worker-side absorb/abandon.
+
+    verify_restart runs in the worker (no live message bus), so it stages
+    ``pending_owner_report`` on the campaign; we deliver it here in the SERVER
+    process (where the bus is initialized) and clear it. Runs every supervisor
+    tick. Best-effort; never raises into the tick.
+    """
+    try:
+        campaign = _read_evolution_campaign()
+        report = campaign.get("pending_owner_report")
+        if not isinstance(report, dict):
+            return
+        notify_owner_cycle_outcome(campaign, report)  # reuses the message builder
+        campaign.pop("pending_owner_report", None)
+        _write_evolution_campaign(campaign)
+    except Exception:
+        log.debug("failed to deliver pending owner report", exc_info=True)
+
+
 def enqueue_evolution_task_if_needed() -> None:
     """Queue evolution only when idle, enabled, within budget, and not failure-paused."""
+    _deliver_pending_owner_report()
     if PENDING or RUNNING:
         return
     st = load_state()
@@ -1499,19 +1323,22 @@ def enqueue_evolution_task_if_needed() -> None:
     # Defensive net: light mode must never run evolution even if the flag was
     # left enabled (e.g. carried across a restart into light mode). Disable and
     # pause once; entry points already refuse new starts up front.
+    from supervisor.state import update_state
+
+    def _disable_evolution(live: Dict[str, Any]) -> None:
+        live["evolution_mode_enabled"] = False
+
     block = evolution_block_reason()
     if block:
         pause_evolution_campaign("blocked in light runtime mode")
-        st["evolution_mode_enabled"] = False
-        save_state(st)
+        update_state(_disable_evolution)
         send_with_budget(int(owner_chat_id), block)
         return
 
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     if consecutive_failures >= 3:
         pause_evolution_campaign("paused after consecutive failures")
-        st["evolution_mode_enabled"] = False
-        save_state(st)
+        update_state(_disable_evolution)
         send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
@@ -1522,8 +1349,7 @@ def enqueue_evolution_task_if_needed() -> None:
     remaining = budget_remaining(st)
     if remaining < EVOLUTION_BUDGET_RESERVE:
         pause_evolution_campaign("budget reserve reached")
-        st["evolution_mode_enabled"] = False
-        save_state(st)
+        update_state(_disable_evolution)
         send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
         return
     cycle = int(st.get("evolution_cycle") or 0) + 1
@@ -1540,8 +1366,11 @@ def enqueue_evolution_task_if_needed() -> None:
     }
     attach_task_contract(task)
     enqueue_task(task)
-    st["evolution_cycle"] = cycle
-    st["last_evolution_task_at"] = utc_now_iso()
-    save_state(st)
+
+    def _record_cycle(live: Dict[str, Any]) -> None:
+        live["evolution_cycle"] = cycle
+        live["last_evolution_task_at"] = utc_now_iso()
+
+    update_state(_record_cycle)
     # The generic "Evolution task <id> started." lifecycle message (workers.py)
     # already announces the cycle start, so no extra enqueue bubble here.

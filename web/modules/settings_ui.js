@@ -455,49 +455,44 @@ export function renderSettingsPage() {
                         <h3>Самоэволюция после задачи</h3>
                         <div class="settings-section-copy">
                             После обычной задачи Ouroboros может опционально запустить один цикл самоулучшения (конверт V4): он продвигает подготовленный пункт из бэклога улучшений в кампанию самомодификации, ограниченную бюджетом владельца. Решение о продвижении принимается в первую очередь LLM &mdash; эта панель формирует конверт.
-                            <br><strong>Управляется человеком:</strong> агент не может включить это сам (самоповышение через shell/браузер/настройки заблокировано). Включение + частота + бюджет применяются к следующей задаче; тайминги фонового мышления применяются после перезапуска.
+                            После подходящей задачи Ouroboros может опционально запускать один проверяемый цикл самоулучшения: воркер запрашивает у light-модели решение о продвижении пункта бэклога, записывает durable-запрос, а супервизор запускает one-shot кампанию позже, на idle-тике, если проходят все гейты.
+                            <br><strong>Управляется человеком:</strong> агент не может включить это сам (самоповышение через shell/браузер/настройки заблокировано). Эти настройки применяются к следующей задаче.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Включить эволюцию после задачи</label>
-                            <input id="s-post-task-evolution" type="hidden" value="off">
-                            <div class="settings-effort-group" data-effort-group data-effort-target="s-post-task-evolution">
+                            <label>Триггер самоулучшения</label>
+                            <input id="s-post-task-evolution-mode" type="hidden" value="off">
+                            <div class="settings-effort-group" data-effort-group data-effort-target="s-post-task-evolution-mode">
                                 <button type="button" class="settings-effort-btn" data-effort-value="off">Выкл</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="on">Вкл</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="llm">После каждой задачи (решает LLM)</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="every_n">Каждые N задач</button>
                             </div>
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Частота</label>
-                            <input id="s-evo-cadence-mode" type="hidden" value="llm">
-                            <div class="settings-effort-group" data-effort-group data-effort-target="s-evo-cadence-mode">
-                                <button type="button" class="settings-effort-btn" data-effort-value="off">Выкл</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="llm">Решает LLM</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="every_n">Каждые N</button>
-                            </div>
-                            <div class="settings-inline-note"><code>Решает LLM</code> = модель оценивает каждую подходящую задачу; <code>Каждые N</code> продвигает раз в N подходящих задач.</div>
+                            <div class="settings-inline-note"><strong>Считаются все подходящие задачи, включая короткие чаты.</strong> <code>Every N=1</code> означает, что Ouroboros рассматривает самоулучшение после каждой задачи, а фактический цикл запускается позже на idle-тике супервизора.</div>
                         </div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Каждые N (задач)</label>
+                                <div data-evo-every-n-row>
+                                <label>Каждые N задач</label>
                                 <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3">
-                                <div class="settings-inline-note">Используется только при Частота = Каждые N.</div>
+                                <div class="settings-inline-note">Показывается только когда Триггер самоулучшения = Каждые N задач.</div>
+                                </div>
                             </div>
                             <div class="form-field">
                                 <label>Резерв бюджета на цикл (USD)</label>
                                 <input id="s-evo-budget" placeholder="0">
-                                <div class="settings-inline-note">Минимальный остаток бюджета для старта цикла после задачи. <code>0</code> = полагаться только на обычный бюджетный лимит.</div>
+                                <div class="settings-inline-note">Минимальный остаток общего бюджета для старта post-task цикла. <code>0</code> = полагаться на обычные гейты. Запущенные циклы всё равно наследуют глобальный soft-cap на задачу и reserve-floor супервизора.</div>
                             </div>
                         </div>
                         <div class="form-field">
                             <label>Постоянная цель (опционально)</label>
                             <input id="s-evo-objective" placeholder="(нет) — напр. приоритет покрытия тестами и задержки">
-                            <div class="settings-inline-note">Необязательная постоянная директива, ДОБАВЛЯЕМАЯ к цели каждого цикла эволюции. Никогда не переопределяет LLM-продвижение; оставьте пустым для чистого выбора LLM.</div>
+                            <div class="settings-inline-note">Необязательный steer, добавляемый к цели каждого цикла эволюции. Никогда не переопределяет LLM-first продвижение; оставьте пустым для чистого выбора LLM.</div>
                         </div>
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Порог стоимости эволюции (USD)</label>
-                                <input id="s-evo-cost-threshold" placeholder="0.10">
-                                <div class="settings-inline-note">Зарезервировано: предполагаемая минимальная стоимость за цикл эволюции (<code>OUROBOROS_EVO_COST_THRESHOLD</code>). Сохраняется для будущего использования — пока не применяется во время выполнения.</div>
-                            </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Фоновое мышление</h3>
+                        <div class="settings-section-copy">
+                            Частота фонового цикла мышления Ouroboros. Эти значения читаются при старте; сохраните и перезапустите, чтобы применить новый тайминг.
                         </div>
                         <div class="form-row">
                             <div class="form-field">

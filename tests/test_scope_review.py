@@ -16,7 +16,6 @@ import importlib
 import inspect
 import json
 import os
-import pathlib
 import subprocess
 import sys
 
@@ -408,8 +407,10 @@ class TestRunScopeReviewFailClosed:
         assert calls == [False, True]
         assert "COMPACT ATLAS" in prompt
 
-    def test_build_scope_prompt_compact_retry_overflow_stays_budget_exceeded(self, tmp_path, monkeypatch):
-        """Post-assembly compact retry overflow remains budget_exceeded, not error."""
+    def test_build_scope_prompt_irreducible_overflow_fails_closed(self, tmp_path, monkeypatch):
+        """Guaranteed-fit ladder: when even full touched degradation + compact
+        atlas cannot fit (mocked oversize estimator), the result is the
+        fail-closed fixed_overflow status — NOT a skippable budget_exceeded."""
         import subprocess
 
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
@@ -431,7 +432,7 @@ class TestRunScopeReviewFailClosed:
         mod = _get_module("ouroboros.tools.scope_review")
         calls = []
 
-        def fake_gather(_repo_dir, _paths, fixed_prompt_tokens=0, compact=False):
+        def fake_gather(_repo_dir, _paths, fixed_prompt_tokens=0, compact=False, **_kw):
             calls.append(compact)
             if compact:
                 raise mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 900_001})
@@ -443,9 +444,110 @@ class TestRunScopeReviewFailClosed:
         prompt, status = mod._build_scope_prompt(tmp_path, "test commit")
 
         assert prompt is None
-        assert status.status == "budget_exceeded"
-        assert status.token_count == 900_001
-        assert calls == [False, True]
+        assert status.status == "fixed_overflow"
+        assert status.token_count > 0
+        # First pass full atlas, then compact retries while the ladder degrades.
+        assert calls[0] is False
+        assert all(calls[1:])
+
+    def test_sub_floor_windows_get_scaled_reserves_not_zero_limit(self):
+        """Provider Independence: the absolute 1M reserves must not swallow a
+        small window whole. GigaChat (131K) and any known sub-1M slot keep a
+        positive input limit via window-scaled reserves; the >=1M reviewer
+        keeps the absolute reserves unchanged."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        giga = mod._effective_scope_input_limit(scope_model="gigachat::GigaChat-3-Ultra")
+        assert giga > 50_000, f"gigachat input limit must be workable, got {giga}"
+
+        out, margin = mod._window_scaled_reserves(131_072)
+        assert out == 32_768 and margin == 16_384
+        # >=1M windows keep the absolute reserves (byte-identical behavior).
+        assert mod._window_scaled_reserves(1_000_000) == (
+            mod._SCOPE_MAX_TOKENS, mod._SCOPE_OUTPUT_MARGIN_TOKENS
+        )
+        full = mod._effective_scope_input_limit(scope_model="openai/gpt-5.5")
+        assert full == mod._SCOPE_INPUT_TOKEN_LIMIT
+
+    def test_irreducible_overflow_terminal_split_by_authority(self, tmp_path, monkeypatch):
+        """Ladder terminal: the >=1M blocking reviewer fails CLOSED
+        (fixed_overflow); a KNOWN sub-floor reviewer (advisory-only authority)
+        routes to the disclosed non-blocking budget_exceeded skip so a
+        sub-floor-only install keeps committing on triad authority."""
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        (tmp_path / "docs").mkdir(exist_ok=True)
+        (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+            "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+        )
+        (tmp_path / "ok.py").write_text("print(1)\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+            cwd=str(tmp_path), capture_output=True,
+        )
+        (tmp_path / "ok.py").write_text("print(2)\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+        mod = _get_module("ouroboros.tools.scope_review")
+        monkeypatch.setattr(
+            mod, "_gather_scope_packs",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 999_999})
+            ),
+        )
+        monkeypatch.setattr(mod, "estimate_tokens", lambda _text: 800_000)
+
+        _, status_full = mod._build_scope_prompt(
+            tmp_path, "test commit", scope_model="anthropic/claude-fable-5"
+        )
+        assert status_full.status == "fixed_overflow"
+
+        _, status_sub = mod._build_scope_prompt(
+            tmp_path, "test commit", scope_model="gigachat::GigaChat-3-Ultra"
+        )
+        assert status_sub.status == "budget_exceeded"
+
+    def test_build_scope_prompt_degrades_touched_files_to_fit(self, tmp_path, monkeypatch):
+        """Guaranteed-fit ladder: a touched file too large for the budget is
+        degraded to diff-only with an explicit disclosed note, and the prompt
+        then fits and is returned (scope review actually runs)."""
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        (tmp_path / "docs").mkdir(exist_ok=True)
+        (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+            "## Intent / Scope Review Checklist\n\nplaceholder\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "big.py").write_text("x = 1\n" * 40_000, encoding="utf-8")  # ~60K tokens
+        (tmp_path / "small.py").write_text("print(1)\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+            cwd=str(tmp_path), capture_output=True,
+        )
+        # Tiny CHANGE inside a huge file: the staged diff stays small (irreducible
+        # part fits) while the full post-change snapshot (~60K tokens) does not.
+        (tmp_path / "big.py").write_text("y = 0\n" + "x = 1\n" * 39_999, encoding="utf-8")
+        (tmp_path / "small.py").write_text("print(2)\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+        mod = _get_module("ouroboros.tools.scope_review")
+        monkeypatch.setattr(mod, "_gather_scope_packs", lambda *_a, **_k: "TINY ATLAS")
+        monkeypatch.setattr(
+            mod, "_effective_scope_input_limit", lambda **_kw: 30_000
+        )
+
+        prompt, status = mod._build_scope_prompt(tmp_path, "test commit")
+
+        assert status is None
+        assert prompt is not None
+        assert "TOUCHED FILE BUDGET DEGRADATION NOTE" in prompt
+        assert "- big.py" in prompt
+        # The small file keeps its full snapshot; the big one is diff-only.
+        assert "### small.py" in prompt
 
     def test_run_scope_review_blocks_incomplete_scope_matrix(self, tmp_path, monkeypatch):
         """A parseable but incomplete scope checklist is a reviewer failure."""
@@ -504,6 +606,9 @@ class TestRunScopeReviewFailClosed:
         ]
         raw_items[0]["reason"] = "PASS"
         raw_items[1]["severity"] = "blocker"
+        # FAIL without severity stays fail-closed (severity decides blocking);
+        # PASS without severity is deliberately legal (defaulted to advisory).
+        raw_items[2]["verdict"] = "FAIL"
         raw_items[2].pop("severity")
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(
@@ -517,8 +622,200 @@ class TestRunScopeReviewFailClosed:
         assert result.blocked is True
         assert result.status == "parse_failure"
         assert "PASS reason is too terse" in result.block_message
-        assert "invalid severity" in result.block_message
-        assert "missing severity" in result.block_message
+        assert "missing or invalid severity 'blocker'" in result.block_message
+        assert "missing or invalid severity ''" in result.block_message
+
+    @pytest.mark.parametrize("crit_item", sorted(_get_module("ouroboros.tools.scope_review")._SCOPE_REQUIRED_ITEMS))
+    def test_advisory_downgrades_every_scope_critical_item(self, crit_item, tmp_path, monkeypatch):
+        """NW-2 guardrail (58a52c4 class): under owner-chosen advisory enforcement,
+        a critical scope finding for ANY required item must NOT block.
+
+        ``forgotten_touchpoints`` is the scope-side item the 58a52c4 incident
+        hardcoded to always block. The only pre-existing advisory-mode scope
+        test hand-built a ScopeReviewResult and never exercised the real
+        enforcement branch at run_scope_review level; this parametrization runs
+        the real branch for every required item with a complete matrix (one
+        critical FAIL + the rest valid PASS) so a per-item always-block hardcode
+        fails here.
+        """
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-advisory-guardrail-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        raw_items = []
+        for item_id in sorted(mod._SCOPE_REQUIRED_ITEMS):
+            if item_id == crit_item:
+                raw_items.append({
+                    "item": item_id,
+                    "verdict": "FAIL",
+                    "severity": "critical",
+                    "reason": f"Staged diff violates {item_id} per the review-gate fixture.",
+                })
+            else:
+                raw_items.append({
+                    "item": item_id,
+                    "verdict": "PASS",
+                    "severity": "advisory",
+                    "reason": f"Checked {item_id} against the staged review-gate fixture.",
+                })
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+        monkeypatch.setattr(
+            mod,
+            "_call_scope_llm",
+            lambda *a, **k: (json.dumps(raw_items), {"prompt_tokens": 10, "completion_tokens": 5}, None),
+        )
+
+        result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
+
+        assert result.blocked is False, (
+            f"advisory mode must NOT block critical scope item {crit_item!r}; "
+            "a per-item always-block hardcode (58a52c4 class) would fail here"
+        )
+        assert result.status == "responded"
+        assert any(f.get("item") == crit_item for f in result.critical_findings)
+
+    def test_provider_oversize_400_downgrades_to_nonblocking_skip(self, tmp_path, monkeypatch):
+        """B3: a provider context-length 400 during the scope call (estimate gate
+        passed, real tokenizer denser) is the SAME failure class as the pre-call
+        budget_exceeded skip — non-blocking, visible advisory. Any other provider
+        error stays fail-closed (next test pins that)."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-oversize-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        oversize_error = (
+            "⚠️ SCOPE_REVIEW_BLOCKED: Scope reviewer (anthropic/claude-fable-5) failed — commit blocked.\n"
+            "Error: BadRequestError: Error code: 400 - prompt is too long: 1166914 tokens > 1000000 maximum\n"
+            "Retry the commit, or check API key and network connectivity."
+        )
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+        monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, oversize_error))
+
+        result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
+
+        assert result.blocked is False
+        assert result.status == "budget_exceeded"
+        assert result.advisory_findings
+        assert result.advisory_findings[0]["item"] == "scope_review_skipped"
+        assert "prompt is too long" in result.advisory_findings[0]["reason"]
+
+    def test_sub_floor_scope_reviewer_is_advisory_only(self, tmp_path, monkeypatch):
+        """BIBLE P3 floor: a scope model with a KNOWN <1M window gets a
+        right-sized pack (window-aware cap) and can respond, but its critical
+        findings must be delivered ADVISORY-ONLY — only a >=1M reviewer may act
+        as the blocking scope gate. A >=1M reviewer keeps full blocking
+        authority under the same enforcement."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-sub-floor-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        raw_items = []
+        for item_id in sorted(mod._SCOPE_REQUIRED_ITEMS):
+            if item_id == "intent_alignment":
+                raw_items.append({
+                    "item": item_id,
+                    "verdict": "FAIL",
+                    "severity": "critical",
+                    "reason": "Staged diff contradicts the declared intent per the fixture.",
+                })
+            else:
+                raw_items.append({
+                    "item": item_id,
+                    "verdict": "PASS",
+                    "severity": "advisory",
+                    "reason": f"Checked {item_id} against the staged review-gate fixture.",
+                })
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+        monkeypatch.setattr(
+            mod,
+            "_call_scope_llm",
+            lambda *a, **k: (json.dumps(raw_items), {"prompt_tokens": 10, "completion_tokens": 5}, None),
+        )
+
+        # anthropic/claude-opus-4.8 matches the generic anthropic/claude- prefix
+        # in provider_models._CONTEXT_WINDOW_PREFIXES => known 200K window.
+        result = mod.run_scope_review(
+            MockCtx(), "test commit", scope_model="anthropic/claude-opus-4.8"
+        )
+        assert result.blocked is False
+        assert result.critical_findings == []
+        assert any(f.get("item") == "scope_review_sub_floor" for f in result.advisory_findings)
+        assert any("[sub-floor scope reviewer]" in str(f.get("reason")) for f in result.advisory_findings)
+
+        # GigaChat direct-provider form (gigachat::X normalizes to gigachat/X,
+        # 131K window) — ARCHITECTURE documents the family as below the floor.
+        result_giga = mod.run_scope_review(
+            MockCtx(), "test commit", scope_model="gigachat::GigaChat-3-Ultra"
+        )
+        assert result_giga.blocked is False
+        assert result_giga.critical_findings == []
+        assert any(f.get("item") == "scope_review_sub_floor" for f in result_giga.advisory_findings)
+
+        # The >=1M reviewer (fable-5 pin) keeps blocking authority.
+        result_full = mod.run_scope_review(
+            MockCtx(), "test commit", scope_model="anthropic/claude-fable-5"
+        )
+        assert result_full.blocked is True
+        assert any(f.get("item") == "intent_alignment" for f in result_full.critical_findings)
+
+    def test_generic_provider_error_stays_fail_closed(self, tmp_path, monkeypatch):
+        """B3 guard: non-oversize provider errors keep blocking (fail-closed)."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-generic-error-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        generic_error = (
+            "⚠️ SCOPE_REVIEW_BLOCKED: Scope reviewer (test-scope) failed — commit blocked.\n"
+            "Error: APIConnectionError: Connection error.\n"
+            "Retry the commit, or check API key and network connectivity."
+        )
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+        monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, generic_error))
+
+        result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
+
+        assert result.blocked is True
+        assert result.status == "error"
+
+    def test_effective_scope_limit_uses_real_window_for_small_window_reviewer(self):
+        """B2: a KNOWN sub-1M reviewer window replaces the assumed 1M, so the
+        pack overflows into the visible budget_exceeded skip instead of a
+        deterministic provider 400. Unknown windows keep today's constants."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        # fable-5 (1M, anthropic family): calibrated 1M-based constant.
+        assert mod._effective_scope_input_limit(scope_model="anthropic/claude-fable-5") == mod._ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
+        # opus-4.8 (200K family window): cap shrinks far below the 1M-based one.
+        small = mod._effective_scope_input_limit(scope_model="anthropic/claude-opus-4.8")
+        assert 0 <= small < mod._ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
+        # gpt-5.5 (1M, non-anthropic): unchanged constant.
+        assert mod._effective_scope_input_limit(scope_model="openai/gpt-5.5") == mod._SCOPE_INPUT_TOKEN_LIMIT
 
     def test_run_scope_review_preserves_pass_rows_in_actor_record(self, tmp_path, monkeypatch):
         """scope_raw_result.parsed_items must keep PASS rows for audit coverage."""
@@ -806,8 +1103,8 @@ class TestGitWiring:
         git = _get_module("ouroboros.tools.git")
         source = inspect.getsource(git._run_parallel_review)
         # Both submissions must be present before any result() call
-        submit_triad = source.find("_run_triad")
-        submit_scope = source.find("_run_scope")
+        submit_triad = source.find("triad_fut = pool.submit")
+        submit_scope = source.find("scope_fut = pool.submit")
         result_triad = source.find("triad_fut.result()")
         result_scope = source.find("scope_fut.result()")
         # Both must be submitted, and submissions must precede result() calls
@@ -933,6 +1230,37 @@ class TestGitWiring:
             or (isinstance(item, str) and "architecture_fit" in item)
             for item in scope_adv
         )
+
+    @pytest.mark.parametrize("crit_item", sorted(_get_module("ouroboros.tools.scope_review")._SCOPE_REQUIRED_ITEMS))
+    def test_aggregation_does_not_block_on_advisory_scope_criticals(self, crit_item):
+        """NW-2 guardrail (aggregation seam): a 58a52c4-class hardcode could be
+        re-introduced downstream in aggregate_review_verdict instead of in
+        scope_review.py. With no triad error and a non-blocked scope result that
+        merely CARRIES a critical finding (advisory pass-through), the aggregator
+        must NOT flip to blocked for ANY item id.
+        """
+        import types
+        import unittest.mock as mock
+        scope_mod = _get_module("ouroboros.tools.scope_review")
+        pr_mod = _get_module("ouroboros.tools.parallel_review")
+
+        scope_advisory_crit = scope_mod.ScopeReviewResult(
+            blocked=False,
+            block_message="",
+            critical_findings=[{"verdict": "FAIL", "item": crit_item,
+                                "severity": "critical", "reason": "advisory-only scope note", "model": "test"}],
+            advisory_findings=[],
+        )
+        ctx = types.SimpleNamespace(
+            repo_dir=None, _last_review_critical_findings=[], _review_advisory=[])
+        with mock.patch.object(pr_mod, "run_cmd", return_value=""):
+            blocked, combined_msg, block_reason, findings, scope_adv = pr_mod.aggregate_review_verdict(
+                None, scope_advisory_crit, "", [], ctx, "test commit", 0.0, ctx.repo_dir)
+        assert not blocked, (
+            f"aggregation must NOT block on an advisory-pass-through scope critical "
+            f"for item {crit_item!r}; a per-item always-block hardcode would fail here"
+        )
+        assert combined_msg is None
 
     def test_scope_review_skipped_surfaces_through_aggregation_path(self):
         """Budget-skip advisories must survive aggregation and caller-side surfacing."""
@@ -1385,8 +1713,8 @@ class TestSharedLLMRouting:
     def test_scope_review_emits_usage(self):
         """Scope review must emit llm_usage event for cost tracking."""
         mod = _get_module("ouroboros.tools.scope_review")
-        source = inspect.getsource(mod._emit_usage)
-        assert "emit_review_usage" in source
+        source = inspect.getsource(mod)
+        assert 'emit_review_usage(ctx, model=scope_model_id, usage=_usage, source="scope_review")' in source
         helper = inspect.getsource(_get_module("ouroboros.tools.review_helpers").emit_review_usage)
         assert "llm_usage" in helper
         assert "emit_review_event" in helper

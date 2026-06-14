@@ -18,12 +18,11 @@ import subprocess
 import sys
 import threading
 import uuid
-from subprocess import Popen, CompletedProcess
 from typing import Any, Dict, List
 
 from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts
-from ouroboros.platform_layer import IS_WINDOWS, bootstrap_process_path, kill_process_tree, subprocess_new_group_kwargs
-from ouroboros.config import get_runtime_mode, load_settings
+from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, subprocess_new_group_kwargs
+from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
     is_protected_runtime_path,
@@ -42,6 +41,7 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.utils import safe_relpath, utc_now_iso, run_cmd
+from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_PAYLOAD_CONTROL_DIRNAMES,
@@ -57,28 +57,25 @@ from ouroboros.workspace_executor import map_backend_path as executor_map_backen
 from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 
 log = logging.getLogger(__name__)
-
 # Tracked process groups let panic kill descendant trees too.
 _active_subprocesses: set = set()
 _subprocess_lock = threading.Lock()
-
 _RUN_SHELL_DEFAULT_TIMEOUT_SEC = 360
 _CONTROL_DIR_BACKUP_MAX_BYTES = 5 * 1024 * 1024
 _OUTPUT_DIR_MAX_FILES = 1000
 _OUTPUT_DIR_MAX_BYTES = 50 * 1024 * 1024
-
 
 def _tracked_subprocess_run(cmd, **kwargs):
     """subprocess.run replacement with process-tree tracking."""
     timeout = kwargs.pop("timeout", None)
     kwargs.update(subprocess_new_group_kwargs())
     kwargs.setdefault("stdin", subprocess.DEVNULL)
-    proc = Popen(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)
     with _subprocess_lock:
         _active_subprocesses.add(proc)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-        return CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
         proc.wait(timeout=5)
@@ -103,22 +100,27 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
-def _resolve_effective_timeout(default_timeout_sec: int) -> int:
-    """Resolve effective timeout from settings.json with env fallback."""
-    try:
-        settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
-        if settings_val > 0:
-            return settings_val
-    except Exception:
-        pass
+def _resolve_effective_timeout(default_timeout_sec: int, ctx: ToolContext | None = None) -> int:
+    """Resolve effective timeout, capping defaults by task deadline when present."""
+    default_setting = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
     raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
     if raw:
         try:
             parsed = int(raw)
-            if parsed > 0:
+            if parsed > 0 and parsed != default_setting:
                 return parsed
         except ValueError:
             pass
+    try:
+        settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
+        if settings_val > 0 and settings_val != default_setting:
+            return settings_val
+    except Exception:
+        pass
+    if ctx is not None:
+        remaining = deadline_remaining_sec(ctx)
+        if remaining > 0:
+            return int(max(60, min(1800, remaining * 0.5)))
     return max(int(default_timeout_sec), 1)
 
 
@@ -736,7 +738,7 @@ _GREP_BACKSLASH_PIPE_PATTERN = re.compile(r'\\\|')
 _NO_MATCH_EXIT_TOOLS = frozenset(("grep", "egrep", "fgrep", "rg", "ag", "ack"))
 
 
-def _is_search_no_match(res: CompletedProcess) -> bool:
+def _is_search_no_match(res: subprocess.CompletedProcess) -> bool:
     tool = pathlib.Path(str(res.args[0] if res.args else "")).name.lower()
     return (
         int(res.returncode) == 1
@@ -949,7 +951,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         changed_paths=set(before_changed or []),
     )
 
-    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC)
+    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx)
     bootstrap_process_path()
     try:
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
@@ -973,6 +975,9 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
             return autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
         after_changed = _status_snapshot(repo_root)
         if after_changed != before_changed:
+            # Kept (nonstandard case): repo_root here is the RESOLVED cwd root,
+            # which may be a workspace/skill repo the central live-repo
+            # dispatcher check does not watch; this call passes precise paths.
             _invalidate_advisory(
                 ctx,
                 changed_paths=after_changed or before_changed,
@@ -1008,7 +1013,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         if artifact_failed:
             return (
                 autocorrect_note
-                + f"⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed. "
+                + "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed. "
                 + f"{_describe_returncode(0, cwd=work_dir)}\n"
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
@@ -1344,6 +1349,9 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
 
             after_changed = _status_snapshot(target_repo_root)
             if repo_mode and after_changed != before_changed:
+                # Kept (nonstandard case): target_repo_root may be a skill
+                # payload/workspace repo outside the central live-repo check,
+                # and result.changed_files gives precise invalidation paths.
                 _invalidate_advisory(
                     ctx,
                     changed_paths=result.changed_files or after_changed or before_changed,
@@ -1534,7 +1542,7 @@ def get_tools() -> List[ToolEntry]:
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
 	                },
 	            }, "required": ["cmd"]},
-        }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC),
+        }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
         ToolEntry("claude_code_edit", {
             "name": "claude_code_edit",
             "description": (
@@ -1568,7 +1576,7 @@ def get_tools() -> List[ToolEntry]:
                     "description": "Generated file paths to copy/register into the task artifact store after a successful edit.",
                 },
             }, "required": ["prompt"]},
-        }, _claude_code_edit, is_code_tool=True, timeout_sec=1200),
+        }, _claude_code_edit, is_code_tool=True, timeout_sec=1200, mutates_worktree=True),
         ToolEntry("run_script", {
             "name": "run_script",
             "description": (
@@ -1588,5 +1596,5 @@ def get_tools() -> List[ToolEntry]:
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
 	                },
 	            }, "required": ["script"]},
-        }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC),
+        }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
     ]

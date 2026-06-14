@@ -33,6 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _BASH_CAPTURE_AVAILABLE = sys.platform != "win32" and shutil.which("bash") is not None
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bench_runs_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_BENCH_RUNS_ROOT", str(tmp_path / "bench_runs"))
+
+
 def _git_repo(path: Path) -> str:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -195,12 +200,19 @@ def test_pyproject_does_not_package_devtools_runtime_assets():
 def test_executable_devtools_entrypoints_support_direct_help():
     scripts = [
         "devtools/benchmarks/programbench/run_programbench.py",
+        "devtools/benchmarks/harness_bench_fast/ouroboros_cli_wrapper.py",
         "devtools/benchmarks/terminal_bench/run_harbor_smoke.py",
+        "devtools/benchmarks/terminal_bench/run_tb.py",
         "devtools/benchmarks/swe_bench/swebench_predictions.py",
         "devtools/benchmarks/swe_bench_pro/grade_pro.py",
         "devtools/benchmarks/swe_bench_pro/pro_predictions.py",
+        "devtools/benchmarks/swe_bench_pro/e1v2/auto_run.py",
+        "devtools/benchmarks/swe_bench_pro/e1v2/build_predictions.py",
+        "devtools/benchmarks/swe_bench_pro/e1v2/plot_e1v2_curves.py",
+        "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py",
         "devtools/benchmarks/osworld/normalize_logs.py",
         "devtools/benchmarks/osworld/osworld_adapter_skeleton.py",
+        "devtools/benchmarks/osworld/run_step_agent.py",
     ]
     for rel in scripts:
         proc = subprocess.run(
@@ -213,6 +225,54 @@ def test_executable_devtools_entrypoints_support_direct_help():
         )
         assert proc.returncode == 0, f"{rel} failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         assert "usage:" in proc.stdout.lower()
+
+
+def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
+    from devtools.benchmarks.harness_bench_fast.ouroboros_cli_wrapper import build_command
+
+    cmd = build_command(ouroboros_bin="/bin/ouroboros", prompt="create hello.py", memory_mode="empty")
+
+    assert cmd == ["/bin/ouroboros", "run", "--memory-mode", "empty", "--quiet", "create hello.py"]
+
+
+def test_swe_pro_e1v2_port_has_csv_option_a_heal_and_no_secrets():
+    e1v2 = REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "e1v2"
+    csv_path = REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "task_order_pro_70.csv"
+
+    assert csv_path.is_file()
+    assert len(csv_path.read_text(encoding="utf-8").splitlines()) == 71
+    entrypoint = (e1v2 / "entrypoint_pro.sh").read_text(encoding="utf-8")
+    # NW-7 (nq10): the harness-side Option A heal is restored so a dangling
+    # committed evolution transaction from the previous task does not poison
+    # enqueue for all subsequent tasks (E1v2 -> E1) on agents whose core lacks
+    # boot reconciliation. It must keep its merge-base reachability guard so a
+    # rolled-back commit is ABANDONED, not falsely marked absorbed. With a
+    # newer core's own boot reconciliation it is a harmless no-op.
+    assert "Option A:" in entrypoint
+    assert "merge-base" in entrypoint and "--is-ancestor" in entrypoint
+    assert "boot reconciliation" in entrypoint  # documents the no-op interaction
+    # owner_chat_id must be seeded BEFORE the budget reset (else native
+    # post-task evolution is dropped on fresh volumes -> E1v2 silently == E0).
+    assert entrypoint.index('printf \'{"owner_chat_id": 1}\'') < entrypoint.index('reset_per_task_budget("/obo-data"')
+    for name in ("settings_base.json", "_run_settings.example.json"):
+        payload = json.loads((e1v2 / name).read_text(encoding="utf-8"))
+        for key, value in payload.items():
+            if any(token in key for token in ("API_KEY", "TOKEN", "PASSWORD", "CREDENTIAL")):
+                assert value in ("", None, False), (name, key)
+
+
+def test_swe_pro_e1v2_curve_rows(tmp_path):
+    from devtools.benchmarks.swe_bench_pro.e1v2.plot_e1v2_curves import curve_rows, load_e0, load_e1v2_results
+
+    csv_path = tmp_path / "order.csv"
+    csv_path.write_text("idx,instance_id,verdict\n1,a,pass\n2,b,fail\n", encoding="utf-8")
+    results_path = tmp_path / "results.jsonl"
+    results_path.write_text('{"instance_id":"a","resolved":false}\n{"instance_id":"b","resolved":true}\n', encoding="utf-8")
+
+    rows = curve_rows(load_e0(csv_path), load_e1v2_results(results_path), window=2)
+
+    assert rows[-1]["e0_window_rate"] == 0.5
+    assert rows[-1]["e1v2_window_rate"] == 0.5
 
 
 def test_programbench_task_body_sets_executor_and_protected_policy(tmp_path):
@@ -486,6 +546,64 @@ def test_terminal_bench_adapter_does_not_commit_target_workspace():
     assert "git commit --allow-empty" not in adapter
 
 
+def test_osworld_shell_action_does_not_fabricate_bash_history():
+    """NW-6 methodology integrity: the OSWorld shell action must NOT write the
+    command into ~/.bash_history to satisfy terminal-task evaluators (hidden
+    verifier knowledge / answer fitting). The only allowed mention is the
+    docstring documenting that we deliberately do not do it."""
+    src = (REPO_ROOT / "devtools" / "benchmarks" / "osworld" / "run_step_agent.py").read_text(encoding="utf-8")
+    # No history-file write in the emitted snippet, no record_history plumbing.
+    assert "hist.open(" not in src
+    assert "record_history" not in src
+    assert ".bash_history'" not in src  # the f.write to the history path is gone
+
+
+def test_terminal_bench_metadata_declares_all_assisting_models():
+    """NW-6: with task_review_mode=required the review triad (incl. a frontier
+    model) assists the measured run; metadata.yaml must declare every assisting
+    model, not only the measured one."""
+    import sys as _sys
+    spec = importlib.util.spec_from_file_location(
+        "tb_run_for_meta", REPO_ROOT / "devtools" / "benchmarks" / "terminal_bench" / "run_tb.py")
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module  # dataclass field resolution needs this
+    spec.loader.exec_module(module)
+    import os as _os
+    prev = _os.environ.pop("OUROBOROS_REVIEW_MODELS", None)
+    try:
+        meta = module.leaderboard_metadata(
+            agent_name="Ouroboros", org_name="Ouroboros",
+            model="openai/gpt-5.5", light_model="google/gemini-3.5-flash")
+    finally:
+        if prev is not None:
+            _os.environ["OUROBOROS_REVIEW_MODELS"] = prev
+    # The default review triad includes a frontier helper that must be visible.
+    assert "anthropic/claude-opus-4.8" in meta
+    assert "commit_review_triad" in meta
+    assert meta.count("model_name:") >= 3
+
+
+def test_terminal_bench_adapter_defaults_to_required_acceptance_review(tmp_path):
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path)
+    env = agent._container_env()
+    assert env["OUROBOROS_TASK_REVIEW_MODE"] == "required"
+    assert env["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
+
+    agent = tb_agent.OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path,
+        task_review_mode="auto",
+        ouroboros_model="openai/gpt-5.5",
+        ouroboros_light_model="google/gemini-3.5-flash",
+    )
+    env = agent._container_env()
+    assert env["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
+    assert env["OUROBOROS_MODEL"] == "openai/gpt-5.5"
+    assert env["OUROBOROS_MODEL_CODE"] == "openai/gpt-5.5"
+    assert env["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
+
+
 def test_terminal_bench_source_copy_excludes_secret_shaped_files(tmp_path):
     import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
 
@@ -576,6 +694,45 @@ def test_terminal_bench_network_preflight_uses_configured_provider(tmp_path, mon
     assert "openrouter.ai" not in env.command
     assert "urllib.error.HTTPError" in env.command
     assert "openai_preflight_status 401" in (tmp_path / "network-preflight.txt").read_text(encoding="utf-8")
+
+
+def test_terminal_bench_openrouter_credit_preflight_blocks_low_credit(tmp_path, monkeypatch):
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"data":{"total_credits":10,"total_usage":9.75}}'
+
+    def fake_urlopen(req, timeout=0):
+        assert req.headers["Authorization"] == "Bearer or-key"
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path, openrouter_min_credit_usd=1.0)
+
+    with pytest.raises(RuntimeError, match="remaining \\$0.25 below threshold \\$1.00"):
+        agent._openrouter_credit_preflight({})
+
+    payload = json.loads((tmp_path / "openrouter-credit-preflight.json").read_text(encoding="utf-8"))
+    assert payload["remaining_usd"] == 0.25
+
+
+def test_terminal_bench_openrouter_credit_preflight_skips_when_unconfigured(tmp_path, monkeypatch):
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path)
+
+    agent._openrouter_credit_preflight({})
+
+    assert not (tmp_path / "openrouter-credit-preflight.json").exists()
 
 
 def test_terminal_bench_network_preflight_supports_openai_compatible(tmp_path, monkeypatch):
@@ -1338,7 +1495,7 @@ def test_osworld_logs_only_normalizer_accepts_nested_trace_manifests(tmp_path):
     assert normalized["traj_count"] == 1
 
 
-def test_osworld_preflight_rejects_computer_use_review_blockers(tmp_path):
+def test_osworld_preflight_rejects_unix_computer_use_review_blockers(tmp_path):
     from devtools.benchmarks.osworld.osworld_adapter_skeleton import preflight
     from ouroboros.skill_loader import compute_content_hash
 
@@ -1346,11 +1503,11 @@ def test_osworld_preflight_rejects_computer_use_review_blockers(tmp_path):
     osworld.mkdir()
     (osworld / "evaluation_examples").mkdir()
     data_root = tmp_path / "data"
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     payload.mkdir()
-    (payload / "SKILL.md").write_text("# computer_use\n", encoding="utf-8")
+    (payload / "SKILL.md").write_text("# unix_computer_use\n", encoding="utf-8")
     content_hash = compute_content_hash(payload)
-    state_dir = data_root / "state" / "skills" / "computer_use"
+    state_dir = data_root / "state" / "skills" / "unix_computer_use"
     state_dir.mkdir(parents=True)
     (state_dir / "review.json").write_text(json.dumps({"status": "blockers", "content_hash": content_hash}), encoding="utf-8")
     (state_dir / "enabled.json").write_text(json.dumps({"enabled": True}), encoding="utf-8")
@@ -1359,8 +1516,8 @@ def test_osworld_preflight_rejects_computer_use_review_blockers(tmp_path):
         osworld_root=osworld,
         ouroboros_url="http://127.0.0.1:9",
         osworld_server_url="http://127.0.0.1:9",
-        computer_use_payload=payload,
-        computer_use_state_dir=state_dir,
+        unix_computer_use_payload=payload,
+        unix_computer_use_state_dir=state_dir,
         output_root=tmp_path / "out",
         repo_root=REPO_ROOT,
         data_root=data_root,
@@ -1370,18 +1527,18 @@ def test_osworld_preflight_rejects_computer_use_review_blockers(tmp_path):
     assert any("fresh executable pass/advisory_pass" in failure for failure in result["failures"])
 
 
-def test_osworld_preflight_rejects_stale_computer_use_review(tmp_path):
+def test_osworld_preflight_rejects_stale_unix_computer_use_review(tmp_path):
     from devtools.benchmarks.osworld.osworld_adapter_skeleton import preflight
 
     osworld = tmp_path / "OSWorld"
     osworld.mkdir()
     (osworld / "evaluation_examples").mkdir()
     data_root = tmp_path / "data"
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     payload.mkdir()
-    (payload / "SKILL.md").write_text("# computer_use\n", encoding="utf-8")
+    (payload / "SKILL.md").write_text("# unix_computer_use\n", encoding="utf-8")
     (payload / "tool.py").write_text("print('v1')\n", encoding="utf-8")
-    state_dir = data_root / "state" / "skills" / "computer_use"
+    state_dir = data_root / "state" / "skills" / "unix_computer_use"
     state_dir.mkdir(parents=True)
     (state_dir / "review.json").write_text(
         json.dumps({"status": "pass", "content_hash": "stale-hash"}),
@@ -1393,8 +1550,8 @@ def test_osworld_preflight_rejects_stale_computer_use_review(tmp_path):
         osworld_root=osworld,
         ouroboros_url="http://127.0.0.1:9",
         osworld_server_url="http://127.0.0.1:9",
-        computer_use_payload=payload,
-        computer_use_state_dir=state_dir,
+        unix_computer_use_payload=payload,
+        unix_computer_use_state_dir=state_dir,
         output_root=tmp_path / "out",
         repo_root=REPO_ROOT,
         data_root=data_root,
@@ -1404,18 +1561,18 @@ def test_osworld_preflight_rejects_stale_computer_use_review(tmp_path):
     assert any("review_stale" in failure for failure in result["failures"])
 
 
-def test_osworld_preflight_rejects_nonisolated_computer_use_state(tmp_path):
+def test_osworld_preflight_rejects_nonisolated_unix_computer_use_state(tmp_path):
     from devtools.benchmarks.osworld.osworld_adapter_skeleton import preflight
     from ouroboros.skill_loader import compute_content_hash
 
     osworld = tmp_path / "OSWorld"
     osworld.mkdir()
     (osworld / "evaluation_examples").mkdir()
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     payload.mkdir()
-    (payload / "SKILL.md").write_text("# computer_use\n", encoding="utf-8")
+    (payload / "SKILL.md").write_text("# unix_computer_use\n", encoding="utf-8")
     content_hash = compute_content_hash(payload)
-    state_dir = tmp_path / "live-state" / "skills" / "computer_use"
+    state_dir = tmp_path / "live-state" / "skills" / "unix_computer_use"
     state_dir.mkdir(parents=True)
     (state_dir / "review.json").write_text(
         json.dumps({"status": "pass", "content_hash": content_hash}),
@@ -1428,8 +1585,8 @@ def test_osworld_preflight_rejects_nonisolated_computer_use_state(tmp_path):
         osworld_root=osworld,
         ouroboros_url="http://127.0.0.1:9",
         osworld_server_url="http://127.0.0.1:9",
-        computer_use_payload=payload,
-        computer_use_state_dir=state_dir,
+        unix_computer_use_payload=payload,
+        unix_computer_use_state_dir=state_dir,
         output_root=tmp_path / "out",
         repo_root=REPO_ROOT,
         data_root=tmp_path / "isolated-data",
@@ -1445,7 +1602,7 @@ def test_osworld_cli_default_repo_root_blocks_repo_internal_output(tmp_path, mon
     repo_root = tmp_path / "repo"
     data_root = tmp_path / "data"
     osworld = tmp_path / "OSWorld"
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     for path in (repo_root, data_root, osworld, payload):
         path.mkdir(parents=True)
     (osworld / "evaluation_examples").mkdir()
@@ -1460,7 +1617,7 @@ def test_osworld_cli_default_repo_root_blocks_repo_internal_output(tmp_path, mon
             str(osworld),
             "--osworld-server-url",
             "http://127.0.0.1:9",
-            "--computer-use-payload",
+            "--unix-computer-use-payload",
             str(payload),
             "--output-root",
             str(repo_root / "bad-output"),
@@ -1477,7 +1634,7 @@ def test_osworld_cli_omitted_data_root_defaults_to_output_isolation(tmp_path, mo
     repo_root = tmp_path / "repo"
     live_data_root = tmp_path / "live-data"
     osworld = tmp_path / "OSWorld"
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     output_root = tmp_path / "runs" / "osworld"
     for path in (repo_root, live_data_root, osworld, payload):
         path.mkdir(parents=True)
@@ -1493,7 +1650,7 @@ def test_osworld_cli_omitted_data_root_defaults_to_output_isolation(tmp_path, mo
             str(osworld),
             "--osworld-server-url",
             "http://127.0.0.1:9",
-            "--computer-use-payload",
+            "--unix-computer-use-payload",
             str(payload),
             "--output-root",
             str(output_root),
@@ -1512,7 +1669,7 @@ def test_osworld_cli_rejects_explicit_live_data_root(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     live_data_root = tmp_path / "data"
     osworld = tmp_path / "OSWorld"
-    payload = tmp_path / "computer_use"
+    payload = tmp_path / "unix_computer_use"
     output_root = tmp_path / "runs" / "osworld"
     for path in (repo_root, live_data_root, osworld, payload):
         path.mkdir(parents=True)
@@ -1528,7 +1685,7 @@ def test_osworld_cli_rejects_explicit_live_data_root(tmp_path, monkeypatch):
             str(osworld),
             "--osworld-server-url",
             "http://127.0.0.1:9",
-            "--computer-use-payload",
+            "--unix-computer-use-payload",
             str(payload),
             "--output-root",
             str(output_root),
@@ -1540,6 +1697,80 @@ def test_osworld_cli_rejects_explicit_live_data_root(tmp_path, monkeypatch):
     assert osworld_adapter.main() == 2
     rows = [json.loads(line) for line in (output_root / "osworld_preflight.ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     assert "live Ouroboros data root" in rows[0]["error"]
+
+
+def test_osworld_step_shell_action_uses_temp_script_without_raw_pkill_pattern():
+    from devtools.benchmarks.osworld.run_step_agent import _shell_action
+
+    rendered = _shell_action("pkill -f chromium || true", timeout=12)
+
+    assert "base64.b64decode" in rendered
+    assert "pkill -f chromium" not in rendered
+    assert "NamedTemporaryFile" in rendered
+    assert "subprocess.run(['/bin/bash', script_path]" in rendered
+
+
+def test_osworld_step_prompt_carries_image_and_in_app_done_guidance(tmp_path):
+    from devtools.benchmarks.osworld.run_step_agent import OuroborosStepAgent
+
+    agent = OuroborosStepAgent(
+        ouroboros_bin="ouroboros",
+        ouroboros_url="http://127.0.0.1:8765",
+        repo_dir=tmp_path,
+        data_dir=tmp_path,
+        settings_path=tmp_path / "settings.json",
+        result_dir=tmp_path,
+        task_id="task",
+        model="anthropic/claude-opus-4-7",
+        timeout_sec=1,
+        max_obs_chars=2000,
+        screenshot_check_only=False,
+    )
+    prompt = agent._prompt(
+        "Use LibreOffice Calc to make a pivot table",
+        {"accessibility_tree": "<desktop-frame/>"},
+        "/tmp/step.png",
+        max_steps=50,
+    )
+
+    assert "screenshot is attached" in prompt
+    assert "step 0 of at most 50" in prompt
+    assert "In app-named tasks, work in the named app first" in prompt
+    assert "Use done only after independently checking" in prompt
+    assert "Cross-step notes" in prompt
+
+
+def test_osworld_step_predict_attaches_screenshot(tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld.run_step_agent import OuroborosStepAgent
+
+    calls = {}
+
+    def fake_run(cmd, **kwargs):
+        calls["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout='{"response":"wait","notes":"remember","actions":[{"type":"wait"}]}', stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    agent = OuroborosStepAgent(
+        ouroboros_bin="ouroboros",
+        ouroboros_url="http://127.0.0.1:9999",
+        repo_dir=tmp_path,
+        data_dir=tmp_path / "data",
+        settings_path=tmp_path / "settings.json",
+        result_dir=tmp_path,
+        task_id="task",
+        model="anthropic/claude-opus-4-7",
+        timeout_sec=1,
+        max_obs_chars=2000,
+        screenshot_check_only=False,
+    )
+    response, actions, debug = agent.predict("look", {"screenshot": b"png", "accessibility_tree": ""}, max_steps=3)
+
+    assert response == "wait"
+    assert actions == ["WAIT"]
+    assert "--attach" in calls["cmd"]
+    assert "http://127.0.0.1:9999" in calls["cmd"]
+    assert debug["screenshot_upload_path"].endswith("step_001.png")
+    assert agent.notes == ["remember"]
 
 
 def test_terminal_bench_adapter_quotes_hostile_workspace_dir(tmp_path):
@@ -1559,7 +1790,7 @@ def test_terminal_bench_adapter_quotes_hostile_workspace_dir(tmp_path):
             return FakeResult()
 
     hostile = "/tmp/ws'; touch /tmp/pwn; echo '"
-    agent = OuroborosTerminalBenchAgent(logs_dir=tmp_path, workspace_dir=hostile)
+    agent = OuroborosTerminalBenchAgent(logs_dir=tmp_path, workspace_dir=hostile, task_timeout_sec=900)
     environment = FakeEnvironment()
 
     asyncio.run(agent._resolve_workspace_dir(environment))
@@ -1575,4 +1806,131 @@ def test_terminal_bench_adapter_quotes_hostile_workspace_dir(tmp_path):
     runner_command = environment.calls[-1]["command"]
     runner = runner_command.split("cat > /tmp/run_ouroboros_task.py <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     assert f'"workspace_root": {json.dumps(hostile)}' in runner
+    assert '"service_teardown": "keep"' in runner
+    assert 'task_body["timeout_sec"] = task_timeout' in runner
+    assert "task_timeout = 900" in runner
     compile(runner, "run_ouroboros_task.py", "exec")
+
+
+def test_terminal_bench_run_tb_validates_leaderboard_methodology():
+    from devtools.benchmarks.terminal_bench.run_tb import validate_methodology
+
+    validate_methodology(k=5, timeout_multiplier=1.0, resource_overrides=[])
+    with pytest.raises(ValueError, match="k >= 5"):
+        validate_methodology(k=1, timeout_multiplier=1.0, resource_overrides=[])
+    with pytest.raises(ValueError, match="timeout_multiplier"):
+        validate_methodology(k=5, timeout_multiplier=2.0, resource_overrides=[])
+    with pytest.raises(ValueError, match="forbids resource overrides"):
+        validate_methodology(k=5, timeout_multiplier=1.0, resource_overrides=["cpus=8"])
+
+
+def test_terminal_bench_run_tb_builds_required_agent_kwargs(tmp_path):
+    from devtools.benchmarks.terminal_bench.run_tb import HarborCommandConfig, harbor_command
+
+    cmd = harbor_command(HarborCommandConfig(
+        dataset="terminal-bench/terminal-bench-2-1",
+        model="openai/gpt-5.5",
+        k=5,
+        jobs_dir=tmp_path / "jobs",
+        harbor_bin="harbor",
+        n_concurrent=1,
+        task_filters=["pypi-server"],
+        settings_path=tmp_path / "settings.json",
+        execute=True,
+        light_model="google/gemini-3.5-flash",
+    ))
+
+    joined = " ".join(cmd)
+    assert "-k 5" in joined
+    assert "task_review_mode=required" in cmd
+    assert "ouroboros_light_model=google/gemini-3.5-flash" in cmd
+    assert "--include-task-name" in cmd
+    assert "pypi-server" in cmd
+    assert "--force-build" in cmd
+    # 6a: methodology-allowed setup/build multipliers (task multiplier stays 1.0).
+    assert "--agent-setup-timeout-multiplier" in cmd
+    assert "--environment-build-timeout-multiplier" in cmd
+    assert "--agent-timeout-multiplier" not in cmd
+
+
+def test_container_env_never_forwards_model_fallback(tmp_path, monkeypatch):
+    """6b: the benchmark metric is single-model — a host-configured
+    OUROBOROS_MODEL_FALLBACK must never leak into the container env."""
+    import json as _json
+
+    from devtools.benchmarks.terminal_bench.harbor_installed_agent import (
+        OuroborosTerminalBenchAgent,
+    )
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(_json.dumps({
+        "OUROBOROS_MODEL": "openai/gpt-5.5",
+        "OUROBOROS_MODEL_FALLBACK": "google/gemini-3.5-flash",
+    }), encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "google/gemini-3.5-flash")
+    monkeypatch.setenv("OUROBOROS_MODEL", "openai/gpt-5.5")
+
+    agent = OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path, model_name="test",
+        host_settings_path=str(settings),
+        ouroboros_model="openai/gpt-5.5",
+    )
+    env = agent._container_env()
+    # The fallback is PINNED to the measured model (not absent: the container
+    # has no settings.json, so absence would resurrect the SETTINGS_DEFAULTS
+    # fallback — a different model — inside the container).
+    assert env.get("OUROBOROS_MODEL_FALLBACK") == "openai/gpt-5.5"
+    assert env.get("OUROBOROS_MODEL") == "openai/gpt-5.5"
+
+    # No explicit kwarg: the pin follows the forwarded host main model.
+    agent_no_kwarg = OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path, model_name="test",
+        host_settings_path=str(settings),
+    )
+    env2 = agent_no_kwarg._container_env()
+    assert env2.get("OUROBOROS_MODEL_FALLBACK") == env2.get("OUROBOROS_MODEL") == "openai/gpt-5.5"
+
+    # No model anywhere: the pin falls back to the packaged default main model
+    # (fallback == main holds in EVERY reachable configuration).
+    monkeypatch.delenv("OUROBOROS_MODEL", raising=False)
+    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACK", raising=False)
+    empty_settings = tmp_path / "empty_settings.json"
+    empty_settings.write_text("{}", encoding="utf-8")
+    agent_bare = OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path, model_name="test",
+        host_settings_path=str(empty_settings),
+    )
+    env3 = agent_bare._container_env()
+    from ouroboros.config import SETTINGS_DEFAULTS
+    assert env3.get("OUROBOROS_MODEL_FALLBACK") == SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+
+
+def test_harbor_agent_defaults_max_workers_two_and_probes_context_timeout(tmp_path):
+    """6c: plan_task needs >=2 workers; 6d: per-task timeout adopted from the
+    harbor AgentContext when a future harbor exposes it (today: metadata probe)."""
+    import types as _types
+
+    from devtools.benchmarks.terminal_bench.harbor_installed_agent import (
+        OuroborosTerminalBenchAgent,
+    )
+
+    agent = OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path, model_name="test",
+        host_settings_path=str(tmp_path / "settings.json"),
+    )
+    assert agent.max_workers == 2
+    assert agent.task_timeout_sec is None
+
+    ctx = _types.SimpleNamespace(metadata={"task_timeout_sec": 900})
+    assert agent._context_task_timeout_sec(ctx) == 900
+    ctx_attr = _types.SimpleNamespace(agent_timeout_sec=600, metadata=None)
+    assert agent._context_task_timeout_sec(ctx_attr) == 600
+    ctx_none = _types.SimpleNamespace(metadata={})
+    assert agent._context_task_timeout_sec(ctx_none) is None
+    # Explicit kwarg still wins over the probe.
+    agent_explicit = OuroborosTerminalBenchAgent(
+        logs_dir=tmp_path, model_name="test",
+        host_settings_path=str(tmp_path / "settings.json"),
+        task_timeout_sec=300,
+    )
+    assert agent_explicit.task_timeout_sec == 300

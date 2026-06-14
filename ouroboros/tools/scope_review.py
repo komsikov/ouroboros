@@ -9,7 +9,6 @@ fail closed; oversized prompts are the explicit non-blocking skip path.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import inspect
 import logging
@@ -30,6 +29,7 @@ from ouroboros.tools.review_helpers import (
     build_scope_section,
     build_touched_file_pack,
     load_checklist_section,
+    review_drive_root,
     CRITICAL_FINDING_CALIBRATION,
     REPO_ANTI_PATTERN_LOCK_GUARD,
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -47,7 +47,13 @@ from ouroboros.tools.review_helpers import (
     parse_git_name_status,
 )
 from ouroboros.triad_review import extract_json_array
-from ouroboros.utils import run_cmd, utc_now_iso, append_jsonl, estimate_tokens
+from ouroboros.utils import (
+    run_cmd,
+    utc_now_iso,
+    append_jsonl,
+    estimate_tokens,
+    truncate_review_artifact as _truncate_review_artifact,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +81,25 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_MODEL_CONTEXT_WINDOW - _SCOPE_MAX_TOKENS - _SCOPE_OUTPUT_MARGIN_TOKENS,
 )
 
+# Tokenizer-density calibration per reviewer family (rationale + ratio SSOT in
+# review_helpers.calibrated_input_token_limit): Claude-family tokenizers cut
+# code-heavy packs at ~2.5 chars/token, so the chars/4 estimate undercounts by
+# ~1.58x and a 739K-estimated pack drew a deterministic provider 400. The
+# calibration shrinks the PROMPT for the same pinned reviewer — never the
+# reviewer model or the >=1M window floor (BIBLE P3).
+from ouroboros.tools.review_helpers import (
+    calibrated_input_token_limit as _calibrated_input_token_limit,
+    is_claude_family_model as _is_anthropic_family_model,
+)
+
+_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT = _calibrated_input_token_limit(
+    "anthropic/claude",
+    context_window=_SCOPE_MODEL_CONTEXT_WINDOW,
+    output_reserve=_SCOPE_MAX_TOKENS,
+    tokenizer_margin=_SCOPE_OUTPUT_MARGIN_TOKENS,
+    budget_cap=_SCOPE_BUDGET_TOKEN_LIMIT,
+)
+
 # Opt-in degraded low-context scope review (OUROBOROS_SCOPE_REVIEW_DEGRADED):
 # when the owner selects low context mode for a local/no-1M setup, this may run a
 # window-fitting ADVISORY scope review instead of the non-blocking skip. The atlas
@@ -97,15 +122,52 @@ def _degraded_scope_requested() -> bool:
     return low and os.environ.get("OUROBOROS_SCOPE_REVIEW_DEGRADED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _effective_scope_input_limit(*, degraded: bool = False) -> int:
+def _window_scaled_reserves(window: int) -> tuple:
+    """(output_reserve, tokenizer_margin) scaled to the reviewer window.
+
+    The absolute 1M-calibrated reserves (100K output + 155K margin) would
+    swallow a small window whole (gigachat 131K => input limit 0, bricking the
+    slot — Provider Independence). Sub-floor windows scale the reserves to the
+    window instead: a quarter for output (floored at 8K so the reviewer can
+    still produce the full checklist JSON) and an eighth for tokenizer margin.
+    >=1M windows keep the absolute reserves unchanged.
+    """
+    if window >= _SCOPE_MODEL_CONTEXT_WINDOW:
+        return _SCOPE_MAX_TOKENS, _SCOPE_OUTPUT_MARGIN_TOKENS
+    output_reserve = min(_SCOPE_MAX_TOKENS, max(8_192, window // 4))
+    tokenizer_margin = min(_SCOPE_OUTPUT_MARGIN_TOKENS, window // 8)
+    return output_reserve, tokenizer_margin
+
+
+def _effective_scope_input_limit(*, degraded: bool = False, scope_model: str = "") -> int:
     """Scope input token cap for normal vs supplemental degraded review.
 
     The commit gate calls the normal full-cap path. Degraded is explicit so the
     low/no-1M advisory path cannot silently replace the blocking 1M floor.
+    The cap is model-aware on two axes: Claude-family reviewers get the
+    code-density-calibrated cap so the assembled prompt fits their REAL
+    tokenizer (rationale above), and a KNOWN reviewer window
+    (provider_models.context_window_tokens) replaces the assumed 1M so a
+    small-window reviewer overflows into the visible non-blocking
+    budget_exceeded skip instead of a deterministic provider 400.
     """
     if degraded and _degraded_scope_requested():
         return _LOW_SCOPE_INPUT_TOKEN_LIMIT
-    return _SCOPE_INPUT_TOKEN_LIMIT
+    model = scope_model or _get_scope_model()
+    from ouroboros.provider_models import context_window_tokens
+    window = context_window_tokens(model) or _SCOPE_MODEL_CONTEXT_WINDOW
+    output_reserve, tokenizer_margin = _window_scaled_reserves(window)
+    if _is_anthropic_family_model(model):
+        if window == _SCOPE_MODEL_CONTEXT_WINDOW:
+            return _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
+        return max(0, _calibrated_input_token_limit(
+            model,
+            context_window=window,
+            output_reserve=output_reserve,
+            tokenizer_margin=tokenizer_margin,
+            budget_cap=_SCOPE_BUDGET_TOKEN_LIMIT,
+        ))
+    return max(0, min(_SCOPE_BUDGET_TOKEN_LIMIT, window - output_reserve - tokenizer_margin))
 
 # Defense-in-depth cap for deleted-file HEAD content inlined into the prompt.
 _DELETED_INLINE_MAX_BYTES = 1_048_576  # 1 MB
@@ -118,7 +180,7 @@ class _ScopeAtlasBudgetExceeded(RuntimeError):
         self.manifest = dict(manifest or {})
         token_count = int(self.manifest.get("estimated_total_tokens") or 0)
         super().__init__(
-            f"Generated Scope Atlas exceeded hard budget"
+            "Generated Scope Atlas exceeded hard budget"
             + (f" (~{token_count:,} estimated tokens)" if token_count else "")
         )
 
@@ -151,7 +213,7 @@ class ScopeReviewResult:
 @dataclass
 class _TouchedContextStatus:
     """Touched-context sentinel; ``None`` means context OK."""
-    status: str  # "empty" | "omitted" | "budget_exceeded"
+    status: str  # "empty" | "omitted" | "budget_exceeded" | "fixed_overflow"
     omitted_paths: List[str] = field(default_factory=list)
     token_count: int = 0  # estimated full prompt tokens when budget is exceeded
 
@@ -190,19 +252,10 @@ _CURRENT_TOUCHED_CONTEXT_SKIP_PREFIXES = (
 )
 
 
-def _load_doc(repo_dir: pathlib.Path, rel_path: str) -> str:
-    return load_governance_doc(repo_dir, rel_path, on_missing="placeholder")
-
-
-def _load_dev_guide(repo_dir: pathlib.Path) -> str:
-    """Compatibility wrapper for tests and older callers."""
-    return _load_doc(repo_dir, "docs/DEVELOPMENT.md")
-
-
 def _load_canonical_context_docs(repo_dir: pathlib.Path) -> str:
     parts: list[str] = []
     for rel_path in _CANONICAL_CONTEXT_DOCS:
-        parts.append(f"## {rel_path}\n\n{_load_doc(repo_dir, rel_path)}")
+        parts.append(f"## {rel_path}\n\n{load_governance_doc(repo_dir, rel_path, on_missing='placeholder')}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -335,11 +388,12 @@ def _gather_scope_packs(
     drive_root: Optional[pathlib.Path] = None,
     degraded: bool = False,
     compact: bool = False,
+    scope_model: str = "",
 ) -> str:
     """Collect the bounded wider repository atlas, failing closed on git errors."""
     # Canonical docs and touched files are injected explicitly; avoid duplicating them.
     already_included = frozenset(set(all_touched_paths) | set(_CANONICAL_CONTEXT_DOCS))
-    _input_limit = _effective_scope_input_limit(degraded=degraded)
+    _input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=scope_model)
     try:
         atlas = compile_review_context_atlas(
             ReviewContextAtlasRequest(
@@ -367,6 +421,57 @@ def _gather_scope_packs(
         raise RuntimeError(f"review_context_atlas error: {exc}") from exc
 
     return repo_pack_section
+
+
+def _ladder_terminal_status(scope_model: str, token_count: int) -> "_TouchedContextStatus":
+    """Terminal status when the guaranteed-fit ladder exhausts every step."""
+    from ouroboros.provider_models import context_window_tokens
+
+    known_window = context_window_tokens(scope_model)
+    if known_window and known_window < _SCOPE_MODEL_CONTEXT_WINDOW:
+        return _TouchedContextStatus(status="budget_exceeded", token_count=token_count)
+    return _TouchedContextStatus(status="fixed_overflow", token_count=token_count)
+
+
+def _render_touched_section(
+    repo_dir: pathlib.Path,
+    current_context_paths: list,
+    deleted_paths: list,
+    skipped_by_design: list,
+    diff_only_paths: list,
+) -> tuple:
+    """Build the touched-files prompt section.
+
+    ``diff_only_paths`` are degraded to an explicit disclosed note (their
+    changes stay fully visible in the staged diff) — the guaranteed-fit
+    ladder's step for oversized fixed parts.
+    """
+    kept = [path for path in current_context_paths if path not in diff_only_paths]
+    section, pack_omitted = build_touched_file_pack(repo_dir, kept)
+    section = _inline_deleted_file_pack(section, deleted_paths, repo_dir)
+    if skipped_by_design:
+        skip_note = (
+            "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
+            "The following touched files are not duplicated as full current-file "
+            "snapshots because they are either canonical docs injected above or "
+            "tests whose exact changes are visible in the staged diff below:\n"
+            + "\n".join(f"- {path}" for path in skipped_by_design)
+            + "\n"
+        )
+        section = section + "\n\n" + skip_note if section.strip() else skip_note
+    if diff_only_paths:
+        degrade_note = (
+            "## TOUCHED FILE BUDGET DEGRADATION NOTE\n"
+            "The full post-change snapshots of the following touched files were "
+            "OMITTED to fit the reviewer input budget (largest files first). "
+            "Their complete changes are still visible in the staged diff below; "
+            "treat this as an explicit, disclosed omission of unchanged "
+            "surrounding context, not a hidden gap:\n"
+            + "\n".join(f"- {path}" for path in diff_only_paths)
+            + "\n"
+        )
+        section = section + "\n\n" + degrade_note if section.strip() else degrade_note
+    return section, pack_omitted
 
 
 def _build_scope_history_section(scope_review_history: Optional[list]) -> str:
@@ -415,13 +520,19 @@ def _build_scope_prompt(
     scope_review_history: Optional[list] = None,
     drive_root: Optional[pathlib.Path] = None,
     degraded: bool = False,
+    scope_model: str = "",
 ) -> tuple:
     """Build the scope prompt or a touched-context/budget status sentinel."""
     _SCOPE_CONTEXT_MANIFEST.set({})
-    try:
-        scope_checklist = load_checklist_section("Intent / Scope Review Checklist")
-    except Exception:
-        scope_checklist = "(Intent / Scope Review Checklist not found in docs/CHECKLISTS.md)"
+    # Fail-closed (immune-system parity with the triad): a scope review running
+    # WITHOUT its checklist silently reviews against nothing. Raising turns it
+    # into an explicit SCOPE_REVIEW_BLOCKED error instead of a placeholder pass.
+    scope_checklist = load_checklist_section("Intent / Scope Review Checklist")
+    if not str(scope_checklist or "").strip():
+        raise RuntimeError(
+            "Intent / Scope Review Checklist could not be loaded from docs/CHECKLISTS.md — "
+            "scope review cannot run without its checklist (fail-closed)."
+        )
 
     goal_section = build_goal_section(goal, scope, commit_message)
     scope_section = build_scope_section(scope)
@@ -475,24 +586,16 @@ def _build_scope_prompt(
         if _should_skip_current_touched_context(path)
     ]
 
-    current_files_section, omitted = build_touched_file_pack(repo_dir, current_context_paths)
-    current_files_section = _inline_deleted_file_pack(
-        current_files_section, deleted_paths, repo_dir
-    )
-    if current_skipped_by_design:
-        skip_note = (
-            "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
-            "The following touched files are not duplicated as full current-file "
-            "snapshots because they are either canonical docs injected above or "
-            "tests whose exact changes are visible in the staged diff below:\n"
-            + "\n".join(f"- {path}" for path in current_skipped_by_design)
-            + "\n"
+    def _render_current_section(diff_only_paths: list) -> tuple:
+        return _render_touched_section(
+            repo_dir,
+            current_context_paths,
+            deleted_paths,
+            current_skipped_by_design,
+            diff_only_paths,
         )
-        current_files_section = (
-            current_files_section + "\n\n" + skip_note
-            if current_files_section.strip()
-            else skip_note
-        )
+
+    current_files_section, omitted = _render_current_section([])
     touched_status = _compute_touched_status(
         current_files_section, deleted_paths, omitted, current_context_paths
     )
@@ -502,9 +605,9 @@ def _build_scope_prompt(
         return None, touched_status
 
     repo_pack_placeholder = "__GENERATED_SCOPE_ATLAS_PENDING__"
-    repo_pack_section = repo_pack_placeholder
 
-    prompt = f"""\
+    def _assemble_prompt(current_files_section: str) -> str:
+        return f"""\
 {REVIEW_PREAMBLE}
 
 ## Your role
@@ -601,9 +704,9 @@ section — the staged diff below already shows every `-` line.
 
 ## Wider repository context
 
-{repo_pack_section}
+{repo_pack_placeholder}
 """
-    fixed_prompt_tokens = estimate_tokens(prompt)
+
     gather_signature = inspect.signature(_gather_scope_packs)
     gather_accepts_kwargs = any(
         param.kind is inspect.Parameter.VAR_KEYWORD
@@ -611,68 +714,95 @@ section — the staged diff below already shows every `-` line.
     )
     gather_accepted = set(gather_signature.parameters)
 
-    try:
-        gather_kwargs = {"fixed_prompt_tokens": fixed_prompt_tokens}
-        gather_kwargs["drive_root"] = drive_root
-        gather_kwargs["degraded"] = degraded
+    def _atlas_section(fixed_tokens: int, compact: bool) -> str:
+        gather_kwargs = {
+            "fixed_prompt_tokens": fixed_tokens,
+            "drive_root": drive_root,
+            "degraded": degraded,
+            "scope_model": scope_model,
+            "compact": compact,
+        }
+        return _gather_scope_packs(
+            repo_dir,
+            all_touched_paths,
+            **(
+                gather_kwargs
+                if gather_accepts_kwargs
+                else {key: value for key, value in gather_kwargs.items() if key in gather_accepted}
+            ),
+        )
+
+    def _touched_token_estimate(path: str) -> int:
         try:
-            repo_pack_section = _gather_scope_packs(
-                repo_dir,
-                all_touched_paths,
-                **(
-                    gather_kwargs
-                    if gather_accepts_kwargs
-                    else {key: value for key, value in gather_kwargs.items() if key in gather_accepted}
-                ),
-            )
-        except _ScopeAtlasBudgetExceeded:
-            gather_kwargs["compact"] = True
-            repo_pack_section = _gather_scope_packs(
-                repo_dir,
-                all_touched_paths,
-                **(
-                    gather_kwargs
-                    if gather_accepts_kwargs
-                    else {key: value for key, value in gather_kwargs.items() if key in gather_accepted}
-                ),
-            )
-    except _ScopeAtlasBudgetExceeded as exc:
-        return None, _TouchedContextStatus(
-            status="budget_exceeded",
-            token_count=int(exc.manifest.get("estimated_total_tokens") or 0),
-        )
-    head, sep, tail = prompt.rpartition(repo_pack_placeholder)
-    if not sep:
-        raise RuntimeError("scope review atlas placeholder missing")
-    prompt = head + repo_pack_section + tail
-    prompt_tokens = estimate_tokens(prompt)
-    if prompt_tokens > _effective_scope_input_limit(degraded=degraded):
-        if not gather_kwargs.get("compact"):
-            gather_kwargs["compact"] = True
-            try:
-                repo_pack_section = _gather_scope_packs(
-                    repo_dir,
-                    all_touched_paths,
-                    **(
-                        gather_kwargs
-                        if gather_accepts_kwargs
-                        else {key: value for key, value in gather_kwargs.items() if key in gather_accepted}
-                    ),
-                )
-            except _ScopeAtlasBudgetExceeded as exc:
-                return None, _TouchedContextStatus(
-                    status="budget_exceeded",
-                    token_count=int(exc.manifest.get("estimated_total_tokens") or 0),
-                )
-            prompt = head + repo_pack_section + tail
+            return int((repo_dir / path).stat().st_size) // 4 + 64
+        except OSError:
+            return 0
+
+    # Guaranteed-fit ladder: 1) full atlas; 2) compact atlas; 3) degrade the
+    # largest touched files to diff-only (explicit disclosed note — their
+    # changes stay fully visible in the staged diff); 4) only the irreducible
+    # prompt (checklist + canonical docs + staged diff) not fitting remains,
+    # which fails CLOSED (fixed_overflow), never a silent skip.
+    input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=scope_model)
+    _atlas_min_allowance = 35_000  # manifest reserve + hard headroom, see review_context_atlas
+    diff_only_paths: list = []
+    degradable = sorted(
+        current_context_paths,
+        key=lambda path: -_touched_token_estimate(path),
+    )
+    compact = False
+    last_known_tokens = 0
+    while True:
+        prompt = _assemble_prompt(current_files_section)
+        fixed_prompt_tokens = estimate_tokens(prompt)
+        atlas_text = None
+        try:
+            atlas_text = _atlas_section(fixed_prompt_tokens, compact)
+        except _ScopeAtlasBudgetExceeded as exc:
+            if not compact:
+                compact = True
+                try:
+                    atlas_text = _atlas_section(fixed_prompt_tokens, True)
+                except _ScopeAtlasBudgetExceeded as compact_exc:
+                    last_known_tokens = int(compact_exc.manifest.get("estimated_total_tokens") or 0)
+            else:
+                last_known_tokens = int(exc.manifest.get("estimated_total_tokens") or 0)
+
+        deficit = 0
+        if atlas_text is not None:
+            head, sep, tail = prompt.rpartition(repo_pack_placeholder)
+            if not sep:
+                raise RuntimeError("scope review atlas placeholder missing")
+            prompt = head + atlas_text + tail
             prompt_tokens = estimate_tokens(prompt)
-            if prompt_tokens <= _effective_scope_input_limit(degraded=degraded):
+            last_known_tokens = prompt_tokens
+            if prompt_tokens <= input_limit:
                 return prompt, None
-        return None, _TouchedContextStatus(
-            status="budget_exceeded",
-            token_count=prompt_tokens,
-        )
-    return prompt, None
+            if not compact:
+                # Retry the same touched set with the compact atlas first.
+                compact = True
+                continue
+            deficit = prompt_tokens - input_limit
+        else:
+            # Even the atlas manifest cannot fit beside the fixed part: shrink
+            # the fixed part enough to give the manifest its minimum room.
+            deficit = max(50_000, fixed_prompt_tokens + _atlas_min_allowance - input_limit)
+
+        if not degradable:
+            # Terminal split by verdict authority: the >=1M blocking reviewer
+            # fails CLOSED (fixed_overflow — split the diff); a KNOWN sub-floor
+            # reviewer is advisory-only and routes to the disclosed
+            # non-blocking skip (Provider Independence for small-window slots).
+            return None, _ladder_terminal_status(
+                scope_model or _get_scope_model(),
+                last_known_tokens or fixed_prompt_tokens,
+            )
+        freed = 0
+        while degradable and freed < deficit + 2_000:
+            path = degradable.pop(0)
+            diff_only_paths.append(path)
+            freed += _touched_token_estimate(path)
+        current_files_section, _ = _render_current_section(diff_only_paths)
 
 
 def _normalize_scope_items(items: list) -> tuple[list[dict], str]:
@@ -699,12 +829,18 @@ def _normalize_scope_items(items: list) -> tuple[list[dict], str]:
         if verdict not in {"PASS", "FAIL"}:
             invalid.append(f"{item_id}: invalid verdict {verdict!r}")
             continue
-        if "severity" not in item:
-            invalid.append(f"{item_id}: missing severity")
-            continue
         severity = str(item.get("severity", "") or "").strip().lower()
+        if verdict == "PASS" and not severity:
+            # Severity is semantically void on PASS rows (it only classifies
+            # FAIL blocking-ness), and reviewer models legitimately omit it
+            # there — fable-5 emits severity on every FAIL but not on PASS.
+            # Defaulting keeps the coverage contract about what matters; the
+            # triad parser applies the same "advisory" default convention.
+            severity = "advisory"
         if severity not in _SCOPE_VALID_SEVERITIES:
-            invalid.append(f"{item_id}: invalid severity {severity!r}")
+            # FAIL rows must carry an explicit valid severity — it decides
+            # blocking, so a missing/garbled value stays fail-closed.
+            invalid.append(f"{item_id}: missing or invalid severity {severity!r}")
             continue
         reason = str(item.get("reason", "") or "").strip()
         if not reason:
@@ -779,10 +915,6 @@ def _classify_scope_findings(items: list) -> tuple:
     return critical_findings, advisory_findings
 
 
-def _emit_usage(ctx: ToolContext, model: str, usage: dict) -> None:
-    emit_review_usage(ctx, model=model, usage=usage, source="scope_review")
-
-
 def _log_scope_result(
     ctx: ToolContext,
     critical_count: int,
@@ -801,7 +933,7 @@ def _log_scope_result(
     prompt_tokens = int(prompt_tokens or 0)
     if prompt_tokens <= 0 and prompt_chars:
         prompt_tokens = max(0, int(prompt_chars) // 4)
-    input_limit = _effective_scope_input_limit(degraded=degraded)
+    input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=model_id)
     try:
         append_jsonl(ctx.drive_logs() / "events.jsonl", {
             "ts": utc_now_iso(), "type": "scope_review_complete",
@@ -817,20 +949,6 @@ def _log_scope_result(
         pass
 
 
-def _scope_drive_root(ctx: ToolContext | None = None) -> pathlib.Path:
-    if ctx is not None:
-        try:
-            return pathlib.Path(ctx.drive_root)
-        except Exception:
-            pass
-    try:
-        from ouroboros.config import DATA_DIR
-
-        return pathlib.Path(DATA_DIR)
-    except Exception:
-        return pathlib.Path("../data").resolve(strict=False)
-
-
 def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContext | None = None) -> tuple:
     """Execute the scope review LLM call synchronously.
 
@@ -841,6 +959,12 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
     from ouroboros.config import resolve_effort as _resolve_effort
     scope_model = scope_model or _get_scope_model()
     scope_effort = _resolve_effort("scope_review")
+    # Output budget scales with the reviewer window: requesting the absolute
+    # 100K reserve on a small-window model would 400 on input+max_tokens.
+    from ouroboros.provider_models import context_window_tokens as _window_of
+    _scope_output_tokens, _ = _window_scaled_reserves(
+        _window_of(scope_model) or _SCOPE_MODEL_CONTEXT_WINDOW
+    )
     messages = [
         {"role": "system", "content": prompt},
         {
@@ -857,7 +981,7 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
             messages=messages,
             task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review",
             call_type="scope_review",
-            max_tokens=_SCOPE_MAX_TOKENS,
+            max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
         )
@@ -866,14 +990,14 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
             model=scope_model,
             effort=scope_effort,
             timeout_sec=_SCOPE_REVIEW_SLOT_TIMEOUT_SEC,
-            max_tokens=_SCOPE_MAX_TOKENS,
+            max_tokens=_scope_output_tokens,
             temperature=0.2,
             role_hint="scope reviewer",
         )
         result = run_review_request(
             request,
             slots=[slot],
-            drive_root=_scope_drive_root(ctx),
+            drive_root=review_drive_root(ctx),
             llm=LLMClient(),
             usage_ctx=None,
         )
@@ -900,10 +1024,30 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
         return "", None, error_msg
 
 
+_PROVIDER_OVERSIZE_MARKERS = (
+    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
+    "prompt is too long",
+    # Anthropic: "input length and `max_tokens` exceed context limit"
+    "exceed context limit",
+    # OpenAI error code + message variants
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def _is_provider_oversize_error(error_text: str) -> bool:
+    """Mechanical fault classification: does this provider error mean the prompt
+    exceeded the model's REAL context window? Deliberately tight markers — any
+    other provider/transport error keeps the fail-closed blocking path."""
+    low = str(error_text or "").lower()
+    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)
+
+
 def _handle_prompt_signals(
     prompt: Optional[str],
     context_status: Optional["_TouchedContextStatus"],
     input_limit: int = _SCOPE_INPUT_TOKEN_LIMIT,
+    scope_model: str = "",
 ) -> Optional[ScopeReviewResult]:
     """Translate touched-context status into an early ScopeReviewResult."""
     if context_status is None:
@@ -913,6 +1057,11 @@ def _handle_prompt_signals(
         token_count = context_status.token_count
         # Back-compute prompt chars from the budget-gate token estimate.
         _prompt_chars_est = token_count * 4
+        # Report the REAL window-scaled reserves, not the 1M constants.
+        from ouroboros.provider_models import context_window_tokens as _window_of
+
+        _window = (_window_of(scope_model) if scope_model else 0) or _SCOPE_MODEL_CONTEXT_WINDOW
+        _output_reserve, _ = _window_scaled_reserves(_window)
         log.warning(
             "Scope review skipped: full scope-review prompt (~%d tokens) exceeds budget limit (%d). "
             "Scope review downgraded to non-blocking warning.",
@@ -930,12 +1079,33 @@ def _handle_prompt_signals(
                 "reason": (
                     f"⚠️ SCOPE_REVIEW_SKIPPED: Full scope-review prompt (~{token_count} tokens) "
                     f"exceeds the scope input budget ({input_limit} tokens, "
-                    f"reserving {_SCOPE_MAX_TOKENS} for output within a {_SCOPE_MODEL_CONTEXT_WINDOW}-token window). "
+                    f"reserving {_output_reserve} for output within a {_window}-token window). "
                     "Scope review downgraded to non-blocking warning. "
                     "Consider reducing codebase size or splitting the review."
                 ),
-                "model": "scope_reviewer",
+                "model": scope_model or "scope_reviewer",
             }],
+        )
+
+    if context_status.status == "fixed_overflow":
+        # The guaranteed-fit ladder exhausted every degradation step: even with
+        # all touched files reduced to diff-only and the atlas reduced to its
+        # manifest, the irreducible prompt (checklist + canonical docs + staged
+        # diff) exceeds the reviewer input budget. This is a structural
+        # condition the owner must see — fail CLOSED, never a silent skip.
+        token_count = context_status.token_count
+        return ScopeReviewResult(
+            blocked=True,
+            status="fixed_overflow",
+            prompt_chars=token_count * 4,
+            block_message=(
+                f"⚠️ SCOPE_REVIEW_BLOCKED: the irreducible scope prompt (checklist + canonical "
+                f"docs + staged diff) is ~{token_count} estimated tokens and exceeds the scope "
+                f"reviewer input budget ({input_limit}). Every touched file was already degraded "
+                "to diff-only and the atlas to its manifest. Split the commit into smaller "
+                "staged diffs, or configure a larger-window scope reviewer. "
+                "Fail-closed stop — not a skippable budget condition."
+            ),
         )
 
     if context_status.status == "empty":
@@ -1035,6 +1205,7 @@ def run_scope_review(
             scope_review_history=scope_review_history,
             drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
             degraded=degraded,
+            scope_model=scope_model_id,
         )
     except RuntimeError as exc:
         return ScopeReviewResult(
@@ -1052,7 +1223,8 @@ def run_scope_review(
     signal_result = _handle_prompt_signals(
         prompt,
         context_status,
-        input_limit=_effective_scope_input_limit(degraded=degraded),
+        input_limit=_effective_scope_input_limit(degraded=degraded, scope_model=scope_model_id),
+        scope_model=scope_model_id,
     )
     if signal_result is not None:
         # Keep _handle_prompt_signals as the status SSOT for early exits.
@@ -1071,6 +1243,41 @@ def run_scope_review(
     _tokens_out = int(_usage.get("completion_tokens", 0) or 0)
     _cost_usd = float(_usage.get("cost", 0.0) or 0.0)
     if llm_error:
+        if _is_provider_oversize_error(llm_error):
+            # The estimate-based budget gate passed but the provider's REAL
+            # tokenizer rejected the prompt as oversize. This is the same
+            # failure class as the pre-call budget_exceeded skip (pack cannot
+            # fit the reviewer window), so it downgrades to the same VISIBLE
+            # non-blocking advisory instead of a fail-closed block. Any other
+            # provider/transport error stays blocking.
+            log.warning(
+                "Scope review skipped: provider rejected the prompt as oversize "
+                "(estimate-gate passed; real tokenizer denser). Downgrading to "
+                "non-blocking budget_exceeded. Error: %s", llm_error,
+            )
+            return ScopeReviewResult(
+                blocked=False,
+                block_message="",
+                status="budget_exceeded",
+                model_id=scope_model_id,
+                prompt_chars=_prompt_chars,
+                context_manifest=_current_scope_context_manifest(),
+                prompt_ref=_prompt_ref,
+                response_ref=_response_ref,
+                advisory_findings=[{
+                    "verdict": "FAIL",
+                    "severity": "advisory",
+                    "item": "scope_review_skipped",
+                    "reason": (
+                        f"⚠️ SCOPE_REVIEW_SKIPPED: the provider rejected the assembled scope prompt "
+                        f"(~{_prompt_tokens_est} estimated tokens) as exceeding the model's real "
+                        f"context window. Scope review downgraded to non-blocking warning. "
+                        "Provider error: "
+                        + _truncate_review_artifact(str(llm_error), 1000)
+                    ),
+                    "model": scope_model_id,
+                }],
+            )
         return ScopeReviewResult(
             blocked=True,
             block_message=llm_error,
@@ -1082,7 +1289,7 @@ def run_scope_review(
             response_ref=_response_ref,
         )
     if _usage:
-        _emit_usage(ctx, scope_model_id, _usage)
+        emit_review_usage(ctx, model=scope_model_id, usage=_usage, source="scope_review")
 
     if not raw_text.strip():
         # Empty model response is distinct from transport/API error.
@@ -1172,6 +1379,32 @@ def run_scope_review(
             ),
             "model": scope_model_id,
         })
+    elif critical_findings:
+        # BIBLE P3 floor: only a >=1M-window reviewer may act as the BLOCKING
+        # scope gate. A scope model with a KNOWN sub-floor window now gets a
+        # right-sized pack (window-aware cap) and can respond, but its verdict
+        # authority is advisory-only — same doctrine as the degraded path.
+        from ouroboros.provider_models import context_window_tokens as _window_of
+
+        _known_window = _window_of(scope_model_id)
+        if _known_window and _known_window < _SCOPE_MODEL_CONTEXT_WINDOW:
+            for _f in critical_findings:
+                _f["severity"] = "advisory"
+                _f["reason"] = "[sub-floor scope reviewer] " + str(_f.get("reason", ""))
+            advisory_findings = list(critical_findings) + list(advisory_findings)
+            critical_findings = []
+            advisory_findings.append({
+                "verdict": "FAIL",
+                "severity": "advisory",
+                "item": "scope_review_sub_floor",
+                "reason": (
+                    f"⚠️ SCOPE_REVIEW_SUB_FLOOR: scope reviewer {scope_model_id} has a known "
+                    f"{_known_window}-token context window, below the >=1M blocking scope floor "
+                    "(BIBLE P3). Its findings are delivered ADVISORY-ONLY and cannot block the "
+                    "commit; configure a >=1M-window scope model to restore the blocking gate."
+                ),
+                "model": scope_model_id,
+            })
     _log_scope_result(
         ctx,
         len(critical_findings),

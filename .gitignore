@@ -35,6 +35,7 @@ build/
 *.dmg
 python-standalone/
 node-standalone/
+ripgrep-standalone/
 
 # OS
 .DS_Store
@@ -48,6 +49,7 @@ repo_bundle_manifest.json
 
 # Test artifacts
 <MagicMock*
+MagicMock/
 .tmp-data-*/
 .refactor-log.md
 .review_phase_1.py

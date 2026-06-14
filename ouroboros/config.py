@@ -13,7 +13,7 @@ import pathlib
 import re
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
@@ -103,6 +103,14 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
     "TOTAL_BUDGET": 10.0,
     "OUROBOROS_PER_TASK_COST_USD": 20.0,
+    # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
+    "OUROBOROS_MAX_ROUNDS": 200,
+    # Same-model attempt budget for TRANSIENT provider failure classes
+    # (finish_reason=null, 429/5xx/overloaded); floored at the caller's base
+    # retry budget. Permanent classes fail fast regardless.
+    "OUROBOROS_TRANSIENT_RETRY_MAX": 6,
+    # Skill lifecycle lane deadline (wedged-job loud-failure bound).
+    "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
     "OUROBOROS_HARD_TIMEOUT_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
@@ -110,7 +118,6 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
-    "OUROBOROS_EVO_COST_THRESHOLD": 0.10,
     # Post-task self-evolution envelope (V4). Owner-enabled capability whose
     # CONTENT stays LLM-first; default OFF. When enabled, after a qualifying task
     # the worker may promote one high-value code-class backlog item into the
@@ -129,6 +136,11 @@ SETTINGS_DEFAULTS = {
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
+    # Launcher-seeded native skills carry a hash-pinned native-trust review
+    # verdict (the payload bytes shipped through the repo commit gate); the
+    # zero-grant ones also auto-enable. Editing the payload still goes stale.
+    # Owner opt-out: set to false to keep manual review for native seeds.
+    "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS": "true",
     # Runtime mode: light | advanced | pro; pro still requires review gates.
     "OUROBOROS_RUNTIME_MODE": "advanced",
     # Context mode: low | max. Owner-only working-context size profile. max =
@@ -653,6 +665,23 @@ def get_auto_grant_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def get_trust_native_seeded_skills() -> bool:
+    """Whether launcher-seeded native skills get the hash-pinned trust verdict."""
+    key = "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS"
+    raw = None
+    try:
+        if SETTINGS_PATH.exists():
+            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(disk, dict) and key in disk:
+                raw = disk.get(key)
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = os.environ.get(key, SETTINGS_DEFAULTS[key])
+    raw = str(raw or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def normalize_runtime_mode(value: Any) -> str:
     """Clamp caller-supplied runtime mode to the canonical closed enum."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"])
@@ -749,11 +778,6 @@ SKILL_SOURCE_SUBDIRS = (
 )
 
 
-def get_data_skills_dir() -> pathlib.Path:
-    """Return ``<DATA_DIR>/skills/`` (created on demand)."""
-    return ensure_data_skills_dir(DATA_DIR)
-
-
 def ensure_data_skills_dir(data_dir: pathlib.Path) -> pathlib.Path:
     """Create and return the data skills root plus source subdirectories."""
     root = data_dir / "skills"
@@ -772,16 +796,6 @@ def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
     return candidate if candidate.is_dir() else None
 
 
-def get_clawhub_skills_dir() -> pathlib.Path:
-    """Return ``<DATA_DIR>/skills/clawhub/`` (created on demand)."""
-    target = get_data_skills_dir() / SKILL_SOURCE_CLAWHUB
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return target
-
-
 def get_ouroboroshub_catalog_url() -> str:
     """Return the official OuroborosHub static catalog URL."""
 
@@ -791,7 +805,7 @@ def get_ouroboroshub_catalog_url() -> str:
 def get_ouroboroshub_skills_dir() -> pathlib.Path:
     """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand)."""
 
-    target = get_data_skills_dir() / SKILL_SOURCE_OUROBOROSHUB
+    target = ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -1016,15 +1030,6 @@ def save_settings(
         _release_settings_lock(fd)
 
 
-def get_mcp_enabled() -> bool:
-    raw = str(os.environ.get("MCP_ENABLED", "") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(load_settings().get("MCP_ENABLED"))
-
-
 def get_mcp_servers() -> list:
     return list(_coerce_setting_value("MCP_SERVERS", load_settings().get("MCP_SERVERS")))
 
@@ -1082,12 +1087,14 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
         "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
-        "OUROBOROS_EVO_COST_THRESHOLD", "OUROBOROS_WEBSEARCH_MODEL",
+        "OUROBOROS_WEBSEARCH_MODEL",
         "OUROBOROS_POST_TASK_EVOLUTION", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE",
         "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE",
         "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
         "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS",
+        "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS",
         "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
         "OUROBOROS_SCOPE_REVIEW_DEGRADED",
         "OUROBOROS_TASK_REVIEW_MODE",

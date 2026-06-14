@@ -30,7 +30,6 @@ from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
     classify_runtime_provider_change,
     has_startup_ready_provider,
-    has_supervisor_provider,
 )
 from ouroboros.settings_setup_contract import (
     BUDGET_SETTING_KEYS,
@@ -141,14 +140,26 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
     }
 
 
+# Password-class secrets are usually short human-chosen strings: an 8-char
+# prefix can BE most of the password. They mask to a constant placeholder;
+# long machine-generated API keys keep the recognizable 8-char prefix.
+_PASSWORD_CLASS_KEYS = {
+    "OUROBOROS_NETWORK_PASSWORD",
+    "GIGACHAT_PASSWORD",
+    "GIGACHAT_CREDENTIALS",
+}
+
+
+def _mask_password_class(value: Any) -> str:
+    return "***set***" if str(value or "").strip() else ""
+
+
 def _mask_secret_value(value: Any) -> str:
     text = str(value or "")
     return text[:8] + "..." if len(text) > 8 else "***"
 
 
-def _looks_masked_secret(value: Any) -> bool:
-    text = str(value or "").strip()
-    return text == "***" or text.endswith("...")
+from ouroboros.mcp_client import looks_masked_secret as _looks_masked_secret
 
 
 def _mask_mcp_servers_payload(servers: Any) -> list:
@@ -534,7 +545,11 @@ async def api_settings_get(request: Request) -> JSONResponse:
     safe = {k: v for k, v in settings.items()}
     for key in _SECRET_SETTING_KEYS:
         if safe.get(key):
-            safe[key] = _mask_secret_value(safe[key])
+            safe[key] = (
+                _mask_password_class(safe[key])
+                if key in _PASSWORD_CLASS_KEYS
+                else _mask_secret_value(safe[key])
+            )
     safe["MCP_SERVERS"] = _mask_mcp_servers_payload(safe.get("MCP_SERVERS") or [])
     for key, value in list(safe.items()):
         if key in _SECRET_SETTING_KEYS or key in _SETTINGS_DEFAULTS:
@@ -732,7 +747,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
         except Exception:
             log.warning("Could not validate network bind settings", exc_info=True)
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
-        if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_supervisor_provider(current):
+        if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_startup_ready_provider(current):
             return json_error("Local-only setups must route at least one model to the local runtime.", 400)
         all_changed = [
             k for k in current

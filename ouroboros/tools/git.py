@@ -9,7 +9,6 @@ import os
 import pathlib
 import re
 import subprocess
-import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +29,7 @@ from ouroboros.tools.commit_gate import (
     _check_overlapping_review_attempt,
     _invalidate_advisory,
     _record_commit_attempt,
+    check_blocked_attempt_cap,
 )
 from ouroboros.tools.review_revalidation import handle_revalidation_failure
 from ouroboros.utils import utc_now_iso, write_text, safe_relpath, run_cmd
@@ -48,11 +48,6 @@ from ouroboros.contracts.skill_payload_policy import (
 )
 _CONTENT_OMITTED_PREFIX = "<<CONTENT_OMITTED"
 log = logging.getLogger(__name__)
-
-
-def _normalize_to_posix(path_str: str) -> str:
-    """Normalize paths to POSIX form before protected-path matching."""
-    return normalize_repo_path(path_str)
 
 
 def _current_runtime_mode() -> str:
@@ -197,6 +192,43 @@ def _mark_failed_bypass_advisory_stale(
         update_state(pathlib.Path(ctx.drive_root), _mutate)
     except Exception:
         log.debug("Failed to stale bypass advisory after preflight block", exc_info=True)
+
+
+def _refuse_capped_attempt(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    *,
+    pre_fingerprint: Dict[str, Any],
+    review_rebuttal: str,
+) -> Optional[Dict[str, Any]]:
+    """Identical-diff blocked-attempt cap preflight; None allows the attempt."""
+    cap_msg = check_blocked_attempt_cap(
+        ctx,
+        pre_fingerprint.get("fingerprint", ""),
+        has_rebuttal=bool(str(review_rebuttal or "").strip()),
+    )
+    if not cap_msg:
+        return None
+    try:
+        run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+    except Exception:
+        pass
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "blocked",
+        block_reason="attempt_cap_reached",
+        block_details=cap_msg,
+        duration_sec=time.time() - commit_start,
+        phase="preflight",
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+    )
+    return {
+        "status": "blocked",
+        "message": cap_msg,
+        "block_reason": "attempt_cap_reached",
+    }
 
 
 def _run_reviewed_stage_cycle(
@@ -364,6 +396,9 @@ def _run_reviewed_stage_cycle(
                 block_reason="tests_preflight_blocked",
                 block_details=msg,
                 duration_sec=time.time() - commit_start,
+                # Preflight, not a review verdict: must neither inflate nor
+                # reset the identical-diff blocked-attempt cap streak.
+                phase="preflight",
             )
             _mark_failed_bypass_advisory_stale(ctx, commit_message, advisory_paths)
             return {
@@ -400,6 +435,12 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": {},
         }
+    cap_refusal = _refuse_capped_attempt(
+        ctx, commit_message, commit_start,
+        pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
+    )
+    if cap_refusal is not None:
+        return cap_refusal
     _record_commit_attempt(
         ctx,
         commit_message,
@@ -916,7 +957,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
         return "⚠️ WRITE_ERROR: nothing to write."
 
     for e in write_list:
-        norm = _normalize_to_posix(e["path"])
+        norm = normalize_repo_path(e["path"])
         if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
             return protected_write_block_message(
                 path=norm,
@@ -1007,7 +1048,7 @@ def _str_replace_editor(
     if not old_str:
         return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
 
-    norm = _normalize_to_posix(path)
+    norm = normalize_repo_path(path)
     if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
         return protected_write_block_message(
             path=norm,
@@ -1258,7 +1299,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         ctx.last_reviewed_commit_sha = commit_sha
         if str(ctx.current_task_type or "") == "evolution":
             try:
-                from supervisor.queue import update_evolution_transaction
+                from supervisor.evolution_lifecycle import update_evolution_transaction
 
                 update_evolution_transaction(
                     str(ctx.task_id or ""),
@@ -1291,7 +1332,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     ctx.last_push_succeeded = "[pushed:" in push_status
     if str(ctx.current_task_type or "") == "evolution":
         try:
-            from supervisor.queue import update_evolution_transaction
+            from supervisor.evolution_lifecycle import update_evolution_transaction
 
             update_evolution_transaction(
                 str(ctx.task_id or ""),
@@ -1303,6 +1344,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     if ctx.last_push_succeeded:
         ci_note = _check_ci_status_after_push(ctx.repo_dir)
     result = _format_commit_result(ctx, commit_message, push_status + tag_info, test_warning_ref[0])
+    if str(ctx.current_task_type or "") == "evolution":
+        result += (
+            "\n\nEvolution transaction open: this cycle should contain at most one reviewed commit. "
+            "If this commit is the intended change, call request_restart once now and then stop."
+        )
     if paths is not None:
         try:
             untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=ctx.repo_dir)
@@ -1433,7 +1479,7 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
     affected_protected = protected_paths_in(dirty_files)
     if paths:
         for p in paths:
-            norm = _normalize_to_posix(p)
+            norm = normalize_repo_path(p)
             if is_protected_runtime_path(norm):
                 return (
                     f"⚠️ RESTORE_BLOCKED: Cannot restore protected file: {norm}. "
@@ -1632,7 +1678,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "vcs_pull_ff",
             "description": "Fetch from origin and fast-forward merge. Safe: never rewrites history.",
             "parameters": {"type": "object", "properties": {}, "required": []},
-        }, _pull_from_remote, is_code_tool=True),
+        }, _pull_from_remote, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_restore", {
             "name": "vcs_restore",
             "description": "Discard uncommitted changes, restoring to last committed state (HEAD).",
@@ -1640,7 +1686,7 @@ def get_tools() -> List[ToolEntry]:
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Specific files to restore"},
             }, "required": ["confirm"]},
-        }, _restore_to_head, is_code_tool=True),
+        }, _restore_to_head, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_revert", {
             "name": "vcs_revert",
             "description": "Revert a specific commit by creating a new undo commit. Safe: no history rewrite.",
@@ -1648,5 +1694,5 @@ def get_tools() -> List[ToolEntry]:
                 "sha": {"type": "string", "description": "Commit SHA to revert"},
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
             }, "required": ["sha", "confirm"]},
-        }, _revert_commit, is_code_tool=True),
+        }, _revert_commit, is_code_tool=True, mutates_worktree=True),
     ]

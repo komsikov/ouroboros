@@ -12,7 +12,6 @@ Covers:
 import json
 from types import SimpleNamespace
 
-import pytest
 
 
 def _write_events(tmp_path, rows):
@@ -109,6 +108,21 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     from ouroboros.task_results import load_task_result
     written = load_task_result(tmp_path, "evo1") or {}
     return enqueued, emitted, written
+
+
+def test_hard_timeout_cleans_owner_mailbox(tmp_path, monkeypatch):
+    """Block 5 (v6.29.0 scope advisory): a hard-killed worker never reaches the
+    loop's mailbox cleanup, so the kill path must remove the task mailbox —
+    otherwise finalize_now files accumulate and a stale control would instantly
+    force-finalize a subagent retry reusing the same task id."""
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, _mailbox_path, write_owner_message
+
+    write_owner_message(tmp_path, "hard_timeout", "evo1", kind=KIND_FINALIZE_NOW)
+    assert _mailbox_path(tmp_path, "evo1").exists()
+
+    _drive_hard_timeout(tmp_path, monkeypatch, evolution_enabled=False)
+
+    assert not _mailbox_path(tmp_path, "evo1").exists()
 
 
 def test_hard_timeout_evolution_stopped_no_requeue_records_cost(tmp_path, monkeypatch):

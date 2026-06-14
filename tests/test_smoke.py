@@ -108,7 +108,7 @@ EXPECTED_TOOLS = [
     "toggle_consciousness", "switch_model", "get_task_result",
     "wait_task", "wait_tasks",
     "read_file", "list_files", "write_file", "edit_text",
-    "send_photo", "send_video", "search_code", "codebase_digest", "forward_to_worker",
+    "send_photo", "send_video", "search_code", "query_code", "codebase_digest", "forward_to_worker",
     "generate_evolution_stats",
     "commit_reviewed", "vcs_commit_reviewed", "vcs_status", "vcs_diff",
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
@@ -218,6 +218,7 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "list_github_prs",
         "get_github_pr",
         "comment_on_pr",
+        "query_code",
     }
     missing = expected_subset - available
     assert missing == set(), f"Frozen registry missing tools: {sorted(missing)}"
@@ -272,8 +273,9 @@ def test_memory_scratchpad():
     """Memory reads/writes scratchpad without crash."""
     from ouroboros.memory import Memory
     with tempfile.TemporaryDirectory() as tmp:
+        from ouroboros.utils import write_text
         mem = Memory(drive_root=pathlib.Path(tmp))
-        mem.save_scratchpad("test content")
+        write_text(mem.scratchpad_path(), "test content")
         content = mem.load_scratchpad()
         assert "test content" in content
 
@@ -306,8 +308,9 @@ def test_memory_persistence():
         tmp_path = pathlib.Path(tmp)
 
         # Write with first instance
+        from ouroboros.utils import write_text
         mem1 = Memory(drive_root=tmp_path)
-        mem1.save_scratchpad("test persistence content")
+        write_text(mem1.scratchpad_path(), "test persistence content")
 
         # Read with second instance
         mem2 = Memory(drive_root=tmp_path)
@@ -357,7 +360,7 @@ def test_no_hardcoded_replies():
                     if "{" in line or "f'" in line or 'f"' in line:
                         continue
                     violations.append(f"{path.name}:{i}: {line.strip()}")
-    assert len(violations) < 5, f"Possible hardcoded replies:\n" + "\n".join(violations)
+    assert len(violations) < 5, "Possible hardcoded replies:\n" + "\n".join(violations)
 
 
 def test_version_file_exists():
@@ -413,7 +416,7 @@ def test_no_env_dumping():
                     continue
                 if dangerous.search(line):
                     violations.append(f"{path.name}:{i}: {line.strip()[:80]}")
-    assert len(violations) == 0, f"Dangerous env dumping:\n" + "\n".join(violations)
+    assert len(violations) == 0, "Dangerous env dumping:\n" + "\n".join(violations)
 
 
 def test_no_oversized_modules():
@@ -459,7 +462,7 @@ def test_no_bare_except_pass():
                         if next_line and next_line == "pass":
                             violations.append(f"{path.name}:{i}: bare except: pass")
                             break
-    assert len(violations) == 0, f"Bare except:pass found:\n" + "\n".join(violations)
+    assert len(violations) == 0, "Bare except:pass found:\n" + "\n".join(violations)
 
 
 # ── AST-based function size check ───────────────────────────────

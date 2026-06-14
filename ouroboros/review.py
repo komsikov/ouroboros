@@ -107,7 +107,7 @@ MAX_FUNCTION_LINES = 320
 # llm_observability, PWA, analytics, fixed-infra policy) on top of this fork's
 # self-evolution surface. Keep the higher cap to cover the combined surface;
 # lower again after the overlapping observability stacks are reconciled.
-MAX_TOTAL_FUNCTIONS = 3000
+MAX_TOTAL_FUNCTIONS = 3500
 # Grandfathered modules are accepted debt until their surfaces stabilize/split.
 GRANDFATHERED_OVERSIZED_MODULES = {
     "llm.py",

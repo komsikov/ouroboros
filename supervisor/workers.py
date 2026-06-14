@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
-from supervisor import git_ops
 from supervisor.message_bus import send_with_budget
 from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
 from ouroboros.utils import utc_now_iso
@@ -108,10 +107,6 @@ QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 # Shared queue lock; queue.py owns the canonical definition.
 from supervisor.queue import _queue_lock
 
-
-def get_running_task_ids() -> List[str]:
-    """Return task IDs currently assigned to workers."""
-    return [w.busy_task_id for w in WORKERS.values() if w.busy_task_id]
 
 _chat_agent = None
 # Serializes every direct-chat caller; _chat_agent has mutable per-call state.
@@ -313,7 +308,17 @@ WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
 })
 
 
-def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str) -> None:
+def _current_custody_session_id() -> str:
+    """Server-side custody session id to hand to spawned workers (best-effort)."""
+    try:
+        from ouroboros.process_custody import current_custody_session_id
+        return current_custody_session_id()
+    except Exception:
+        return ""
+
+
+def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
+                custody_session_id: str = "") -> None:
     import os as _os
     # Mark this process as a worker BEFORE importing the agent/LLM stack so the
     # central network-transport policy disables system proxy resolution
@@ -321,8 +326,28 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str)
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    # Adopt the server's custody session id. Under the 'spawn' start method this
+    # process re-imported process_custody and minted a fresh _SESSION_ID; without
+    # adopting the server's id, every service/process this worker records looks
+    # foreign to the server's reaper and gets killed at the next reap tick —
+    # even a still-running task's services. Passed as an arg (not env) so it
+    # cannot survive a server re-exec. See process_custody.adopt_session_id.
+    if custody_session_id:
+        try:
+            from ouroboros.process_custody import adopt_session_id
+            adopt_session_id(custody_session_id)
+        except Exception:
+            pass
     from ouroboros.platform_layer import create_new_session
     create_new_session()
+    # Lifeline: if the supervisor dies abruptly, this worker is reparented to
+    # init and would keep running LLM rounds invisibly — group-suicide instead.
+    try:
+        from ouroboros.process_custody import start_parent_lifeline
+
+        start_parent_lifeline(label=f"worker-{wid}")
+    except Exception:
+        pass
     # Stream this worker's append_jsonl log lines to the dashboard Logs panel.
     # The WS log sink lives only in the main process, so without this every
     # worker-task log line (queued/evolution/review/subagent) is written to file
@@ -617,8 +642,104 @@ def _verify_worker_sha_after_spawn(events_offset: int, timeout_sec: float = 90.0
         )
 
 
+_WORKER_PIDS_FILENAME = "worker_pids.json"
+
+
+def _worker_pids_path() -> pathlib.Path:
+    return DRIVE_ROOT / "state" / _WORKER_PIDS_FILENAME
+
+
+def _record_worker_pids() -> None:
+    """Persist current worker PIDs so a later server instance can reap any that
+    survive an abrupt restart. Workers run in their own ``os.setsid`` session, so
+    when the parent server dies they are reparented to init and outlive it."""
+    try:
+        from ouroboros.utils import atomic_write_json
+        recs = [{"pid": int(w.proc.pid)} for w in WORKERS.values() if w.proc.pid]
+        atomic_write_json(
+            _worker_pids_path(),
+            {"server_pid": os.getpid(), "ts": utc_now_iso(), "workers": recs},
+            trailing_newline=True,
+        )
+    except Exception:
+        log.debug("Failed to record worker pids", exc_info=True)
+    # Write-through into the custody ledger (SSOT for the generation reaper);
+    # worker_pids.json stays as the legacy session-leader reap path.
+    try:
+        from ouroboros.process_custody import record_process
+
+        for w in WORKERS.values():
+            if w.proc.pid:
+                record_process(
+                    DRIVE_ROOT,
+                    pid=int(w.proc.pid),
+                    cmd=f"ouroboros-worker-{w.wid}",
+                    purpose=f"worker:{w.wid}",
+                    scope="session",
+                )
+    except Exception:
+        log.debug("Failed to ledger worker pids", exc_info=True)
+
+
+def reap_orphaned_workers() -> int:
+    """Kill leftover worker process groups left by a PRIOR server instance.
+
+    ``kill_workers`` only walks the in-memory ``WORKERS`` dict, so workers
+    orphaned by an abrupt restart (reparented to init, ~one Python interpreter
+    each) were never reaped and accumulated across restarts. On startup we read
+    the prior pid record and force-kill any that are still alive AND verifiably
+    ours — cmdline matches this interpreter/multiprocessing and the process is
+    its own session leader (``pgid == pid``) — which guards against PID reuse and
+    bounds the group kill to the worker's own setsid session."""
+    try:
+        from ouroboros.utils import read_json_dict
+        from ouroboros.platform_layer import (
+            force_kill_pid,
+            kill_process_group_id,
+            process_command,
+            process_group_id,
+        )
+    except Exception:
+        return 0
+    data = read_json_dict(_worker_pids_path()) or {}
+    prior = data.get("workers") or []
+    if not isinstance(prior, list) or not prior:
+        return 0
+    current = {w.proc.pid for w in WORKERS.values() if w.proc.pid}
+    killed: List[int] = []
+    for rec in prior:
+        try:
+            pid = int((rec or {}).get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not pid or pid in current or pid == os.getpid():
+            continue
+        cmd = process_command(pid)
+        if not cmd:
+            continue  # already dead
+        if sys.executable not in cmd and "multiprocessing" not in cmd:
+            continue  # PID reused by an unrelated process — do not touch it
+        pgid = process_group_id(pid)
+        if pgid and pgid == pid:
+            kill_process_group_id(pgid)  # the worker's own setsid session
+        force_kill_pid(pid)
+        killed.append(pid)
+    if killed:
+        try:
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {"ts": utc_now_iso(), "type": "orphaned_workers_reaped", "pids": killed},
+            )
+        except Exception:
+            log.debug("Failed to log orphaned worker reap", exc_info=True)
+    return len(killed)
+
+
 def spawn_workers(n: int = 0) -> None:
     global _CTX, _EVENT_Q
+    # Reap any workers left orphaned by a prior/abrupt server exit before we
+    # spawn fresh ones, so process groups do not accumulate across restarts.
+    reap_orphaned_workers()
     # Fresh context ensures workers use current code.
     _CTX = mp.get_context(_WORKER_START_METHOD)
     _EVENT_Q = _CTX.Queue()
@@ -642,12 +763,14 @@ def spawn_workers(n: int = 0) -> None:
     for i in range(count):
         in_q = _CTX.Queue()
         proc = _CTX.Process(target=worker_main,
-                           args=(i, in_q, _EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT)))
+                           args=(i, in_q, _EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT),
+                                 _current_custody_session_id()))
         proc.daemon = True
         proc.start()
         WORKERS[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
     global _LAST_SPAWN_TIME
     _LAST_SPAWN_TIME = time.time()
+    _record_worker_pids()
     # Verify asynchronously so spawn does not block the supervisor loop.
     threading.Thread(target=_verify_worker_sha_after_spawn, args=(events_offset,), daemon=True).start()
 
@@ -742,10 +865,24 @@ def respawn_worker(wid: int) -> None:
     ctx = _get_ctx()
     in_q = ctx.Queue()
     proc = ctx.Process(target=worker_main,
-                       args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT)))
+                       args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT),
+                             _current_custody_session_id()))
     proc.daemon = True
     proc.start()
-    WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
+    # Swap under _queue_lock (an RLock — safe even when the caller already holds
+    # it) so a concurrent assign_tasks cannot enqueue into the slot mid-swap.
+    with _queue_lock:
+        old = WORKERS.get(wid)
+        WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
+    # Close the crashed worker's old queue now that nothing can route to it,
+    # otherwise its file descriptors / semaphores leak on every respawn.
+    if old is not None and getattr(old, "in_q", None) is not None:
+        try:
+            old.in_q.close()
+            old.in_q.cancel_join_thread()
+        except Exception:
+            log.debug("Failed to close old worker queue on respawn", exc_info=True)
+    _record_worker_pids()
     # Do not reset _LAST_SPAWN_TIME here; respawn grace would hide crash storms.
 
 
@@ -808,7 +945,8 @@ def assign_tasks() -> None:
         # Evolution is hard-blocked in light runtime mode at the assignment
         # chokepoint too: a task restored from a snapshot or created before the
         # mode switch must never actually run. Cancel them terminally.
-        evo_block = queue.evolution_block_reason()
+        from supervisor.evolution_lifecycle import evolution_block_reason
+        evo_block = evolution_block_reason()
         if evo_block and any(str(t.get("type") or "") == "evolution" for t in PENDING):
             blocked_ids = [str(t.get("id") or "") for t in PENDING if str(t.get("type") or "") == "evolution"]
             PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
@@ -897,10 +1035,22 @@ def assign_tasks() -> None:
                 queue.persist_queue_snapshot(reason="assign_task")
 
 def ensure_workers_healthy() -> None:
+    """Detect dead workers, finalize/requeue their tasks, respawn.
+
+    Runs under the queue lock: the RUNNING pops and respawn decisions here
+    raced with HTTP cancel handlers (double respawn → orphaned worker, and
+    "dict changed size" crashes in concurrent iteration). RLock keeps the
+    nested enqueue/respawn/persist calls re-entrant.
+    """
     from supervisor import queue
     # Workers need init time after spawn.
     if (time.time() - _LAST_SPAWN_TIME) < _SPAWN_GRACE_SEC:
         return
+    with _queue_lock:
+        _ensure_workers_healthy_locked(queue)
+
+
+def _ensure_workers_healthy_locked(queue: Any) -> None:
     busy_crashes = 0
     dead_detections = 0
     crashed_tasks = []

@@ -12,6 +12,7 @@ from ouroboros.utils import (
     run_cmd,
     append_jsonl,
     truncate_review_artifact,
+    utc_now_iso,
 )
 from ouroboros import config as _cfg
 from ouroboros.tools.registry import ToolEntry, ToolContext
@@ -84,12 +85,12 @@ from ouroboros.tools.review_helpers import (
     load_governance_doc,
     build_touched_file_pack,
     build_goal_section,
+    review_drive_root,
     build_rebuttal_section,
     CRITICAL_FINDING_CALIBRATION,
     REPO_ANTI_PATTERN_LOCK_GUARD,
     REVIEW_JSON_ARRAY_CONTRACT,
     REVIEW_PREAMBLE,
-    normalize_reviewer_items,
     build_self_verification_template,
     build_review_history_section as _build_review_history_section,
     emit_review_usage,
@@ -101,10 +102,6 @@ from ouroboros.tools.review_helpers import (
 
 # Derived alias; ``review_helpers.REPO_ROOT`` remains the repo-root SSOT.
 _CHECKLISTS_PATH = _REPO_ROOT / "docs" / "CHECKLISTS.md"
-
-
-def _load_bible() -> str:
-    return load_governance_doc(_REPO_ROOT, "BIBLE.md", on_missing="explicit")
 
 
 # Tool: task_acceptance_review.
@@ -157,6 +154,7 @@ def _handle_task_acceptance_review(
             "raw_output_must_be_preserved": True,
             "min_successful_slots": 2,
             "fail_closed_on_errors": True,
+            "classify_outcome_tier": True,
         },
         task_id=str(getattr(ctx, "task_id", "") or ""),
     )
@@ -197,20 +195,6 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
 
 
-def _review_drive_root(ctx: Optional[ToolContext]) -> pathlib.Path:
-    if ctx is not None:
-        try:
-            return pathlib.Path(ctx.drive_root)
-        except Exception:
-            pass
-    try:
-        from ouroboros.config import DATA_DIR
-
-        return pathlib.Path(DATA_DIR)
-    except Exception:
-        return pathlib.Path("../data").resolve(strict=False)
-
-
 def _review_query_error_payload(
     *,
     ctx: Optional[ToolContext],
@@ -223,7 +207,7 @@ def _review_query_error_payload(
     try:
         from ouroboros.observability import new_call_id, persist_call
 
-        drive_root = _review_drive_root(ctx)
+        drive_root = review_drive_root(ctx)
         task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
         call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
         payload["prompt_ref"] = persist_call(
@@ -286,7 +270,7 @@ async def _query_model(
                     lambda: run_review_request(
                         request,
                         slots=[slot],
-                        drive_root=_review_drive_root(ctx),
+                        drive_root=review_drive_root(ctx),
                         llm=llm_client,
                         usage_ctx=None,
                     ),
@@ -331,7 +315,7 @@ async def _multi_model_review_async(content: str, prompt: str,
     if len(models) > MAX_MODELS:
         return {"error": f"Too many models ({len(models)}). Maximum is {MAX_MODELS}."}
 
-    bible_text = _load_bible()
+    bible_text = load_governance_doc(_REPO_ROOT, "BIBLE.md", on_missing="explicit")
     if bible_text:
         system_content = (
             _CONSTITUTIONAL_PREAMBLE
@@ -784,20 +768,52 @@ def _handle_review_block_or_warning(
     """Either block immediately or downgrade to advisory warning."""
     if blocking_review:
         return blocked_msg
+    _record_advisory_override(ctx, blocked_msg)
     _append_review_warning(ctx, advisory_prefix + blocked_msg)
     ctx._review_iteration_count = 0
     ctx._review_history = []
     return None
 
 
-def _load_dev_guide_text(repo_dir: pathlib.Path) -> str:
-    """Load DEVELOPMENT.md with explicit omission marker on failure."""
-    return load_governance_doc(repo_dir, "docs/DEVELOPMENT.md", on_missing="explicit")
+def _record_advisory_override(ctx: ToolContext, blocked_msg: str) -> None:
+    """Durable trace of a blocking signal waved through by advisory enforcement.
 
+    Constitutional requirement (BIBLE P3 "Owner-chosen enforcement, loud
+    advisory"): every decision blocking enforcement would have stopped must
+    leave a durable, owner-visible trace. Persisted to events.jsonl AND to a
+    persistent counter file surfaced by the review_status tool.
+    """
+    reason = str(getattr(ctx, "_last_review_block_reason", "") or "unknown")
+    try:
+        append_jsonl(ctx.drive_logs() / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "review_advisory_override",
+            "block_reason": reason,
+            "message_head": str(blocked_msg or "")[:600],
+            "task_id": str(getattr(ctx, "task_id", "") or ""),
+        })
+    except Exception:
+        log.debug("Failed to emit review_advisory_override event", exc_info=True)
+    try:
+        from ouroboros.utils import update_json_locked
 
-def _load_architecture_text(repo_dir: pathlib.Path) -> str:
-    """Load ARCHITECTURE.md with explicit omission marker on failure."""
-    return load_governance_doc(repo_dir, "docs/ARCHITECTURE.md", on_missing="explicit")
+        path = ctx.drive_root / "state" / "advisory_overrides.json"
+
+        def _bump(current: dict) -> dict:
+            recent = list(current.get("recent") or [])
+            recent.append({
+                "ts": utc_now_iso(),
+                "block_reason": reason,
+                "message_head": str(blocked_msg or "")[:300],
+            })
+            return {
+                "count": int(current.get("count") or 0) + 1,
+                "recent": recent[-10:],
+            }
+
+        update_json_locked(path, _bump)
+    except Exception:
+        log.warning("Failed to persist advisory override visibility", exc_info=True)
 
 
 def _collect_review_findings(ctx: ToolContext, model_results: list) -> tuple[list[str], list[str], list[str], list[dict]]:
@@ -986,8 +1002,8 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             "Review enforcement=Advisory: review checklist failed to load; commit proceeding anyway. ",
         )
 
-    dev_guide_text = _load_dev_guide_text(pathlib.Path(ctx.repo_dir))
-    architecture_text = _load_architecture_text(pathlib.Path(ctx.repo_dir))
+    dev_guide_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/DEVELOPMENT.md", on_missing="explicit")
+    architecture_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/ARCHITECTURE.md", on_missing="explicit")
 
     # Durable open obligations reduce review thrashing across restarts.
     _open_obs_for_review = []
@@ -1130,6 +1146,7 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
                 ctx, commit_message, critical_fails, advisory_warns, errored_note,
             )
 
+        _record_advisory_override(ctx, "; ".join(critical_fails[:5]))
         _append_review_warning(
             ctx,
             "Review enforcement=Advisory: critical review findings did not block commit.",
@@ -1141,9 +1158,12 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         if errored_note:
             _append_review_warning(ctx, errored_note)
 
-    # All clear: reset iteration state.
-    ctx._review_iteration_count = 0
-    ctx._review_history = []
+    if not critical_fails:
+        # All clear: reset iteration state. With critical findings present
+        # (advisory enforcement), the anti-thrashing history must SURVIVE so
+        # repeat findings on the next attempt are still recognized as repeats.
+        ctx._review_iteration_count = 0
+        ctx._review_history = []
 
     if errored_note:
         advisory_warns.append(errored_note.strip())

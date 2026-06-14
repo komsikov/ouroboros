@@ -7,13 +7,13 @@ filesystem state needed for isolated external runs and patch artifacts.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import shutil
 import subprocess
 import tempfile
 import threading
-import time
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -21,6 +21,8 @@ from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tupl
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
 from ouroboros.utils import atomic_write_json, utc_now_iso
+
+log = logging.getLogger(__name__)
 
 
 HEADLESS_TASKS_DIR = pathlib.Path("state") / "headless_tasks"
@@ -42,7 +44,10 @@ ARTIFACT_TERMINAL_STATUSES = {
     ARTIFACT_STATUS_FAILED,
 }
 
-_FINAL_STATUSES = {"completed", "failed", "cancelled", "rejected_duplicate"}
+# Mirrors task_status.SETTLED_STATUSES; a module-level import would close the
+# headless → task_status → outcomes → headless cycle, and the smoke test below
+# pins equality so the literal cannot drift from the SSOT.
+_FINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected_duplicate"})
 _ARTIFACT_LIFECYCLE_FIELDS = {
     "artifact_status",
     "artifact_error",
@@ -283,6 +288,31 @@ def prune_task_drives(
     return report
 
 
+def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
+    """Immediately remove a subagent's child drive (used on cancel/timeout).
+
+    ``prune_*_task_drives`` only frees a child drive on the next startup and after
+    the retention window, so a subagent cancelled mid-run would otherwise leave
+    its scratch drive under ``state/headless_tasks/<id>`` or ``task_drives/<id>``
+    for the rest of the session. A cancelled subagent produced no result to copy
+    back, so dropping its drive now is safe. Returns True if anything was removed.
+    """
+    parent = pathlib.Path(parent_drive_root)
+    try:
+        validate_task_id(task_id)
+    except Exception:
+        return False
+    removed = False
+    for base in (parent / HEADLESS_TASKS_DIR / task_id, parent / TASK_DRIVES_DIR / task_id):
+        try:
+            if base.is_dir():
+                shutil.rmtree(base)
+                removed = True
+        except Exception:
+            log.debug("Failed to remove subagent task drive %s", base, exc_info=True)
+    return removed
+
+
 def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Copy a child-drive task result back to the parent data root."""
 
@@ -375,6 +405,16 @@ def _copy_child_artifacts_to_parent(
         except ValueError:
             pass
         if not src.is_file():
+            # The artifact path is relative/outside the child drive and the file is
+            # not present, so it cannot be rebased into the parent store. Surface the
+            # failure (flag + warn) instead of silently keeping an unreachable path
+            # that the parent UI/consumers cannot serve.
+            log.warning(
+                "Child artifact for task %s could not be rebased into the parent store: %r",
+                task_id, raw_path,
+            )
+            item["copy_status"] = "failed"
+            item["copy_error"] = "artifact file not found for rebase"
             rebased.append(item)
             continue
         dest = parent_dir / src.name
@@ -562,7 +602,14 @@ def write_workspace_patch_artifacts(
     sensitive: List[Dict[str, str]] = []
     included_untracked: List[str] = []
     task_base_sha = _acting_base_sha_from_task(task)
-    base_ref, base_head, base_is_empty_tree = _workspace_patch_base(root, errors, expected_base_sha=task_base_sha)
+    preflight_head = _preflight_head_from_task(task)
+    if not task_base_sha and not preflight_head and _preflight_head_present(task):
+        preflight_head = _GIT_UNBORN_HEAD
+    base_ref, base_head, base_is_empty_tree = _workspace_patch_base(
+        root,
+        errors,
+        expected_base_sha=task_base_sha or preflight_head,
+    )
     changed_tracked = _git_path_list(
         ["git", "diff", "--name-only", "-z", "--no-ext-diff", "--no-color", base_ref, "--"],
         root,
@@ -574,7 +621,7 @@ def write_workspace_patch_artifacts(
         allow_rc={0},
         errors=errors,
     )
-    untracked = _untracked_files(root, errors)
+    untracked = _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
     for rel in untracked:
         sensitive_reason = _sensitive_untracked_reason(rel)
         if sensitive_reason:
@@ -630,11 +677,14 @@ def write_workspace_patch_artifacts(
     head_error: Dict[str, Any] | None = None
     expected_head = base_head if task_base_sha else _preflight_head_from_task(task)
     expected_head_present = bool(task_base_sha) or _preflight_head_present(task)
+    enforce_static_head = bool(task_base_sha)
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
     if not current_head and base_is_empty_tree:
         head_errors = []
-    if expected_head == _GIT_UNBORN_HEAD and not current_head and base_is_empty_tree:
+    if not enforce_static_head:
+        pass
+    elif expected_head == _GIT_UNBORN_HEAD and not current_head and base_is_empty_tree:
         pass
     elif expected_head and not current_head:
         errors.extend(head_errors)
@@ -942,14 +992,6 @@ def _head_reflog_exists(root: pathlib.Path) -> bool:
 def _looks_like_git_oid(value: str) -> bool:
     text = str(value or "").strip()
     return 7 <= len(text) <= 64 and all(ch in "0123456789abcdefABCDEF" for ch in text)
-
-
-def _git_lines(cmd: Sequence[str], root: pathlib.Path, errors: List[Dict[str, Any]]) -> List[str]:
-    return [line.strip() for line in _git_stdout(cmd, root, errors=errors).splitlines() if line.strip()]
-
-
-def _untracked_files(root: pathlib.Path, errors: Optional[List[Dict[str, Any]]] = None) -> List[str]:
-    return _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
 
 
 def _git_path_list(cmd: Sequence[str], root: pathlib.Path, errors: Optional[List[Dict[str, Any]]] = None) -> List[str]:
