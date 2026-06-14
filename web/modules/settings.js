@@ -1,15 +1,21 @@
+import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
+import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { refreshModelCatalog } from './settings_catalog.js';
 import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
-import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
-import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
 let setupContract = {};
+const MODEL_LOCKED_SETTING_KEYS = new Set([
+    'OUROBOROS_MODEL',
+    'OUROBOROS_MODEL_CODE',
+    'OUROBOROS_MODEL_LIGHT',
+    'OUROBOROS_MODEL_FALLBACK',
+]);
 
 const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
@@ -73,7 +79,9 @@ function resetSecretClearFlags(root) {
         input.type = 'password';
     });
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.textContent = 'Show';
+        button.classList.remove('is-revealed');
+        button.setAttribute('aria-label', 'Показать секрет');
+        button.title = 'Показать секрет';
     });
 }
 
@@ -88,9 +96,17 @@ function wireSecretRow(row) {
     const input = row.querySelector('.secret-input');
     const toggle = row.querySelector('[data-row-secret-toggle]');
     const clear = row.querySelector('[data-row-secret-clear]');
+    const syncToggle = () => {
+        if (!toggle || !input) return;
+        const revealed = input.type === 'text';
+        toggle.classList.toggle('is-revealed', revealed);
+        toggle.setAttribute('aria-label', revealed ? 'Скрыть секрет' : 'Показать секрет');
+        toggle.title = revealed ? 'Скрыть секрет' : 'Показать секрет';
+    };
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
-    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
+    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; syncToggle(); });
+    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; syncToggle(); markSettingsDirty(); });
+    syncToggle();
 }
 
 function customSecretRow(key = '', value = '') {
@@ -101,11 +117,11 @@ function customSecretRow(key = '', value = '') {
     row.innerHTML = `
         <div class="form-field settings-custom-secret-key"><label>Key</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
         <div class="form-field settings-custom-secret-value"><label>Value</label><div class="secret-input-row">
-            <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Secret value">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Show</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Clear</button>
+            <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Значение секрета">
+            <button type="button" class="secret-icon-btn secret-toggle" data-row-secret-toggle aria-label="Показать секрет" title="Показать секрет"></button>
+            <button type="button" class="secret-icon-btn secret-clear" data-row-secret-clear aria-label="Очистить секрет" title="Очистить секрет"></button>
         </div><div class="settings-inline-note" data-custom-secret-error hidden></div></div>
-        <button type="button" class="settings-ghost-btn settings-custom-secret-remove" data-custom-secret-remove>Remove</button>`;
+        <button type="button" class="settings-ghost-btn settings-custom-secret-remove" data-custom-secret-remove>Удалить</button>`;
     wireSecretRow(row);
     row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => { row.dataset.removeCustomSecret = '1'; row.hidden = true; markSettingsDirty(); });
     return row;
@@ -117,7 +133,7 @@ function renderCustomSecrets(root, settings) {
     host.innerHTML = '';
     const keys = Array.isArray(settings?._meta?.custom_secret_keys) ? settings._meta.custom_secret_keys : [];
     keys.forEach((key) => host.appendChild(customSecretRow(key, settings[key] || '')));
-    if (!keys.length) host.innerHTML = '<div class="muted">No custom keys yet.</div>';
+    if (!keys.length) host.innerHTML = '<div class="muted">Пользовательских ключей пока нет.</div>';
 }
 
 function renderRequestedSkillSecrets(root, skills, settings) {
@@ -131,16 +147,16 @@ function renderRequestedSkillSecrets(root, skills, settings) {
         });
     });
     const unique = Array.from(new Set(keys)).sort((a, b) => a.localeCompare(b));
-    if (!unique.length) { host.innerHTML = '<div class="muted">No skill-requested secrets.</div>'; return; }
+    if (!unique.length) { host.innerHTML = '<div class="muted">Навыки не запрашивали секреты.</div>'; return; }
     host.innerHTML = '';
     unique.forEach((key, idx) => {
         const id = `requested-secret-${idx}`;
         const el = document.createElement('div');
         el.className = 'settings-requested-secret-row';
         el.innerHTML = `<div class="form-field"><label>${escapeHtml(key)}</label><div class="secret-input-row">
-            <input id="${id}" data-secret-setting="${escapeHtml(key)}" class="secret-input" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Secret value">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Show</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Clear</button>
+            <input id="${id}" data-secret-setting="${escapeHtml(key)}" class="secret-input" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Значение секрета">
+            <button type="button" class="secret-icon-btn secret-toggle" data-row-secret-toggle aria-label="Показать секрет" title="Показать секрет"></button>
+            <button type="button" class="secret-icon-btn secret-clear" data-row-secret-clear aria-label="Очистить секрет" title="Очистить секрет"></button>
         </div></div>`;
         wireSecretRow(el); host.appendChild(el);
     });
@@ -151,7 +167,7 @@ function renderExtensionSettingsSections(root, sections) {
     if (!host) return;
     const items = Array.isArray(sections) ? sections : [];
     if (!items.length) {
-        host.innerHTML = '<div class="muted">No extension settings registered.</div>';
+        host.innerHTML = '<div class="muted">Настройки расширений не зарегистрированы.</div>';
         return;
     }
     const fieldHtml = (field) => {
@@ -179,30 +195,30 @@ function renderExtensionSettingsSections(root, sections) {
             const fields = Array.isArray(component.fields) ? component.fields : [];
             const rawRoute = component.route || component.api_route || '';
             if (!cleanExtensionRoute(rawRoute)) {
-                return '<div class="settings-inline-note">Invalid extension settings route.</div>';
+                return '<div class="settings-inline-note">Некорректный маршрут настроек расширения.</div>';
             }
             return `
                 <form class="settings-extension-form" data-extension-settings-form data-skill="${escapeHtml(section.skill || '')}" data-route="${escapeHtml(rawRoute)}">
                     <div class="form-grid two">${fields.map(fieldHtml).join('')}</div>
-                    <button class="btn btn-primary btn-sm" type="submit">${escapeHtml(component.submit_label || component.label || 'Save')}</button>
+                    <button class="btn btn-primary btn-sm" type="submit">${escapeHtml(component.submit_label || component.label || 'Сохранить')}</button>
                     <div class="settings-inline-status" data-extension-settings-status></div>
                 </form>
             `;
         }
-        return `<div class="settings-inline-note">Unsupported extension settings component ${idx + 1}: ${escapeHtml(type || 'unknown')}</div>`;
+        return `<div class="settings-inline-note">Неподдерживаемый компонент настроек расширения ${idx + 1}: ${escapeHtml(type || 'неизвестно')}</div>`;
     };
     host.innerHTML = items.map((section) => {
-        const title = escapeHtml(section.title || section.section_id || section.key || 'Extension settings');
+        const title = escapeHtml(section.title || section.section_id || section.key || 'Настройки расширения');
         const skill = escapeHtml(section.skill || '');
         const components = Array.isArray(section.render?.components) ? section.render.components : [];
         return `
             <article class="settings-extension-section">
                 <div class="settings-extension-section-head">
                     <strong>${title}</strong>
-                    ${skill ? `<span class="settings-inline-note">from ${skill}</span>` : ''}
+                    ${skill ? `<span class="settings-inline-note">из ${skill}</span>` : ''}
                 </div>
                 <div class="settings-extension-components">
-                    ${components.length ? components.map((component, idx) => componentHtml(section, component, idx)).join('') : '<div class="muted">No declarative components.</div>'}
+                    ${components.length ? components.map((component, idx) => componentHtml(section, component, idx)).join('') : '<div class="muted">Декларативных компонентов нет.</div>'}
                 </div>
             </article>
         `;
@@ -220,7 +236,7 @@ function renderExtensionSettingsSections(root, sections) {
                 values[input.name] = input.checked;
             });
             if (status) {
-                status.textContent = 'Saving...';
+                status.textContent = 'Сохранение...';
                 status.dataset.tone = 'muted';
             }
             try {
@@ -234,7 +250,7 @@ function renderExtensionSettingsSections(root, sections) {
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
                 if (status) {
-                    status.textContent = data.message || 'Saved.';
+                    status.textContent = data.message || 'Сохранено.';
                     status.dataset.tone = 'ok';
                 }
             } catch (err) {
@@ -276,7 +292,7 @@ const SETTINGS_FALLBACK_MODELS = [
     'anthropic/claude-opus-4.6',
 ];
 
-let settingsModelCatalogItems = SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));
+let settingsModelCatalogItems = SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Рекомендуемая модель' }));
 
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
@@ -310,6 +326,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
+    let fixedInfraModels = false;
     initMcpSettings({ onChange: updateSettingsDirtyState });
 
     function anthropicKeyConfigured() {
@@ -335,7 +352,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (!visible) return;
         if (button && button.dataset.busy !== '1' && button.dataset.ready !== '1') {
             button.disabled = false;
-            button.textContent = 'Repair Runtime';
+            button.textContent = 'Восстановить среду';
         }
     }
 
@@ -345,7 +362,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             saveBtn.disabled = !settingsLoaded;
             saveBtn.title = settingsLoaded
                 ? ''
-                : 'Reload current settings successfully before saving.';
+                : 'Перед сохранением успешно перезагрузите текущие настройки.';
         }
     }
 
@@ -354,8 +371,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const group = document.querySelector('[data-runtime-mode-group]');
         if (group) {
             group.title = hasBridge
-                ? 'Runtime mode changes require native launcher confirmation and restart.'
-                : 'Runtime mode changes are saved through the owner endpoint and take effect after restart.';
+                ? 'Смена режима требует подтверждения нативного лаунчера и перезапуска.'
+                : 'Смена режима сохраняется через эндпоинт владельца и применяется после перезапуска.';
         }
         document.querySelectorAll('[data-runtime-mode-group] [data-effort-value]').forEach((button) => {
             button.disabled = false;
@@ -403,7 +420,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // Backend error state controls visibility without an API key.
         claudeRuntimeHasError = Boolean(error);
         const message = String(payload.message || '').trim()
-            || (ready ? 'Claude runtime ready.' : (installed ? 'Claude runtime available but not ready.' : 'Claude runtime not available.'));
+            || (ready ? 'Среда Claude готова.' : (installed ? 'Среда Claude доступна, но не готова.' : 'Среда Claude недоступна.'));
         const tone = ready ? 'ok' : (error ? 'error' : (installed ? 'muted' : 'error'));
         if (status) {
             status.textContent = message;
@@ -414,7 +431,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             button.dataset.ready = ready ? '1' : '0';
             button.dataset.installed = installed ? '1' : '0';
             button.disabled = busy;
-            button.textContent = busy ? 'Repairing...' : (ready ? 'Runtime OK' : 'Repair Runtime');
+            button.textContent = busy ? 'Восстановление...' : (ready ? 'Среда в порядке' : 'Восстановить среду');
         }
         renderClaudeCodeUi();
     }
@@ -432,7 +449,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ready: false,
                 busy: false,
                 error: String(error?.message || error || ''),
-                message: `Claude runtime status check failed: ${String(error?.message || error || '')}`,
+                message: `Не удалось проверить статус среды Claude: ${String(error?.message || error || '')}`,
             });
         }
     }
@@ -458,8 +475,47 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }, 3000);
     }
 
+    function applyFixedPolicyUi() {
+        const compatibleCard = page.querySelector('[data-provider-card="compatible"]');
+        if (compatibleCard) {
+            if (!compatibleCard.dataset.fixedLockBound) {
+                compatibleCard.addEventListener('toggle', () => {
+                    if (!compatibleCard.classList.contains('settings-provider-locked')) return;
+                    if (compatibleCard.open) compatibleCard.open = false;
+                });
+                compatibleCard.dataset.fixedLockBound = '1';
+            }
+            compatibleCard.classList.toggle('settings-provider-locked', fixedInfraModels);
+            compatibleCard.setAttribute('aria-disabled', fixedInfraModels ? 'true' : 'false');
+            if (fixedInfraModels && compatibleCard.open) compatibleCard.open = false;
+            compatibleCard.querySelectorAll('input, select, textarea, button').forEach((control) => {
+                control.disabled = fixedInfraModels;
+            });
+        }
+        const disableModelControl = (input, disabled) => {
+            if (!input) return;
+            input.disabled = disabled;
+            if (!disabled) input.removeAttribute('readonly');
+            const picker = input.closest('[data-model-picker]');
+            if (picker) picker.classList.toggle('settings-model-locked', disabled);
+            const card = input.closest('.settings-model-card');
+            if (card) card.classList.toggle('settings-model-locked', disabled);
+        };
+        setupModelSlots().forEach((slot) => {
+            disableModelControl(byId(slot.settingsInputId), fixedInfraModels);
+            const toggle = byId(slot.settingsToggleId);
+            if (toggle) toggle.disabled = fixedInfraModels;
+        });
+        const modelStatus = byId('settings-model-catalog-status');
+        if (modelStatus && fixedInfraModels) {
+            modelStatus.textContent = 'Модели зафиксированы политикой OUROBOROS_FIXED_INFRA_MODELS (режим только чтение).';
+            modelStatus.dataset.tone = 'muted';
+        }
+    }
+
     function applySettings(s) {
         setupContract = s?._meta?.setup_contract || setupContract || {};
+        fixedInfraModels = Boolean(s?._meta?.fixed_infra_models);
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
@@ -509,6 +565,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
+        applyFixedPolicyUi();
     }
 
     function _renderNetworkHint(meta) {
@@ -559,17 +616,17 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     async function reloadSettingsWithFeedback() {
-        setStatus('Loading settings...', 'muted');
+        setStatus('Загрузка настроек...', 'muted');
         settingsLoaded = false;
         syncSettingsLoadState();
         try {
             await loadSettings();
             try {
                 await refreshModelCatalog();
-                setStatus('Settings loaded', 'ok');
+                setStatus('Настройки загружены', 'ok');
             } catch (error) {
                 setStatus(
-                    `Settings loaded. Model catalog refresh failed: ${error.message || error}`,
+                    `Настройки загружены. Не удалось обновить каталог моделей: ${error.message || error}`,
                     'warn'
                 );
             }
@@ -577,24 +634,24 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             settingsLoaded = false;
             syncSettingsLoadState();
             setStatus(
-                `Failed to load current settings. Save is disabled until reload succeeds: ${error.message || error}`,
+                `Не удалось загрузить текущие настройки. Сохранение недоступно до успешной перезагрузки: ${error.message || error}`,
                 'warn'
             );
         }
     }
 
-    async function refreshSettingsAfterExtensionChange(reason = 'skills changed') {
+    async function refreshSettingsAfterExtensionChange(reason = 'навыки изменились') {
         if (extensionRefreshPending) return;
         if (settingsDirty) {
-            setStatus(`Settings changed externally (${reason}). Reload after saving or discarding your draft.`, 'warn');
+            setStatus(`Настройки изменились извне (${reason}). Перезагрузите после сохранения или отказа от черновика.`, 'warn');
             return;
         }
         extensionRefreshPending = true;
         try {
             await loadSettings();
-            setStatus('Settings refreshed', 'ok');
+            setStatus('Настройки обновлены', 'ok');
         } catch (error) {
-            setStatus(`Settings refresh failed: ${error.message || error}`, 'warn');
+            setStatus(`Не удалось обновить настройки: ${error.message || error}`, 'warn');
         } finally {
             extensionRefreshPending = false;
         }
@@ -612,11 +669,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 : (rawMutative ? ({ true: 'true', false: 'false' }[rawMutative] ?? rawMutative) : ''),
             ...collectMcpSettings(),
         };
-        setupModelSlots().forEach((slot) => {
-            body[slot.settingKey] = fieldValue(slot.settingsInputId);
-            body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
-        });
+        if (!fixedInfraModels) {
+            setupModelSlots().forEach((slot) => {
+                body[slot.settingKey] = fieldValue(slot.settingsInputId);
+                body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
+            });
+        }
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => {
+            if (fixedInfraModels && MODEL_LOCKED_SETTING_KEYS.has(key)) return;
             const value = fieldValue(id).trim();
             body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || (key === 'CLAUDE_CODE_MODEL' ? fallback : '');
         });
@@ -651,7 +711,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const key = (keyInput?.value || '').trim().toUpperCase();
             const error = row.querySelector('[data-custom-secret-error]');
             if (!key) return;
-            if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Use uppercase letters, numbers, and underscores.'; } return; }
+            if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Используйте заглавные латинские буквы, цифры и подчёркивания.'; } return; }
             if (row.dataset.removeCustomSecret === '1' || valueInput?.dataset.forceClear === '1') { body[key] = ''; return; }
             const value = valueInput?.value || '';
             if (value && !value.includes('...')) body[key] = value;
@@ -669,11 +729,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
         const result = bridge
             ? await bridge(nextMode)
-            : (confirm(`Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`)
+            : (confirm(`Сменить режим Ouroboros с ${currentMode} на ${nextMode}? Изменение применится после перезапуска.`)
                 ? await apiClient.ownerRuntimeMode(nextMode)
-                : { ok: false, error: 'Runtime mode change cancelled.' });
+                : { ok: false, error: 'Смена режима отменена.' });
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Runtime mode change was cancelled.');
+            throw new Error(result?.error || 'Смена режима была отменена.');
         }
         return result;
     }
@@ -687,11 +747,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const bridge = window.pywebview?.api?.request_auto_grant_reviewed_skills_change;
         const result = bridge
             ? await bridge(nextEnabled)
-            : (confirm(`${nextEnabled ? 'Enable' : 'Disable'} reviewed-skill auto-grant? It only applies after a fresh executable review for the current content hash.`)
+            : (confirm(`${nextEnabled ? 'Включить' : 'Выключить'} авто-выдачу доступа для проверенных навыков? Применяется только после свежей исполнимой проверки для текущего хэша содержимого.`)
                 ? await apiClient.ownerAutoGrant(nextEnabled)
-                : { ok: false, error: 'Reviewed-skill auto-grant change cancelled.' });
+                : { ok: false, error: 'Изменение авто-выдачи отменено.' });
         if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Reviewed-skill auto-grant change was cancelled.');
+            throw new Error(result?.error || 'Изменение авто-выдачи было отменено.');
         }
         return result;
     }
@@ -713,12 +773,22 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     syncSettingsLoadState();
     syncRuntimeModeBridgeState();
     syncAutoGrantBridgeState();
+    window.addEventListener('pywebviewready', () => {
+        syncRuntimeModeBridgeState();
+        syncAutoGrantBridgeState();
+    });
+    [250, 1000, 2500].forEach((delay) => {
+        setTimeout(() => {
+            syncRuntimeModeBridgeState();
+            syncAutoGrantBridgeState();
+        }, delay);
+    });
     reloadSettingsWithFeedback();
 
     if (typeof setBeforePageLeave === 'function') {
         setBeforePageLeave(({ from }) => {
             if (from !== 'settings' || !settingsDirty) return true;
-            const leave = confirm('You have unsaved settings changes. Discard them and leave Settings?');
+            const leave = confirm('Есть несохранённые изменения настроек. Отбросить их и выйти из Настроек?');
             if (leave) discardUnsavedSettingsDraft();
             return leave;
         });
@@ -781,6 +851,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     function renderSettingsModelPicker(input) {
+        if (!input || input.disabled) return;
         const picker = input.closest('[data-model-picker]');
         const panel = picker?.querySelector('.model-picker-results');
         if (!picker || !panel) return;
@@ -813,6 +884,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ? event.target.closest('[data-model-picker] input')
             : null;
         if (!input) return;
+        if (input.disabled) {
+            closeSettingsModelPickers();
+            return;
+        }
         const picker = input.closest('[data-model-picker]');
         closeSettingsModelPickers(picker);
         renderSettingsModelPicker(input);
@@ -824,6 +899,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ? event.target.closest('[data-model-picker] input')
             : null;
         if (!input) return;
+        if (input.disabled) return;
         const picker = input.closest('[data-model-picker]');
         closeSettingsModelPickers(picker);
         renderSettingsModelPicker(input);
@@ -836,7 +912,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (item) {
             const picker = item.closest('[data-model-picker]');
             const input = picker?.querySelector('input');
-            if (input) {
+            if (input && !input.disabled) {
                 event.preventDefault();
                 input.value = item.dataset.value || '';
                 closeSettingsModelPickers();
@@ -881,7 +957,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             installed: false,
             ready: false,
             busy: true,
-            message: 'Repairing Claude runtime...',
+            message: 'Восстановление среды Claude...',
             error: '',
         });
         try {
@@ -889,7 +965,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
             applyClaudeCodeStatus(data);
-            setStatus(data.repaired ? 'Claude runtime repaired' : 'Claude runtime up to date', 'ok');
+            setStatus(data.repaired ? 'Среда Claude восстановлена' : 'Среда Claude в актуальном состоянии', 'ok');
         } catch (error) {
             const message = String(error?.message || error || '');
             applyClaudeCodeStatus({
@@ -897,9 +973,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ready: false,
                 busy: false,
                 error: message,
-                message: `Claude runtime repair failed: ${message}`,
+                message: `Не удалось восстановить среду Claude: ${message}`,
             });
-            setStatus('Claude runtime repair failed', 'warn');
+            setStatus('Не удалось восстановить среду Claude', 'warn');
         }
     });
 
@@ -913,7 +989,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     byId('btn-save-settings').addEventListener('click', async () => {
         if (!settingsLoaded) {
-            setStatus('Reload current settings successfully before saving.', 'warn');
+            setStatus('Перед сохранением успешно перезагрузите текущие настройки.', 'warn');
             return;
         }
         // Validate Every-N cadence before save: malformed N must NOT silently coerce
@@ -953,31 +1029,31 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             let statusMsg;
             let statusType = 'ok';
             if (data.no_changes) {
-                statusMsg = 'No changes detected';
+                statusMsg = 'Изменений не обнаружено';
             } else if (data.restart_required) {
-                statusMsg = 'Settings saved. Some changes require a restart to take effect';
+                statusMsg = 'Настройки сохранены. Некоторые изменения требуют перезапуска';
                 statusType = 'warn';
             } else if (data.immediate_changed && data.next_task_changed) {
-                statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task';
+                statusMsg = 'Настройки сохранены. Часть изменений применилась сразу; остальные — со следующей задачи';
             } else if (data.immediate_changed) {
-                statusMsg = 'Settings saved. Changes took effect immediately';
+                statusMsg = 'Настройки сохранены. Изменения применены сразу';
             } else {
-                statusMsg = 'Settings saved. Changes take effect on the next task';
+                statusMsg = 'Настройки сохранены. Изменения применятся со следующей задачи';
             }
             if (data.warnings && data.warnings.length) {
                 statusMsg += ' ⚠️ ' + data.warnings.join(' | ');
                 statusType = 'warn';
             }
             if (runtimeModeResult?.restart_required) {
-                statusMsg = `${statusMsg} Runtime mode saved as ${runtimeModeResult.runtime_mode}; restart required.`;
+                statusMsg = `${statusMsg} Режим работы сохранён как ${runtimeModeResult.runtime_mode}; требуется перезапуск.`;
                 statusType = 'warn';
             }
             if (runtimeModeError) {
-                statusMsg = `${statusMsg} Runtime mode was not changed: ${runtimeModeError}`;
+                statusMsg = `${statusMsg} Режим работы не был изменён: ${runtimeModeError}`;
                 statusType = 'warn';
             }
             if (autoGrantResult) {
-                statusMsg = `${statusMsg} Reviewed-skill auto-grant ${autoGrantResult.enabled ? 'enabled' : 'disabled'}.`;
+                statusMsg = `${statusMsg} Авто-выдача для проверенных навыков ${autoGrantResult.enabled ? 'включена' : 'выключена'}.`;
             }
             if (contextModeResult?.context_mode) {
                 statusMsg = `${statusMsg} Context mode saved as ${contextModeResult.context_mode}.`;
@@ -987,25 +1063,25 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             if (autoGrantError) {
-                statusMsg = `${statusMsg} Reviewed-skill auto-grant was not changed: ${autoGrantError}`;
+                statusMsg = `${statusMsg} Авто-выдача для проверенных навыков не была изменена: ${autoGrantError}`;
                 statusType = 'warn';
             }
             setStatus(statusMsg, statusType);
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'settings saved', source: 'settings' } }));
         } catch (e) {
-            setStatus('Failed to save: ' + e.message, 'warn');
+            setStatus('Не удалось сохранить: ' + e.message, 'warn');
         }
     });
 
     byId('btn-reset').addEventListener('click', async () => {
-        if (!confirm('This will delete all runtime data (state, memory, logs, settings) and restart.\nThe repo (agent code) will be preserved.\nYou will need to re-enter your provider settings.\n\nContinue?')) return;
+        if (!confirm('Будут удалены все рантайм-данные (состояние, память, логи, настройки), затем выполнится перезапуск.\nКод репозитория (агента) будет сохранён.\nНастройки провайдеров придётся ввести заново.\n\nПродолжить?')) return;
         try {
             const res = await apiFetch('/api/reset', { method: 'POST' });
             const data = await res.json();
-            if (data.status === 'ok') alert('Deleted: ' + (data.deleted.join(', ') || 'nothing') + '\nRestarting...');
-            else alert('Error: ' + (data.error || 'unknown'));
+            if (data.status === 'ok') alert('Удалено: ' + (data.deleted.join(', ') || 'ничего') + '\nПерезапуск...');
+            else alert('Ошибка: ' + (data.error || 'неизвестная ошибка'));
         } catch (e) {
-            showToast('Reset failed: ' + e.message, 'error');
+            showToast('Сброс не удался: ' + e.message, 'error');
         }
     });
 

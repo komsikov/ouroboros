@@ -19,6 +19,7 @@ from ouroboros.skill_loader import (
     compute_content_hash,
     discover_skills,
     find_skill,
+    grant_status_for_skill,
     list_available_for_execution,
     load_enabled,
     load_review_state,
@@ -29,6 +30,7 @@ from ouroboros.skill_loader import (
     skill_state_dir,
     summarize_skills,
 )
+from ouroboros.skill_readiness import skill_readiness_for_execution
 
 
 def _write_skill(
@@ -493,6 +495,55 @@ def test_loaded_skill_identity_is_directory_basename_not_manifest_name(tmp_path)
     # Addressable by directory name, NOT by the sanitised manifest name.
     from ouroboros.skill_loader import _sanitize_skill_name as _sn
     assert _sn("Weather Skill Display") != loaded.name
+
+
+def test_user_repo_skills_are_enabled_reviewed_granted_and_deps_ready_by_default(tmp_path):
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    repo_root = tmp_path / "skills"
+    manifest = (
+        "---\n"
+        "name: weather\n"
+        "description: Check weather.\n"
+        "version: 0.1.0\n"
+        "type: script\n"
+        "runtime: python3\n"
+        "timeout_sec: 30\n"
+        "permissions: [inject_chat]\n"
+        "install_specs:\n"
+        "  - kind: pip\n"
+        "    package: example-dependency\n"
+        "scripts:\n"
+        "  - name: fetch.py\n"
+        "---\n"
+        "body\n"
+    )
+    _write_skill(
+        repo_root,
+        "weather",
+        manifest=manifest,
+        scripts={"fetch.py": "print('ok')\n"},
+    )
+
+    loaded = find_skill(drive_root, "weather", repo_path=str(repo_root))
+    assert loaded is not None
+    assert loaded.enabled is True
+    assert loaded.review.status == "clean"
+    assert loaded.review.content_hash == loaded.content_hash
+    assert loaded.review.is_stale_for(loaded.content_hash) is False
+
+    grants = grant_status_for_skill(drive_root, loaded)
+    assert grants["all_granted"] is True
+    assert grants["usable"] is True
+    assert grants["requested_permissions"] == ["inject_chat"]
+    assert grants["granted_permissions"] == ["inject_chat"]
+    assert grants["missing_permissions"] == []
+    assert skill_readiness_for_execution(drive_root, loaded).ready is True
+
+    save_enabled(drive_root, "weather", False)
+    loaded = find_skill(drive_root, "weather", repo_path=str(repo_root))
+    assert loaded is not None
+    assert loaded.enabled is True
 
 
 def test_hidden_helper_files_are_hashed_and_reviewed(tmp_path):

@@ -28,7 +28,7 @@ from ouroboros.server_auth import (
     validate_network_auth_configuration,
 )
 from ouroboros.server_entrypoint import find_free_port, parse_server_args, write_port_file
-from ouroboros.server_web import NoCacheStaticFiles, make_index_page, resolve_web_dir
+from ouroboros.server_web import NoCacheStaticFiles, make_index_page, make_pwa_routes, resolve_web_dir
 from ouroboros.gateway import collect_routes
 from ouroboros.gateway import settings as _gateway_settings
 from ouroboros.gateway.ws import (
@@ -70,6 +70,18 @@ else:
     _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[_file_handler, logging.StreamHandler()])
 log = logging.getLogger("server")
+
+try:
+    from ouroboros.telemetry import init_telemetry
+    init_telemetry(service_name="ouroboros-server")
+except Exception:
+    log.warning("OpenTelemetry initialization failed", exc_info=True)
+
+try:
+    from ouroboros.guardrails_llm import init_guardrails
+    init_guardrails()
+except Exception:
+    log.warning("Guardrails initialization failed", exc_info=True)
 
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
@@ -825,6 +837,7 @@ index_page = make_index_page(web_dir)
 
 routes = [
     Route("/", endpoint=index_page),
+    *make_pwa_routes(web_dir),
     *collect_routes(
         data_dir=DATA_DIR,
         settings_handlers={

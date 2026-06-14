@@ -3,6 +3,7 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
+import { trackMetric } from './analytics.js';
 import {
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -56,25 +57,24 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     page.className = 'page active';
     page.innerHTML = `
         ${renderPageHeader({
-            title: 'Chat',
+            title: 'Чат',
             icon: PAGE_ICONS.chat,
             variant: 'overlay',
             className: 'chat-page-header',
             actionsHtml: `
-                <div class="chat-header-actions" id="chat-header-actions">
-                    <button class="chat-header-btn" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                    <button class="chat-header-btn" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                    <button class="chat-header-btn" type="button" data-chat-command="review" title="Run review now">Review</button>
-                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
-                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
-                </div>
-                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
-                    <span class="chat-budget-text" id="chat-budget-text">$0 / $0</span>
-                    <div class="chat-budget-bar">
-                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
+                <div class="chat-action-menu" id="chat-action-menu">
+                    <span id="chat-status" class="status-badge offline">Подключение...</span>
+                    <button class="chat-action-trigger" id="chat-action-trigger" type="button" title="Действия чата" aria-label="Действия чата" aria-expanded="false" aria-haspopup="menu">
+                        <img class="chat-action-trigger-icon" src="/static/icons/settings-cog.svg" alt="">
+                    </button>
+                    <div class="chat-header-actions chat-action-dropdown" id="chat-header-actions" role="menu">
+                        <button class="chat-header-btn" type="button" data-chat-command="evolve" role="menuitem" title="Переключить режим эволюции"><span class="chat-action-switch" aria-hidden="true"></span><span>Эволюция</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="review" role="menuitem" title="Запустить ревью сейчас"><span class="chat-action-switch" aria-hidden="true"></span><span>Ревью кода</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="bg" role="menuitem" title="Переключить фоновое сознание"><span class="chat-action-switch" aria-hidden="true"></span><span>Фоновое сознание</span></button>
+                        <button class="chat-header-btn" type="button" data-chat-command="restart" role="menuitem" title="Перезапустить агента"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/restart.svg" alt=""></span><span>Перезапустить чат</span></button>
+                        <button class="chat-header-btn danger" type="button" data-chat-command="panic" role="menuitem" title="Остановить всех воркеров"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/power.svg" alt=""></span><span>Экстренное отключение</span></button>
                     </div>
-                </button>
-                <span id="chat-status" class="status-badge offline">Connecting...</span>
+                </div>
             `,
         })}
         <div id="chat-messages"></div>
@@ -83,21 +83,33 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Consilium: arm a one-shot multi-subagent brainstorm/plan (plan_task + web search) for your next message. Auto-disarms after sending.">Consilium</button>
-                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Applies on the next task.">
+                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Консилиум: разовый мозговой штурм/план несколькими субагентами (plan_task + веб-поиск) для следующего сообщения. Автоматически снимается после отправки.">Consilium</button>
+                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Режим размера контекста" title="Режим контекста (настройка владельца). Low — около 200K / локальные модели; Max — полный. Применяется к следующей задаче.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
                         </div>
                     </div>
                 </div>
-                <div class="chat-text-row">
-                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                <button class="chat-attach-btn" id="chat-attach" type="button" title="Прикрепить файл">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                    <span class="chat-attach-label">Прикрепить</span>
+                </button>
+                <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
+                <textarea id="chat-input" placeholder="Сообщение Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                <div class="chat-send-group">
+                    <button class="chat-send-inline" id="chat-send" title="Отправить сообщение">Отправить</button>
+                    <button class="chat-send-chevron" id="chat-send-chevron" type="button" title="Другие варианты отправки" aria-label="Другие варианты отправки">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
                     </button>
-                    <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-                    <div class="chat-send-group">
-                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
+                    <div class="chat-send-dropdown" id="chat-send-dropdown" role="menu">
+                        <button class="chat-send-dropdown-item" id="chat-dropdown-send" role="menuitem">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                            Отправить
+                        </button>
+                        <button class="chat-send-dropdown-item" id="chat-dropdown-plan" role="menuitem">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/></svg>
+                            Планировать
+                        </button>
                     </div>
                 </div>
             </div>
@@ -109,7 +121,13 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     const input = document.getElementById('chat-input');
     const inputArea = document.getElementById('chat-input-area');
     const sendBtn = document.getElementById('chat-send');
+    const chevronBtn = document.getElementById('chat-send-chevron');
+    const sendDropdown = document.getElementById('chat-send-dropdown');
+    const dropdownSend = document.getElementById('chat-dropdown-send');
+    const dropdownPlan = document.getElementById('chat-dropdown-plan');
     const statusBadge = document.getElementById('chat-status');
+    const actionMenu = document.getElementById('chat-action-menu');
+    const actionTrigger = document.getElementById('chat-action-trigger');
     const headerActions = document.getElementById('chat-header-actions');
     const budgetPill = document.getElementById('chat-budget-pill');
     const attachBtn = document.getElementById('chat-attach');
@@ -132,6 +150,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         return items.reduce((total, item) => total + Number(item.file?.size || 0), 0);
     }
 
+    // Общий стейджер для скрепки/вставки; загрузка происходит только при отправке.
     function updateAttachmentPreview() {
         if (!pendingAttachments.length) {
             attachmentPreview.classList.remove('visible');
@@ -144,7 +163,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <span class="attach-badge" data-attachment-id="${escapeHtmlAttr(item.id)}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
                 <span class="attach-name" title="${escapeHtmlAttr(item.display_name)}">${escapeHtml(item.display_name)}</span>
-                <button class="attach-remove" type="button" title="Remove" aria-label="Remove attachment ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
+                <button class="attach-remove" type="button" title="Убрать" aria-label="Убрать вложение ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
             </span>
         `).join('');
         requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
@@ -163,22 +182,22 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const incoming = Array.from(files || []).filter(Boolean);
         if (!incoming.length) return;
         if (attachmentsUploading) {
-            showToast('Wait for the current upload to finish before changing attachments.', 'error');
+            showToast('Дождитесь завершения текущей загрузки, прежде чем менять вложения.', 'error');
             return;
         }
         if (pendingAttachments.length + incoming.length > MAX_PENDING_ATTACHMENTS) {
-            showToast(`Attach up to ${MAX_PENDING_ATTACHMENTS} files per message.`, 'error');
+            showToast(`Можно прикрепить не более ${MAX_PENDING_ATTACHMENTS} файлов к сообщению.`, 'error');
             return;
         }
         const oversized = incoming.find((file) => Number(file.size || 0) > MAX_ATTACHMENT_FILE_BYTES);
         if (oversized) {
-            showToast(`Each attachment must be ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} MB or smaller.`, 'error');
+            showToast(`Каждое вложение должно быть не больше ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} МБ.`, 'error');
             return;
         }
         const incomingBytes = incoming.reduce((total, file) => total + Number(file.size || 0), 0);
         if (pendingAttachmentBytes() + incomingBytes > MAX_PENDING_ATTACHMENT_BYTES) {
             const limitMb = Math.round(MAX_PENDING_ATTACHMENT_BYTES / (1024 * 1024));
-            showToast(`Attachments are limited to ${limitMb} MB total per message.`, 'error');
+            showToast(`Суммарный размер вложений в сообщении ограничен ${limitMb} МБ.`, 'error');
             return;
         }
         pendingAttachments = pendingAttachments.concat(incoming.map((file) => ({
@@ -334,8 +353,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function reconnectBannerText(reason = '') {
-        if (reason === 'sha-change') return '♻️ Restart complete';
-        if (reason) return '♻️ Reconnected';
+        if (reason === 'sha-change') return '♻️ Перезапущен';
+        if (reason) return '♻️ Соединение установлено';
         return '';
     }
 
@@ -376,15 +395,15 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             const now = new Date();
             const pad = n => String(n).padStart(2, '0');
             const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
             const todayStr = now.toDateString();
             const yesterday = new Date(now);
             yesterday.setDate(now.getDate() - 1);
             let short;
             if (d.toDateString() === todayStr) short = hhmm;
-            else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
+            else if (d.toDateString() === yesterday.toDateString()) short = `Вчера, ${hhmm}`;
             else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
-            const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
+            const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} в ${hhmm}`;
             return { short, full };
         } catch {
             return null;
@@ -397,21 +416,21 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             if (opts.senderSessionId && opts.senderSessionId !== chatSessionId) {
                 return `WebUI (${opts.senderSessionId.slice(0, 8)})`;
             }
-            return opts.senderLabel || 'You';
+            return opts.senderLabel || 'Вы';
         }
         if (role === 'system') {
-            if (systemType === 'task_summary') return '📋 Task Summary';
-            if (systemType === 'skill_review') return '📋 Skill Review';
-            return '📋 System';
+            if (systemType === 'task_summary') return '📋 Сводка задачи';
+            if (systemType === 'skill_review') return '📋 Ревью навыка';
+            return '📋 Система';
         }
-        if (isProgress) return '💬 Thought';
+        if (isProgress) return '💬 Мысль';
         return 'Ouroboros';
     }
 
     function summarizeSkillReviewMessage(text) {
         const raw = String(text || '');
         const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        const headline = lines[0] || 'Skill review';
+        const headline = lines[0] || 'Проверка навыка';
         const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
         const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
         const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
@@ -433,7 +452,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     <span class="skill-review-summary-main">${summary.headline}</span>
                     <span class="skill-review-summary-side">
                         <span class="skill-review-meta">${summary.meta}</span>
-                        <span class="skill-review-toggle-label">Show review</span>
+                        <span class="skill-review-toggle-label">Показать ревью</span>
                     </span>
                 </button>
                 <div class="skill-review-full" data-skill-review-full hidden>${renderMarkdown(text)}</div>
@@ -489,23 +508,44 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     const NEAR_BOTTOM_THRESHOLD_PX = 160;
+    const REATTACH_STICKY_THRESHOLD_PX = 48;
+    let shouldAutoStickToBottom = true;
+    let lastMessagesScrollTop = 0;
+    let suppressStickyDetection = false;
 
     function isNearBottom(threshold = NEAR_BOTTOM_THRESHOLD_PX) {
         const remaining = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
         return remaining <= threshold;
     }
 
+    function setProgrammaticScrollTop(nextScrollTop) {
+        suppressStickyDetection = true;
+        messagesDiv.scrollTop = nextScrollTop;
+        requestAnimationFrame(() => {
+            suppressStickyDetection = false;
+            lastMessagesScrollTop = messagesDiv.scrollTop;
+        });
+    }
+
+    function setStickyByUserScroll() {
+        if (suppressStickyDetection) return;
+        const current = messagesDiv.scrollTop;
+        if (current < lastMessagesScrollTop - 2) shouldAutoStickToBottom = false;
+        else if (isNearBottom(REATTACH_STICKY_THRESHOLD_PX)) shouldAutoStickToBottom = true;
+        lastMessagesScrollTop = current;
+    }
+
     function insertMessageNode(node, options = {}) {
         if (!node) return;
-        const shouldStick = Boolean(options.forceStick) || isNearBottom();
+        const shouldStick = Boolean(options.forceStick) || (shouldAutoStickToBottom && isNearBottom());
         if (node.parentNode === messagesDiv) {
-            if (shouldStick) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            if (shouldStick) setProgrammaticScrollTop(messagesDiv.scrollHeight);
             return;
         }
         const typing = document.getElementById('typing-indicator');
         if (typing && typing.parentNode === messagesDiv) messagesDiv.insertBefore(node, typing);
         else messagesDiv.appendChild(node);
-        if (shouldStick) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        if (shouldStick) setProgrammaticScrollTop(messagesDiv.scrollHeight);
     }
 
     function isBackgroundTaskId(taskId = '') {
@@ -687,15 +727,15 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
-                        <span class="chat-live-phase working" data-live-phase>Working</span>
+                        <span class="chat-live-phase working" data-live-phase>Работает</span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
                         </div>
-                        <span class="chat-live-title" data-live-title>Waiting for work</span>
+                        <span class="chat-live-title" data-live-title>Ожидание работы</span>
                     </div>
                     <div class="chat-live-summary-side">
-                        <span class="chat-live-count" data-live-count hidden>2 notes</span>
-                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
+                        <span class="chat-live-count" data-live-count hidden>2 заметки</span>
+                        <span class="chat-live-toggle" data-live-toggle>Показать детали</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
@@ -804,12 +844,12 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         record.items = [];
         record.lastHumanHeadline = '';
         record.expandedLineKeys.clear();
-        record.titleEl.textContent = 'Working...';
+        record.titleEl.textContent = 'Работает...';
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Working';
+        record.phaseEl.textContent = 'Работает';
         record.phaseEl.className = 'chat-live-phase working';
         record.countEl.hidden = true;
-        record.countEl.textContent = '0 notes';
+        record.countEl.textContent = '0 заметок';
         record.metaEl.innerHTML = '';
         record.timelineEl.innerHTML = '';
         record.root.dataset.finished = '0';
@@ -838,18 +878,23 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function formatLiveCardPhaseLabel(phase) {
-        if (phase === 'thinking') return 'Thinking';
-        if (phase === 'working') return 'Working';
-        if (phase === 'done') return 'Done';
-        if (phase === 'warn') return 'Notice';
-        if (phase === 'error' || phase === 'timeout' || phase === 'lifecycle_error') return 'Issue';
-        if (!phase) return 'Working';
+        if (phase === 'thinking') return 'Думает';
+        if (phase === 'working') return 'Работает';
+        if (phase === 'done') return 'Готово';
+        if (phase === 'warn') return 'Внимание';
+        if (phase === 'error' || phase === 'timeout') return 'Ошибка';
+        if (!phase) return 'Работает';
         return phase.charAt(0).toUpperCase() + phase.slice(1);
     }
 
     function setLiveCardExpanded(record, expanded) {
         if (!record?.root) return;
         record.root.dataset.expanded = expanded ? '1' : '0';
+        // Re-apply timeline visibility explicitly so viewport switches
+        // (mobile -> desktop and back) cannot leave stale display state.
+        if (record.timelineEl) {
+            record.timelineEl.style.display = expanded ? 'flex' : 'none';
+        }
         syncLiveCardToggle(record);
         if (record.root.isConnected) {
             requestAnimationFrame(() => syncLiveCardLayout(record));
@@ -866,7 +911,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function syncLiveCardToggle(record) {
         if (!record?.toggleEl) return;
         const expanded = record.root.dataset.expanded === '1';
-        record.toggleEl.textContent = expanded ? 'Hide details' : 'Show details';
+        record.toggleEl.textContent = expanded ? 'Скрыть детали' : 'Показать детали';
         record.summaryButtonEl?.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     }
 
@@ -877,9 +922,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function updateLiveCardCount(record) {
         if (!record?.countEl) return;
         const bits = [];
-        if (record.items.length >= 2) bits.push(`${record.items.length} notes`);
+        const n = record.items.length;
+        if (n >= 2) bits.push(`${n} ${n === 1 ? 'заметка' : (n < 5 ? 'заметки' : 'заметок')}`);
         const children = directSubagentCount(record);
-        if (children) bits.push(`${children} ${children === 1 ? 'child' : 'children'}`);
+        if (children) bits.push(`${children} ${children === 1 ? 'дочерний' : 'дочерних'}`);
         record.countEl.hidden = bits.length === 0;
         record.countEl.textContent = bits.join(' · ');
     }
@@ -905,6 +951,15 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (event?.detail?.page !== 'chat') return;
         for (const record of liveCardRecords.values()) {
             if (record?.root?.isConnected) syncLiveCardLayout(record);
+        }
+    });
+    window.addEventListener('resize', () => {
+        if (state.activePage !== 'chat') return;
+        for (const record of liveCardRecords.values()) {
+            if (!record?.root?.isConnected) continue;
+            const expanded = record.root.dataset.expanded === '1';
+            if (record.timelineEl) record.timelineEl.style.display = expanded ? 'flex' : 'none';
+            syncLiveCardLayout(record);
         }
     });
     document.addEventListener('visibilitychange', () => {
@@ -937,7 +992,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
                 >
                     <span class="chat-live-line-head">${headContent}</span>
-                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : 'Expand'}</span>
+                    <span class="chat-live-line-expand-label">${expanded ? 'Свернуть' : 'Развернуть'}</span>
                 </button>
             `
             : `<div class="chat-live-line-head">${headContent}</div>`;
@@ -1089,9 +1144,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         updateLiveCardCount(record);
         record.metaEl.innerHTML = [
-            nextGroupId === 'bg-consciousness' ? 'Background thinking' : '',
+            nextGroupId === 'bg-consciousness' ? 'Фоновое мышление' : '',
             ...(Array.isArray(summary.meta) ? summary.meta : []),
-            ts ? `Latest ${ts}` : '',
+            ts ? `Последнее ${ts}` : '',
         ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join('');
         // Incremental updates; full rebuilds stay limited to toggles.
         const lastItem = record.items[record.items.length - 1];
@@ -1116,14 +1171,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             }
             syncLiveCardToggle(record);
             if (drivesComposerStatus) {
-                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Attention' : 'Online');
+                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Внимание' : 'Онлайн');
             }
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
-                setStatus('thinking', 'Working...');
-            } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Online');
+                setStatus('thinking', 'Работает...');
+            } else if (!hasActiveLiveCard() && statusBadge && ['Работает...', 'Working...', 'Thinking...'].includes(statusBadge.textContent)) {
+                setStatus('online', 'Онлайн');
             }
         }
     }
@@ -1150,7 +1205,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
         if (!hasActiveLiveCard()) {
             setStatus(activePhase === 'error' || activePhase === 'timeout' ? 'error' : 'online',
-                      activePhase === 'error' || activePhase === 'timeout' ? 'Attention' : 'Online');
+                      activePhase === 'error' || activePhase === 'timeout' ? 'Внимание' : 'Онлайн');
         }
     }
 
@@ -1175,10 +1230,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const severity = messageOutcomeSeverity(msg || {});
         const failedResult = severity === 'error';
         const doneHeadline = failedResult && reasonCode
-            ? `Done: ${reasonCode}`
+            ? `Готово: ${reasonCode}`
             : (severity === 'warn'
-                ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                : ((record && record.lastHumanHeadline) || 'Done'));
+                ? (reasonCode ? `Завершено с предупреждениями: ${reasonCode}` : 'Завершено с предупреждениями')
+                : ((record && record.lastHumanHeadline) || 'Готово'));
         applyLiveCardState(
             {
                 phase: severity === 'warn' ? 'warn' : (failedResult ? 'error' : 'done'),
@@ -1524,7 +1579,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 : renderMarkdown(text));
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
+        const pendingHtml = pending ? `<div class="msg-pending">В очереди до переподключения</div>` : '';
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
             <div class="message">${rendered}</div>
@@ -1542,7 +1597,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 disclosure.dataset.expanded = expanded ? '0' : '1';
                 full.hidden = expanded;
                 skillReviewToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-                if (label) label.textContent = expanded ? 'Show review' : 'Hide review';
+                if (label) label.textContent = expanded ? 'Показать ревью' : 'Скрыть ревью';
                 requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
             });
         }
@@ -1567,7 +1622,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         );
         if (hasRealBubbles) return;
         welcomeShown = true;
-        addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
+        addMessage('Ouroboros пробудился', 'assistant', false, null, false, { ephemeral: true });
     }
 
     async function syncHistory({ includeUser = false, fromReconnect = false } = {}) {
@@ -1803,11 +1858,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function resizeChatInput({ preserveStickiness = false } = {}) {
-        const caretAtEnd = input.selectionEnd >= input.value.length - 1;
-        const previousScrollTop = input.scrollTop;
-        input.style.height = 'auto';
-        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-        input.scrollTop = caretAtEnd ? input.scrollHeight : previousScrollTop;
+        input.style.removeProperty('height');
         updateMessagesPadding({ preserveStickiness });
     }
 
@@ -1837,16 +1888,16 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (pendingAttachments.length) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
-                showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
+                showToast('Нельзя прикрепить файл оффлайн. Переподключитесь и попробуйте снова.', 'error');
                 return;
             }
             const staged = [...pendingAttachments];
             const uploaded = [];
             setAttachmentUploadState(true);
-            setSendBusy(true, staged.length > 1 ? 'Uploading files' : 'Uploading');
+            setSendBusy(true, staged.length > 1 ? 'Загрузка файлов' : 'Загрузка');
             try {
                 for (const stagedItem of staged) {
-                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed during upload. Reconnect and try again.');
+                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение прервано во время загрузки. Переподключитесь и попробуйте снова.');
                     const formData = new FormData();
                     formData.append('file', stagedItem.file);
                     const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
@@ -1860,16 +1911,16 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                         display_name: data.display_name || stagedItem.display_name,
                     });
                 }
-                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed after upload. Reconnect and try again.');
+                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение прервано после загрузки. Переподключитесь и попробуйте снова.');
                 uploadedAttachments = uploaded;
                 const attachmentLines = uploaded
-                    .map((item) => `[Attached file: ${item.display_name} saved to ${item.path}]`)
+                    .map((item) => `[Прикреплён файл: ${item.display_name} сохранён в ${item.path}]`)
                     .join('\n');
                 text += (text ? '\n\n' : '') + attachmentLines;
             } catch (e) {
                 await cleanupUploadedAttachments(uploaded);
-                showToast('Upload error: ' + e.message, 'error');
-                return;  // pending attachments and preview remain so the user can retry
+                showToast('Ошибка загрузки: ' + e.message, 'error');
+                return;  // вложения и превью остаются — пользователь может повторить
             } finally {
                 setAttachmentUploadState(false);
                 setSendBusy(false);
@@ -1885,7 +1936,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
-            showToast('Connection lost before send. Reconnect and try again.', 'error');
+            showToast('Соединение потеряно до отправки. Переподключитесь и попробуйте снова.', 'error');
             return;
         }
         // One-shot: disarm Consilium now that the message is sent.
@@ -1920,15 +1971,24 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (consiliumBtn) consiliumBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
+    function setSendMode(mode) {
+        sendGroup.dataset.sendMode = mode;
+        sendBtn.textContent = mode === 'plan' ? 'Планировать' : 'Отправить';
+        sendBtn.title = mode === 'plan' ? 'Отправить с префиксом планирования' : 'Отправить сообщение';
+        // Mark the active item in the dropdown for visual feedback.
+        dropdownSend.dataset.modeActive = mode === 'send' ? 'true' : 'false';
+        dropdownPlan.dataset.modeActive = mode === 'plan' ? 'true' : 'false';
+    }
+
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
+        if (chevronBtn) chevronBtn.disabled = busy;
         if (busy) {
-            sendBtn.textContent = label || 'Sending';
-            sendBtn.title = label || 'Sending';
+            sendBtn.textContent = label || 'Отправка';
+            sendBtn.title = label || 'Отправка';
         } else {
-            sendBtn.textContent = 'Send';
-            sendBtn.title = 'Send message';
+            setSendMode(sendGroup.dataset.sendMode || 'send');
         }
     }
 
@@ -1969,12 +2029,51 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
     });
 
+    // Send-mode dropdown (new composer design): pick Send vs Plan; the choice
+    // persists on the send group. Plan is also triggered when Consilium is armed.
+    setSendMode('send');
+    function planModeRequested() {
+        return consiliumArmed() || sendGroup.dataset.sendMode === 'plan';
+    }
+    function openSendDropdown() {
+        sendDropdown.classList.add('open');
+        chevronBtn.classList.add('active');
+    }
+    function closeSendDropdown() {
+        sendDropdown.classList.remove('open');
+        chevronBtn.classList.remove('active');
+    }
+    chevronBtn?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (sendDropdown.classList.contains('open')) {
+            closeSendDropdown();
+        } else {
+            openSendDropdown();
+        }
+    });
+    dropdownSend?.addEventListener('click', () => {
+        setSendMode('send');
+        closeSendDropdown();
+    });
+    dropdownPlan?.addEventListener('click', () => {
+        setSendMode('plan');
+        closeSendDropdown();
+    });
+    document.addEventListener('click', (e) => {
+        if (sendDropdown && !sendDropdown.contains(e.target) && e.target !== chevronBtn) {
+            closeSendDropdown();
+        }
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeSendDropdown();
+    });
+
     // Arrow wrappers avoid MouseEvent leaking into sendMessage(planMode).
-    sendBtn.addEventListener('click', () => sendMessage(consiliumArmed()));
+    sendBtn.addEventListener('click', () => sendMessage(planModeRequested()));
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            sendMessage(consiliumArmed());
+            sendMessage(planModeRequested());
             return;
         }
         if (e.key === 'ArrowUp' && !e.shiftKey) {
@@ -1985,7 +2084,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
     // Dynamic CSS reserve keeps the absolute composer from covering messages.
     function scrollToBottom() {
-        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        shouldAutoStickToBottom = true;
+        setProgrammaticScrollTop(messagesDiv.scrollHeight);
     }
 
     function scrollToBottomAfterLayout() {
@@ -2022,10 +2122,26 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     installChatResizeObservers();
+    messagesDiv.addEventListener('scroll', setStickyByUserScroll, { passive: true });
 
     input.addEventListener('input', () => {
         if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
         resizeChatInput({ preserveStickiness: false });
+    });
+
+    function closeActionMenu() {
+        actionMenu?.classList.remove('open');
+        actionTrigger?.setAttribute('aria-expanded', 'false');
+    }
+
+    actionTrigger?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const isOpen = actionMenu?.classList.contains('open');
+        if (isOpen) closeActionMenu();
+        else {
+            actionMenu?.classList.add('open');
+            actionTrigger.setAttribute('aria-expanded', 'true');
+        }
     });
 
     headerActions?.addEventListener('click', (event) => {
@@ -2036,30 +2152,49 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             const next = !button.classList.contains('on');
             button.classList.toggle('on', next);
             ws.send({ type: 'command', cmd: `/evolve ${next ? 'start' : 'stop'}` });
+            closeActionMenu();
             return;
         }
         if (command === 'bg') {
             const next = !button.classList.contains('on');
             button.classList.toggle('on', next);
             ws.send({ type: 'command', cmd: `/bg ${next ? 'start' : 'stop'}` });
+            closeActionMenu();
             return;
         }
         if (command === 'review') {
             ws.send({ type: 'command', cmd: '/review' });
+            closeActionMenu();
             return;
         }
         if (command === 'restart') {
+            trackMetric('restart');
             ws.send({ type: 'command', cmd: '/restart' });
+            closeActionMenu();
             return;
         }
-        if (command === 'panic' && confirm('Kill all workers immediately?')) {
+        if (command === 'panic' && confirm('Немедленно остановить всех воркеров?')) {
+            trackMetric('panic');
             ws.send({ type: 'command', cmd: '/panic' });
         }
+        closeActionMenu();
+    });
+
+    document.addEventListener('click', (event) => {
+        if (actionMenu && !actionMenu.contains(event.target)) closeActionMenu();
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeActionMenu();
     });
 
     budgetPill?.addEventListener('click', () => {
         if (typeof openDashboardTab === 'function') openDashboardTab('costs');
         else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
+    });
+    budgetPill?.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        budgetPill.click();
     });
 
     refreshHeaderControlState(true);
@@ -2079,9 +2214,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function showTyping() {
         if (!hasActiveLiveCard()) {
             typingEl.style.display = '';
-            if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            if (shouldAutoStickToBottom && isNearBottom()) scrollToBottom();
         }
-        setStatus('thinking', 'Thinking...');
+        setStatus('thinking', 'Думает...');
     }
 
     function hideTypingIndicatorOnly() {
@@ -2090,8 +2225,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     function hideTyping() {
         hideTypingIndicatorOnly();
-        if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Online');
+        if (statusBadge && ['Думает...', 'Работает...'].includes(statusBadge.textContent)) {
+            setStatus('online', 'Онлайн');
         }
     }
 
@@ -2230,11 +2365,11 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     let wsHasConnectedOnce = false;
 
     ws.on('open', () => {
-        setStatus('online', 'Online');
+        setStatus('online', 'Онлайн');
         refreshHeaderControlState(true);
         const reconnectBanner =
             pendingReconnectBannerText
-            || (wsHasConnectedOnce ? '♻️ Reconnected' : '');
+            || (wsHasConnectedOnce ? '♻️ Соединение установлено' : '');
         const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
         pendingReconnectBannerText = '';
         const isReconnect = wsHasConnectedOnce;
@@ -2259,7 +2394,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     ws.on('close', () => {
         hideTyping();
-        setStatus('offline', 'Reconnecting...');
-        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Connecting...' });
+        setStatus('offline', 'Переподключение...');
+        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Подключение...' });
     });
 }

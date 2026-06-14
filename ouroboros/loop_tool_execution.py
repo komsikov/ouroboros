@@ -26,6 +26,7 @@ from ouroboros.tool_capabilities import (
     UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
     UNTRUNCATED_REPO_READ_PATHS as _UNTRUNCATED_REPO_READ_PATHS,
 )
+from ouroboros.telemetry import current_otel_context, record_tool_result, tool_span, use_otel_context
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import (
     append_jsonl,
@@ -286,11 +287,16 @@ def _execute_single_tool(
     tc: Dict[str, Any],
     drive_logs: pathlib.Path,
     task_id: str = "",
+    otel_context: Any = None,
 ) -> Dict[str, Any]:
     """
     Execute a single tool call and return all needed info.
 
     Returns dict with: tool_call_id, fn_name, result, is_error, args_for_log, is_code_tool
+
+    ``otel_context`` carries the parent trace context captured on the loop
+    thread; it is re-attached here so the tool span nests under the active
+    chain/agent span even though this runs in a worker thread.
     """
     requested_fn_name = tc["function"]["name"]
     fn_name = str(requested_fn_name or "").strip()
@@ -344,16 +350,18 @@ def _execute_single_tool(
     args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
 
     tool_ok = True
-    try:
-        result = tools.execute(fn_name, args)
-    except Exception as e:
-        tool_ok = False
-        safe_error = sanitize_tool_result_for_log(f"{type(e).__name__}: {e}")
-        result = f"⚠️ TOOL_ERROR ({fn_name}): {safe_error}"
-        append_jsonl(drive_logs / "events.jsonl", _with_correlation({
-            "ts": utc_now_iso(), "type": "tool_error", "task_id": task_id,
-            "tool": fn_name, "args": args_for_log, "error": safe_error,
-        }, correlation, tool_call_id=tool_call_id))
+    with use_otel_context(otel_context), tool_span(name=fn_name, arguments=args_for_log) as _otel_span:
+        try:
+            result = tools.execute(fn_name, args)
+        except Exception as e:
+            tool_ok = False
+            safe_error = sanitize_tool_result_for_log(f"{type(e).__name__}: {e}")
+            result = f"⚠️ TOOL_ERROR ({fn_name}): {safe_error}"
+            append_jsonl(drive_logs / "events.jsonl", _with_correlation({
+                "ts": utc_now_iso(), "type": "tool_error", "task_id": task_id,
+                "tool": fn_name, "args": args_for_log, "error": safe_error,
+            }, correlation, tool_call_id=tool_call_id))
+        record_tool_result(_otel_span, result, is_error=not tool_ok)
 
     is_error = _is_tool_execution_failure(tool_ok, result)
     result_meta = _extract_result_metadata(fn_name, result, is_error)
@@ -528,6 +536,7 @@ def _execute_with_timeout(
     timeout_sec: int,
     task_id: str = "",
     stateful_executor: Optional[StatefulToolExecutor] = None,
+    otel_context: Any = None,
 ) -> Dict[str, Any]:
     """Execute one tool call with timeout handling."""
     requested_fn_name = tc["function"]["name"]
@@ -553,7 +562,7 @@ def _execute_with_timeout(
     }, correlation, tool_call_id=tool_call_id))
 
     if use_stateful:
-        future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
+        future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id, otel_context)
         try:
             result = future.result(timeout=timeout_sec)
             result_meta = result.get("result_meta") or {}
@@ -591,7 +600,7 @@ def _execute_with_timeout(
     else:
         executor = ThreadPoolExecutor(max_workers=1)
         try:
-            future = executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
+            future = executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id, otel_context)
             try:
                 result = future.result(timeout=timeout_sec)
                 result_meta = result.get("result_meta") or {}
@@ -769,11 +778,15 @@ def handle_tool_calls(
     """Execute tool calls, append results, and return error count."""
     can_parallel = tool_calls_can_run_parallel(tool_calls)
 
+    # Capture the active trace context on this (loop) thread so tool spans
+    # created in worker threads attach to the current chain/agent span.
+    otel_ctx = current_otel_context()
+
     if not can_parallel:
         results = [
             _execute_with_timeout(tools, tc, drive_logs,
                                   _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip()), task_id,
-                                  stateful_executor)
+                                  stateful_executor, otel_ctx)
             for tc in tool_calls
         ]
     else:
@@ -784,7 +797,7 @@ def handle_tool_calls(
                 executor.submit(
                     _execute_with_timeout, tools, tc, drive_logs,
                     _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip()), task_id,
-                    stateful_executor,
+                    stateful_executor, otel_ctx,
                 ): idx
                 for idx, tc in enumerate(tool_calls)
             }

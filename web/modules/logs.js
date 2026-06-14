@@ -1,4 +1,3 @@
-import { escapeHtml } from './utils.js';
 import { apiFetch } from './api_client.js';
 import {
     LOG_CATEGORIES,
@@ -10,8 +9,9 @@ import {
     prettyLogEvent,
     summarizeLogEvent,
 } from './log_events.js';
+import { escapeHtml } from './utils.js';
 
-export function initLogs({ ws, state, mount }) {
+export function initLogs({ ws, state, mount = null, embedded = false, hostPage = 'dashboard', hostSubtab = 'logs' }) {
     const MAX_LOGS = 500;
     const MAX_TASK_EVENTS = 30;
     const duplicateWindowMs = 5000;
@@ -28,17 +28,36 @@ export function initLogs({ ws, state, mount }) {
 
     const page = document.createElement('div');
     page.id = 'page-logs';
-    page.className = 'settings-embedded-content settings-logs-panel';
+    page.className = embedded ? 'settings-embedded-content settings-logs-panel' : 'page';
+    // v5.7.0: when embedded inside the Dashboard tab strip, skip the inner
+    // .page-header (the outer Dashboard header + tab pill already labels the
+    // panel — drawing another "Logs" h2 here wasted ~44px of fixed vertical
+    // space on every viewport). The Clear button moves into the filter row.
+    const headerBlock = embedded
+        ? ''
+        : `
+        <div class="page-header">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <h2>Логи</h2>
+            <div class="spacer"></div>
+            <button class="btn btn-default" id="btn-clear-logs">Очистить</button>
+        </div>`;
+    const inlineClear = embedded
+        ? `<button class="btn btn-default logs-inline-clear" id="btn-clear-logs">Очистить</button>`
+        : '';
     page.innerHTML = `
-        <div class="logs-filters" id="log-filters"><button class="btn btn-default logs-inline-clear" id="btn-clear-logs">Clear</button></div>
+        ${headerBlock}
+        <div class="logs-filters" id="log-filters">${inlineClear}</div>
         <div id="log-entries"></div>
     `;
-    mount.appendChild(page);
+    (mount || document.getElementById('content')).appendChild(page);
 
     const filtersDiv = page.querySelector('#log-filters');
     const logEntries = page.querySelector('#log-entries');
     function isLogsVisible() {
-        return state.activePage === 'dashboard' && state.dashboardActiveSubtab === 'logs';
+        return embedded
+            ? state.activePage === hostPage && state.dashboardActiveSubtab === hostSubtab
+            : state.activePage === 'logs';
     }
 
     function scrollToLatest() {
@@ -86,7 +105,7 @@ export function initLogs({ ws, state, mount }) {
         return `<div class="log-meta">${meta.map((item) => `<span class="log-pill">${escapeHtml(item)}</span>`).join('')}</div>`;
     }
 
-    function logMainHtml({ ts = '', type = '', phase = 'info', headline = 'Event', repeat = '', attrs = {} }) {
+    function logMainHtml({ ts = '', type = '', phase = 'info', headline = 'Событие', repeat = '', attrs = {} }) {
         const attr = (key) => attrs[key] ? ` ${attrs[key]}` : '';
         return `
             <div class="log-main">
@@ -109,10 +128,10 @@ export function initLogs({ ws, state, mount }) {
                 const isHidden = rawEl.hasAttribute('hidden');
                 if (isHidden) {
                     rawEl.removeAttribute('hidden');
-                    rawToggle.textContent = 'Hide raw';
+                    rawToggle.textContent = 'Скрыть';
                 } else {
                     rawEl.setAttribute('hidden', '');
-                    rawToggle.textContent = 'Raw';
+                    rawToggle.textContent = 'Сырое';
                 }
             });
         });
@@ -162,12 +181,12 @@ export function initLogs({ ws, state, mount }) {
                 ts: normalizeLogTs(evt.ts || evt.timestamp),
                 type: { className: cat, label: view.typeLabel },
                 phase: view.phase || 'info',
-                headline: view.headline || 'Event',
+                headline: view.headline || 'Событие',
             })}
             ${metaPills(view.meta)}
             ${bodyHtml}
             <div class="log-actions">
-                <button class="log-raw-toggle" type="button">Raw</button>
+                <button class="log-raw-toggle" type="button">Сырое</button>
             </div>
             <pre class="log-raw" hidden>${escapeHtml(prettyLogEvent(evt))}</pre>
         `;
@@ -190,9 +209,9 @@ export function initLogs({ ws, state, mount }) {
         entry.dataset.taskGroup = groupId;
         entry.innerHTML = `
             ${logMainHtml({
-                type: { className: category, label: groupId === 'bg-consciousness' ? 'background' : 'task' },
+                type: { className: category, label: groupId === 'bg-consciousness' ? 'фон' : 'задача' },
                 phase: 'info',
-                headline: 'Task activity',
+                headline: 'Активность задачи',
                 attrs: {
                     ts: 'data-task-ts',
                     type: 'data-task-kind',
@@ -203,7 +222,7 @@ export function initLogs({ ws, state, mount }) {
             })}
             <div class="log-task-summary" data-task-summary></div>
             <details class="log-task-details">
-                <summary>Timeline</summary>
+                <summary>Хронология</summary>
                 <div class="log-task-timeline" data-task-timeline></div>
             </details>
         `;
@@ -236,7 +255,7 @@ export function initLogs({ ws, state, mount }) {
                 ${metaPills(item.meta)}
                 ${item.body ? `<div class="log-body">${escapeHtml(item.body)}</div>` : ''}
                 <div class="log-actions">
-                    <button class="log-raw-toggle" type="button">Raw</button>
+                    <button class="log-raw-toggle" type="button">Сырое</button>
                 </div>
                 <pre class="log-raw" hidden>${escapeHtml(item.raw || '')}</pre>
             </div>
@@ -263,15 +282,15 @@ export function initLogs({ ws, state, mount }) {
         record.category = category;
         record.entry.dataset.category = category;
         record.ts.textContent = ts;
-        record.kind.textContent = groupId === 'bg-consciousness' ? 'background' : `task ${groupId}`;
+        record.kind.textContent = groupId === 'bg-consciousness' ? 'фон' : `задача ${groupId}`;
         record.kind.className = `log-type ${category}`;
         record.phase.textContent = view.phase || 'info';
         record.phase.className = `log-phase ${view.phase || 'info'}`;
-        record.headline.textContent = view.headline || 'Task activity';
+        record.headline.textContent = view.headline || 'Активность задачи';
         record.count.textContent = `x${record.events}`;
         record.count.hidden = record.events <= 1;
         record.summary.innerHTML = metaPills([
-            groupId === 'bg-consciousness' ? 'background' : `task=${groupId}`,
+            groupId === 'bg-consciousness' ? 'фон' : `задача=${groupId}`,
             ...view.meta,
         ]);
 
@@ -287,7 +306,7 @@ export function initLogs({ ws, state, mount }) {
             record.recent.push({
                 ts,
                 phase: view.phase || 'info',
-                headline: view.headline || 'Task event',
+                headline: view.headline || 'Событие задачи',
                 meta: view.meta,
                 body: view.body,
                 raw: prettyLogEvent(evt),

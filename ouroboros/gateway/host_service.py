@@ -24,7 +24,6 @@ from ouroboros.event_bus import get_global_event_bus
 from ouroboros.skill_loader import (
     find_skill,
     grant_status_for_skill,
-    load_enabled,
     review_status_allows_execution,
 )
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
@@ -132,7 +131,7 @@ class HostServiceContext:
             raise HostServiceAuthError(f"skill {skill_name!r} is not installed")
         if not review_status_allows_execution(loaded.review.status) or loaded.review.is_stale_for(loaded.content_hash):
             raise HostServiceAuthError(f"skill {skill_name!r} does not have a fresh executable review")
-        if not load_enabled(self.data_dir, skill_name):
+        if not loaded.enabled:
             raise HostServiceAuthError(f"skill {skill_name!r} is disabled")
         if str(token_payload.get("content_hash") or "") != str(loaded.content_hash or ""):
             raise HostServiceAuthError(f"skill {skill_name!r} token is stale")

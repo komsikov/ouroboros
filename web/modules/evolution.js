@@ -1,27 +1,47 @@
-import { escapeHtmlText, formatUsd2 } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { escapeHtmlText, formatUsd2 } from './utils.js';
 
-export function initEvolution({ ws, state, mount }) {
+export function initEvolution({ ws, state, mount = null, embedded = false, chartOnly = false, hostPage = 'dashboard', hostSubtab = 'evolution' }) {
     const page = document.createElement('div');
     page.id = 'page-evolution';
-    page.className = 'settings-embedded-content settings-evolution-panel';
+    page.className = embedded ? 'settings-embedded-content settings-evolution-panel' : 'page';
+    // v5.7.0: drop the duplicate inner page-header when embedded (Dashboard
+    // pill strip already labels the panel). Move Refresh + status badge
+    // into the runtime card head row alongside the existing pills.
+    const headerBlock = embedded
+        ? ''
+        : `
+        <div class="page-header">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            <h2>Эволюция</h2>
+            <div class="spacer"></div>
+            <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
+            <span id="evo-status" class="status-badge">Загрузка...</span>
+        </div>`;
+    const inlineEvoControls = embedded
+        ? `
+                    <div class="evo-runtime-pills evo-runtime-controls">
+                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
+                        <span id="evo-status" class="status-badge">Загрузка...</span>
+                    </div>`
+        : '';
     page.innerHTML = `
         <div id="evo-chart-content" class="evolution-container">
             <div class="evo-runtime-card">
                 <div class="evo-runtime-head">
                     <div>
-                        <div class="section-title">Runtime Status</div>
-                        <div id="evo-runtime-detail" class="evo-runtime-detail">Loading evolution and consciousness state...</div>
+                        <div class="section-title">Статус среды выполнения</div>
+                        <div id="evo-runtime-detail" class="evo-runtime-detail">Загрузка состояния эволюции и сознания...</div>
                     </div>
                     <div class="evo-runtime-pills">
-                        <span id="evo-mode-pill" class="evo-runtime-pill">Evolution</span>
-                        <span id="evo-bg-pill" class="evo-runtime-pill">Consciousness</span>
+                        <span id="evo-mode-pill" class="evo-runtime-pill">Эволюция</span>
+                        <span id="evo-bg-pill" class="evo-runtime-pill">Сознание</span>
                     </div>
                     <div class="evo-runtime-pills evo-runtime-controls">
-                        <button id="evo-start" class="btn btn-primary btn-sm evo-refresh-btn" type="button">Start campaign</button>
-                        <button id="evo-stop" class="btn btn-default btn-sm evo-refresh-btn" type="button">Pause</button>
-                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Refresh</button>
-                        <span id="evo-status" class="status-badge">Loading...</span>
+                        <button id="evo-start" class="btn btn-primary btn-sm evo-refresh-btn" type="button">Начать кампанию</button>
+                        <button id="evo-stop" class="btn btn-default btn-sm evo-refresh-btn" type="button">Пауза</button>
+                        <button id="evo-refresh" class="btn btn-default btn-sm evo-refresh-btn" type="button">Обновить</button>
+                        <span id="evo-status" class="status-badge">Загрузка...</span>
                     </div>
                 </div>
                 <div id="evo-runtime-meta" class="evo-runtime-meta"></div>
@@ -33,10 +53,12 @@ export function initEvolution({ ws, state, mount }) {
             <div id="evo-tags-list" class="evo-tags-list"></div>
         </div>
     `;
-    mount.appendChild(page);
+    (mount || document.getElementById('content')).appendChild(page);
 
     function isEvolutionVisible() {
-        return state.activePage === 'dashboard' && state.dashboardActiveSubtab === 'evolution';
+        return embedded
+            ? state.activePage === hostPage && state.dashboardActiveSubtab === hostSubtab
+            : state.activePage === 'evolution';
     }
 
     // -----------------------------------------------------------------------
@@ -65,12 +87,12 @@ export function initEvolution({ ws, state, mount }) {
         memory_kb:  '#fb7185',
     };
     const LABELS = {
-        code_lines: 'Code (lines)',
-        bible_kb:   'BIBLE.md (KB)',
-        system_kb:  'SYSTEM.md (KB)',
-        identity_kb:'identity.md (KB)',
-        scratchpad_kb: 'Scratchpad (KB)',
-        memory_kb:  'Memory (KB)',
+        code_lines: 'Код (строки)',
+        bible_kb:   'BIBLE.md (КБ)',
+        system_kb:  'SYSTEM.md (КБ)',
+        identity_kb:'identity.md (КБ)',
+        scratchpad_kb: 'Scratchpad (КБ)',
+        memory_kb:  'Memory (КБ)',
     };
 
     function setBadge(kind, text) {
@@ -99,17 +121,17 @@ export function initEvolution({ ws, state, mount }) {
         return 'offline';
     }
 
-    function shortStatusLabel(status, fallback = 'off') {
-        if (status === 'running') return 'running';
-        if (status === 'queued') return 'queued';
-        if (status === 'idle_ready') return 'idle';
-        if (status === 'waiting_for_idle') return 'waiting';
-        if (status === 'waiting_for_owner_chat') return 'needs owner';
-        if (status === 'waiting_for_restart_verify') return 'restart verify';
-        if (status === 'paused' || status === 'paused_failures') return 'paused';
-        if (status === 'budget_blocked' || status === 'budget_stopped') return 'budget';
-        if (status === 'error_backoff') return 'retrying';
-        if (status === 'stopped') return 'stopped';
+    function shortStatusLabel(status, fallback = 'выкл') {
+        if (status === 'running') return 'работает';
+        if (status === 'queued') return 'в очереди';
+        if (status === 'idle_ready') return 'ожидание';
+        if (status === 'waiting_for_idle') return 'ждёт';
+        if (status === 'waiting_for_owner_chat') return 'нужен владелец';
+        if (status === 'waiting_for_restart_verify') return 'проверка перезапуска';
+        if (status === 'paused' || status === 'paused_failures') return 'пауза';
+        if (status === 'budget_blocked' || status === 'budget_stopped') return 'бюджет';
+        if (status === 'error_backoff') return 'повтор';
+        if (status === 'stopped') return 'остановлен';
         return fallback;
     }
 
@@ -126,40 +148,40 @@ export function initEvolution({ ws, state, mount }) {
         const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled ? 'running' : 'disabled');
 
         evolutionPill.className = `evo-runtime-pill ${pillTone(evolutionStatus)}`;
-        evolutionPill.textContent = `Evolution ${shortStatusLabel(evolutionStatus, 'off')}`;
+        evolutionPill.textContent = `Эволюция: ${shortStatusLabel(evolutionStatus, 'выкл')}`;
 
         consciousnessPill.className = `evo-runtime-pill ${pillTone(consciousnessStatus)}`;
-        consciousnessPill.textContent = `Consciousness ${shortStatusLabel(consciousnessStatus, 'off')}`;
+        consciousnessPill.textContent = `Сознание: ${shortStatusLabel(consciousnessStatus, 'выкл')}`;
 
         const lines = [];
         if (evolution.detail) lines.push(evolution.detail);
-        if (consciousness.detail) lines.push(`Consciousness: ${consciousness.detail}`);
+        if (consciousness.detail) lines.push(`Сознание: ${consciousness.detail}`);
         runtimeDetail.textContent = lines.filter(Boolean).join(' ');
 
         runtimeMeta.innerHTML = [
-            runtimeChip('Cycle', evolution.cycle || 0),
-            runtimeChip('Campaign', campaign.id || ''),
-            runtimeChip('Campaign attempts', campaign.cycles_done || ''),
-            runtimeChip('Absorbed cycles', campaign.absorbed_cycles_done || 0),
-            runtimeChip('Queue', `${evolution.pending_count || 0} pending / ${evolution.running_count || 0} running`),
-            runtimeChip('Failures', evolution.consecutive_failures || 0),
-            runtimeChip('Budget left', Number.isFinite(Number(evolution.budget_remaining_usd)) ? formatUsd2(evolution.budget_remaining_usd) : ''),
-            runtimeChip('Last evolution', formatTs(evolution.last_task_at)),
-            runtimeChip('Next wakeup', consciousness.next_wakeup_sec ? `${consciousness.next_wakeup_sec}s` : ''),
-            runtimeChip('Last background cycle', formatTs(consciousness.last_cycle_finished_at || consciousness.last_cycle_started_at)),
-            runtimeChip('Updated', formatTs(generatedAt)),
+            runtimeChip('Цикл', evolution.cycle || 0),
+            runtimeChip('Кампания', campaign.id || ''),
+            runtimeChip('Попытки кампании', campaign.cycles_done || ''),
+            runtimeChip('Поглощённые циклы', campaign.absorbed_cycles_done || 0),
+            runtimeChip('Очередь', `${evolution.pending_count || 0} ожидает / ${evolution.running_count || 0} выполняется`),
+            runtimeChip('Ошибки', evolution.consecutive_failures || 0),
+            runtimeChip('Бюджет', Number.isFinite(Number(evolution.budget_remaining_usd)) ? formatUsd2(evolution.budget_remaining_usd) : ''),
+            runtimeChip('Посл. эволюция', formatTs(evolution.last_task_at)),
+            runtimeChip('След. пробуждение', consciousness.next_wakeup_sec ? `${consciousness.next_wakeup_sec}с` : ''),
+            runtimeChip('Посл. фоновый цикл', formatTs(consciousness.last_cycle_finished_at || consciousness.last_cycle_started_at)),
+            runtimeChip('Обновлено', formatTs(generatedAt)),
         ].filter(Boolean).join('');
         if (campaignDetail) {
             const objective = campaign.objective || '';
             const progress = campaign.progress_notes || '';
-            campaignDetail.textContent = [objective ? `Objective: ${objective}` : '', progress ? `Progress: ${progress}` : ''].filter(Boolean).join(' ');
+            campaignDetail.textContent = [objective ? `Цель: ${objective}` : '', progress ? `Прогресс: ${progress}` : ''].filter(Boolean).join(' ');
         }
         // Evolution is self-modification work, so it is hard-blocked in light mode.
         const isLightMode = String(runtime.runtime_mode || '') === 'light';
         if (startBtn) {
             startBtn.disabled = isLightMode;
             startBtn.title = isLightMode
-                ? "Evolution campaigns need runtime mode 'advanced' or 'pro' (currently 'light')."
+                ? "Кампаниям эволюции нужен режим среды выполнения 'advanced' или 'pro' (сейчас 'light')."
                 : '';
         }
     }
@@ -176,34 +198,34 @@ export function initEvolution({ ws, state, mount }) {
         chartLoaded = true;
         const requestId = ++loadSequence;
         refreshBtn.disabled = true;
-        setBadge('starting', force ? 'Refreshing...' : 'Loading...');
+        setBadge('starting', force ? 'Обновление...' : 'Загрузка...');
         try {
             const suffix = force ? '?force=1' : '';
             const [stateResp, evoResp] = await Promise.all([
                 apiFetch('/api/state', { cache: 'no-store' }),
                 apiFetch(`/api/evolution-data${suffix}`, { cache: 'no-store' }),
             ]);
-            if (!stateResp.ok) throw new Error('State API error ' + stateResp.status);
-            if (!evoResp.ok) throw new Error('Evolution API error ' + evoResp.status);
+            if (!stateResp.ok) throw new Error('Ошибка API состояния ' + stateResp.status);
+            if (!evoResp.ok) throw new Error('Ошибка API эволюции ' + evoResp.status);
             const runtime = await stateResp.json();
             const data = await evoResp.json();
             if (requestId !== loadSequence) return;
             renderRuntimeState(runtime, data.generated_at || '');
             const points = data.points || [];
             if (points.length === 0) {
-                renderEmptyState('No evolution tags yet. When evolution commits start landing, the chart will appear here.');
-                setBadge('offline', 'No data');
+                renderEmptyState('Тегов эволюции пока нет. Когда появятся первые коммиты эволюции, здесь отобразится график.');
+                setBadge('offline', 'Нет данных');
                 return;
             }
-            setBadge('online', data.cached ? `${points.length} tags (cached)` : `${points.length} tags`);
+            setBadge('online', data.cached ? `${points.length} тегов (кэш)` : `${points.length} тегов`);
             renderChart(points);
             renderTagsList(points);
         } catch (err) {
             console.error('Evolution load error:', err);
             if (requestId !== loadSequence) return;
-            renderEmptyState('Failed to load evolution data. Use Refresh to try again.');
-            setBadge('error', 'Error');
-            runtimeDetail.textContent = 'Failed to load evolution state. Try Refresh or wait for the runtime to reconnect.';
+            renderEmptyState('Не удалось загрузить данные эволюции. Нажмите «Обновить» для повторной попытки.');
+            setBadge('error', 'Ошибка');
+            runtimeDetail.textContent = 'Не удалось загрузить состояние эволюции. Нажмите «Обновить» или дождитесь переподключения.';
             runtimeMeta.innerHTML = '';
         } finally {
             if (requestId === loadSequence) refreshBtn.disabled = false;
@@ -259,7 +281,7 @@ export function initEvolution({ ws, state, mount }) {
                         backgroundColor: 'rgba(26, 21, 32, 0.95)',
                         titleColor: '#e2e8f0',
                         bodyColor: '#94a3b8',
-                        borderColor: 'rgba(201, 53, 69, 0.18)',
+                        borderColor: 'rgba(36, 56, 112, 0.18)',
                         borderWidth: 1,
                         titleFont: { family: 'JetBrains Mono, monospace', size: 12 },
                         bodyFont: { family: 'JetBrains Mono, monospace', size: 11 },
@@ -273,8 +295,8 @@ export function initEvolution({ ws, state, mount }) {
                                 const val = ctx.parsed.y;
                                 if (val === null || val === undefined) return null;
                                 const key = Object.keys(COLORS)[ctx.datasetIndex];
-                                if (key === 'code_lines') return ' ' + ctx.dataset.label + ': ' + val.toLocaleString() + ' lines';
-                                return ' ' + ctx.dataset.label + ': ' + val.toFixed(1) + ' KB';
+                                if (key === 'code_lines') return ' ' + ctx.dataset.label + ': ' + val.toLocaleString() + ' строк';
+                                return ' ' + ctx.dataset.label + ': ' + val.toFixed(1) + ' КБ';
                             },
                         },
                     },
@@ -287,14 +309,14 @@ export function initEvolution({ ws, state, mount }) {
                     y: {
                         type: 'linear',
                         position: 'left',
-                        title: { display: true, text: 'Lines of Code', color: '#60a5fa', font: { size: 11 } },
+                        title: { display: true, text: 'Строки кода', color: '#60a5fa', font: { size: 11 } },
                         ticks: { color: '#60a5fa', font: { size: 10 } },
                         grid: { color: '#1e293b' },
                     },
                     y1: {
                         type: 'linear',
                         position: 'right',
-                        title: { display: true, text: 'Size (KB)', color: '#94a3b8', font: { size: 11 } },
+                        title: { display: true, text: 'Размер (КБ)', color: '#94a3b8', font: { size: 11 } },
                         ticks: { color: '#94a3b8', font: { size: 10 } },
                         grid: { drawOnChartArea: false },
                     },
@@ -327,9 +349,9 @@ export function initEvolution({ ws, state, mount }) {
         tagsList.innerHTML = `
             <table class="cost-table">
                 <thead><tr>
-                    <th>Tag</th><th>Date</th><th>Code Lines</th>
-                    <th>BIBLE (KB)</th><th>SYSTEM (KB)</th>
-                    <th>Identity (KB)</th><th>Scratchpad (KB)</th><th>Memory (KB)</th>
+                    <th>Тег</th><th>Дата</th><th>Строки кода</th>
+                    <th>BIBLE (КБ)</th><th>SYSTEM (КБ)</th>
+                    <th>Identity (КБ)</th><th>Scratchpad (КБ)</th><th>Memory (КБ)</th>
                 </tr></thead>
                 <tbody>${rows}</tbody>
             </table>

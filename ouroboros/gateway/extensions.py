@@ -590,7 +590,11 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
                 from ouroboros.marketplace.isolated_deps import read_deps_state
                 from ouroboros.skill_dependencies import auto_install_specs_for_skill
 
-                auto_specs = auto_install_specs_for_skill(drive_root, loaded)
+                auto_specs = (
+                    []
+                    if getattr(loaded, "source", "") == "user_repo"
+                    else auto_install_specs_for_skill(drive_root, loaded)
+                )
                 if auto_specs:
                     deps_state = read_deps_state(drive_root, loaded.name, loaded.skill_dir)
                     deps_status = str(deps_state.get("status") or "pending")

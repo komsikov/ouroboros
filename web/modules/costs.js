@@ -22,44 +22,44 @@ export function initCosts({ state, mount }) {
         <div class="costs-scroll">
             <div class="costs-budget-card">
                 <div class="costs-budget-head">
-                    <h3 class="costs-budget-title">Budget</h3>
-                    <button class="btn btn-default btn-sm costs-budget-refresh" id="btn-refresh-costs">Refresh</button>
+                    <h3 class="costs-budget-title">Бюджет</h3>
+                    <button class="btn btn-default btn-sm costs-budget-refresh" id="btn-refresh-costs">Обновить</button>
                 </div>
                 <div class="costs-budget-fields">
                     <div class="form-field">
-                        <label>Total Budget ($)</label>
-                        <input id="s-budget" type="number" value="10">
+                        <label>Общий бюджет ($)</label>
+                        <input id="s-budget" type="number" min="1" value="10">
                     </div>
                     <div class="form-field">
-                        <label>Per-task Cost Cap ($)</label>
-                        <input id="s-per-task-cost" type="number" value="20">
-                        <div class="settings-inline-note">Soft threshold only. When a task crosses it, Ouroboros is asked to wrap up rather than being hard-killed.</div>
+                        <label>Лимит на задачу ($)</label>
+                        <input id="s-per-task-cost" type="number" min="1" value="20">
+                        <div class="settings-inline-note">Мягкий порог. При его превышении Ouroboros получит запрос на завершение задачи вместо принудительного прекращения.</div>
                     </div>
                 </div>
-                <button class="btn btn-save costs-budget-save" id="btn-save-budget">Save Budget</button>
+                <button class="btn btn-save costs-budget-save" id="btn-save-budget">Сохранить бюджет</button>
                 <div id="budget-save-status" class="settings-inline-status"></div>
             </div>
             <div class="costs-stats-grid">
-                <div class="stat-card"><div class="label">Total Spent</div><div class="value" id="cost-total">$0.00</div></div>
-                <div class="stat-card"><div class="label">Total Calls</div><div class="value" id="cost-calls">0</div></div>
-                <div class="stat-card"><div class="label">Top Model</div><div class="value cost-top-model" id="cost-top-model">-</div></div>
+                <div class="stat-card"><div class="label">Всего потрачено</div><div class="value" id="cost-total">$0.00</div></div>
+                <div class="stat-card"><div class="label">Всего вызовов</div><div class="value" id="cost-calls">0</div></div>
+                <div class="stat-card"><div class="label">Топ модели</div><div class="value cost-top-model" id="cost-top-model">-</div></div>
             </div>
             <div class="costs-tables-grid">
                 <div>
-                    <h3 class="costs-table-label">By Model</h3>
-                    <table class="cost-table" id="cost-by-model"><thead><tr><th>Model</th><th>Calls</th><th>Cost</th><th></th></tr></thead><tbody></tbody></table>
+                    <h3 class="costs-table-label">По модели</h3>
+                    <table class="cost-table" id="cost-by-model"><thead><tr><th>Модель</th><th>Вызовы</th><th>Стоимость</th><th></th></tr></thead><tbody></tbody></table>
                 </div>
                 <div>
-                    <h3 class="costs-table-label">By API Key</h3>
-                    <table class="cost-table" id="cost-by-key"><thead><tr><th>Key</th><th>Calls</th><th>Cost</th><th></th></tr></thead><tbody></tbody></table>
+                    <h3 class="costs-table-label">По API-ключу</h3>
+                    <table class="cost-table" id="cost-by-key"><thead><tr><th>Ключ</th><th>Вызовы</th><th>Стоимость</th><th></th></tr></thead><tbody></tbody></table>
                 </div>
                 <div>
-                    <h3 class="costs-table-label">By Model Category</h3>
-                    <table class="cost-table" id="cost-by-model-cat"><thead><tr><th>Category</th><th>Calls</th><th>Cost</th><th></th></tr></thead><tbody></tbody></table>
+                    <h3 class="costs-table-label">По категории модели</h3>
+                    <table class="cost-table" id="cost-by-model-cat"><thead><tr><th>Категория</th><th>Вызовы</th><th>Стоимость</th><th></th></tr></thead><tbody></tbody></table>
                 </div>
                 <div>
-                    <h3 class="costs-table-label">By Task Category</h3>
-                    <table class="cost-table" id="cost-by-task-cat"><thead><tr><th>Category</th><th>Calls</th><th>Cost</th><th></th></tr></thead><tbody></tbody></table>
+                    <h3 class="costs-table-label">По категории задачи</h3>
+                    <table class="cost-table" id="cost-by-task-cat"><thead><tr><th>Категория</th><th>Вызовы</th><th>Стоимость</th><th></th></tr></thead><tbody></tbody></table>
                 </div>
             </div>
         </div>
@@ -96,7 +96,7 @@ export function initCosts({ state, mount }) {
         }
         if (Object.keys(data).length === 0) {
             const tr = document.createElement('tr');
-            tr.appendChild(cell('cost-empty-cell', 'No data', { colspan: '4' }));
+            tr.appendChild(cell('cost-empty-cell', 'Нет данных', { colspan: '4' }));
             tbody.appendChild(tr);
         }
     }
@@ -155,21 +155,21 @@ export function initCosts({ state, mount }) {
             if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
             let msg;
             if (data.no_changes) {
-                msg = 'No changes.';
+                msg = 'Без изменений.';
             } else if (data.restart_required) {
-                msg = 'Saved. Restart required.';
+                msg = 'Сохранено. Требуется перезапуск.';
             } else if (data.immediate_changed && data.next_task_changed) {
-                msg = 'Saved. Some changes took effect immediately; others apply on the next task.';
+                msg = 'Сохранено. Общий бюджет применён сразу; лимит на задачу применится со следующей задачи.';
             } else if (data.immediate_changed) {
-                msg = 'Saved. Took effect immediately.';
+                msg = 'Сохранено. Применено сразу.';
             } else {
-                msg = 'Saved. Applies on the next task.';
+                msg = 'Сохранено. Применится со следующей задачи.';
             }
             if (data.warnings && data.warnings.length) msg += ' ⚠️ ' + data.warnings.join(' | ');
             statusEl.textContent = msg;
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'budget saved', source: 'costs' } }));
         } catch (e) {
-            statusEl.textContent = 'Error: ' + e.message;
+            statusEl.textContent = 'Ошибка: ' + e.message;
         }
         setTimeout(() => { statusEl.textContent = ''; }, 4000);
     });

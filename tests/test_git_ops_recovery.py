@@ -748,11 +748,11 @@ def test_configure_remote_adds_origin_even_when_managed_remote_exists(monkeypatc
         lambda repo_slug, token: calls.append(("helper", repo_slug, token)),
     )
 
-    ok, message = git_ops.configure_remote("razzant/ouroboros", "ghp_test")
+    ok, message = git_ops.configure_remote("gen-ai/fusion_team/front/ouroboros", "ghp_test")
 
     assert ok
     assert message == "ok"
-    assert ["git", "remote", "add", "origin", "https://github.com/razzant/ouroboros.git"] in calls
+    assert ["git", "remote", "add", "origin", "git@gitlab.k8s.genai.int:gen-ai/fusion_team/front/ouroboros.git"] in calls
 
 
 def test_collect_repo_sync_state_prefers_managed_remote(monkeypatch):

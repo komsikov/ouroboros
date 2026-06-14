@@ -1,0 +1,101 @@
+stages:
+  - check
+  - test
+  - publish
+
+variables:
+  MAIN_BRANCH: "main"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $MAIN_BRANCH
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH && $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+
+.nexus-config:
+  before_script:
+    - |
+      if [ -n "${NEXUS_CA:-}" ]; then
+        mkdir -p /usr/local/share/ca-certificates
+        cp "$NEXUS_CA" /usr/local/share/ca-certificates/nexus-ca.crt
+        update-ca-certificates
+        echo "Imported Nexus CA certificate"
+      fi
+
+check:
+  stage: check
+  extends: .nexus-config
+  image: $CI_BASE_IMAGE
+  allow_failure: true
+  variables:
+    SECRET_KEY: "ci-placeholder"
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}-uv"
+    paths:
+      - .venv/
+  script:
+    - uv sync --frozen
+    - uv run python manage.py check
+    - uv run python manage.py makemigrations --check --dry-run
+    - uv run ruff check .
+    - uv run mypy .
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: on_success
+
+test:
+  stage: test
+  extends: .nexus-config
+  image: $CI_BASE_IMAGE
+  allow_failure: true
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}-uv"
+    paths:
+      - .venv/
+  script:
+    - uv sync --frozen
+    - uv run pytest
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: on_success
+
+publish:
+  stage: publish
+  image: registry.genai.int/ci/docker/buildah:stable
+  before_script:
+    - |
+      if [ -n "${NEXUS_CA:-}" ]; then
+        cp "$NEXUS_CA" /etc/pki/ca-trust/source/anchors/nexus-ca.crt
+        update-ca-trust
+        echo "Imported Nexus CA certificate"
+      fi
+  variables:
+    STORAGE_DRIVER: vfs
+    BUILDAH_FORMAT: docker
+  script:
+    - |
+      IMAGE_TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHA}"
+      buildah build --storage-driver="$STORAGE_DRIVER" --platform linux/amd64 \
+          --build-arg CI_BASE_IMAGE="$CI_BASE_IMAGE" \
+          ${NEXUS_CA:+--secret id=nexus_ca,src="$NEXUS_CA"} \
+          -t "${CI_REGISTRY_IMAGE}:${IMAGE_TAG}" .
+      buildah push --storage-driver="$STORAGE_DRIVER" --creds "$NEXUS_USER:$NEXUS_PASSWORD" \
+          "${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+      echo "Pushing image ${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: on_success
+      allow_failure: false

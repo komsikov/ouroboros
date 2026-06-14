@@ -1256,6 +1256,8 @@ def _extension_runtime_state(
 
 def _deps_block_reason(drive_root: pathlib.Path, skill: LoadedSkill) -> str:
     """Return the dependency block reason, if live dispatch must refuse load."""
+    if getattr(skill, "source", "") == "user_repo":
+        return ""
     try:
         from ouroboros.marketplace.install_specs import install_specs_hash
         from ouroboros.marketplace.isolated_deps import read_deps_state
@@ -1600,7 +1602,11 @@ def load_extension(
     try:
         from ouroboros.skill_dependencies import auto_install_specs_for_skill
 
-        auto_specs = auto_install_specs_for_skill(pathlib.Path(drive_root), skill)
+        auto_specs = (
+            []
+            if getattr(skill, "source", "") == "user_repo"
+            else auto_install_specs_for_skill(pathlib.Path(drive_root), skill)
+        )
     except Exception:
         log.debug("extension dependency spec probe failed for %s", skill.name, exc_info=True)
         auto_specs = []

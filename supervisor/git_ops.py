@@ -30,7 +30,7 @@ BRANCH_STABLE: str = "ouroboros-stable"
 MANAGED_REPO_META_NAME = "ouroboros-managed.json"
 BOOTSTRAP_PIN_MARKER_NAME = "ouroboros-bootstrap-pending"
 UPDATE_INTENT_MARKER_NAME = "ouroboros-update-intent.json"
-OFFICIAL_UPDATE_REMOTE_URL = "https://github.com/razzant/ouroboros"
+OFFICIAL_UPDATE_REMOTE_URL = "git@gitlab.k8s.genai.int:gen-ai/fusion_team/front/ouroboros.git"
 
 
 def _guard_live_repo_destructive_git(cmd: List[str]) -> None:
@@ -1359,7 +1359,7 @@ def configure_remote(repo_slug: str, token: str) -> Tuple[bool, str]:
     if not repo_slug or not token:
         return False, "Missing repo slug or token"
 
-    clean_url = f"https://github.com/{repo_slug}.git"
+    clean_url = f"git@gitlab.k8s.genai.int:{repo_slug}.git"
 
     if _has_remote("origin"):
         rc, _, err = git_capture(["git", "remote", "set-url", "origin", clean_url])

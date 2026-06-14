@@ -62,6 +62,12 @@ claude-sdk = ["claude-agent-sdk>=0.1.60"]
 browser = ["playwright", "playwright-stealth"]
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
+telemetry = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+guardrails = ["nemoguardrails>=0.11.0"]
 all = ["claude-agent-sdk>=0.1.60", "playwright", "playwright-stealth", "llama-cpp-python", "huggingface_hub"]
 
 [tool.pytest.ini_options]
@@ -92,6 +98,8 @@ web = [
     "*.png",
     "*.jpg",
     "modules/*.js",
+    "icons/*.svg",
+    "icons/*.png",
     "providers/*.svg",
     "providers/*.png",
     "providers/*.ico",

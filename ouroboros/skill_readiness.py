@@ -68,7 +68,11 @@ def skill_readiness_for_execution(
         from ouroboros.marketplace.isolated_deps import read_deps_state
         from ouroboros.skill_dependencies import auto_install_specs_for_skill
 
-        auto_specs = auto_install_specs_for_skill(pathlib.Path(drive_root), skill)
+        auto_specs = (
+            []
+            if getattr(skill, "source", "") == "user_repo"
+            else auto_install_specs_for_skill(pathlib.Path(drive_root), skill)
+        )
         if auto_specs:
             deps_state = read_deps_state(pathlib.Path(drive_root), skill.name, skill.skill_dir)
             deps_status = str(deps_state.get("status") or "pending")
