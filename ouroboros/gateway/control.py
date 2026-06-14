@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import pathlib
+import logging
 import time
 from typing import Any, Dict
 
@@ -15,6 +15,8 @@ from ouroboros.gateway._helpers import json_error, json_exception, request_drive
 from ouroboros.gateway.ws import broadcast_ws_sync
 from ouroboros.outcomes import public_task_result
 from ouroboros.utils import utc_now_iso
+
+log = logging.getLogger(__name__)
 
 _RECENT_VISIBLE_COMMANDS: Dict[str, float] = {}
 _VISIBLE_COMMAND_DEDUPE_SEC = 5.0
@@ -204,6 +206,16 @@ async def api_update_check(_request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+def _respawn_workers_after_failed_update() -> None:
+    """Revive workers when an update aborts after they were stopped (no restart follows)."""
+    try:
+        from supervisor.workers import spawn_workers
+
+        spawn_workers()
+    except Exception:
+        log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
+
+
 async def api_update_apply(request: Request) -> JSONResponse:
     """Prepare a managed update and restart so safe_restart applies it."""
     body = await request_json_or(request, {}, exceptions=(Exception,))
@@ -214,20 +226,36 @@ async def api_update_apply(request: Request) -> JSONResponse:
         ok, payload = prepare_managed_update(strategy)
         if not ok:
             return JSONResponse(payload, status_code=409)
+        # Stop workers AFTER the update is validated/prepared but BEFORE the
+        # hard reset of the live repo: a self-modifying task writing between
+        # the rescue snapshot and the reset would have its edits destroyed
+        # unrescued. Doing this pre-validation killed all workers on a plain
+        # 409 (no update available) with no restart to revive them.
+        try:
+            from supervisor.workers import kill_workers
+
+            kill_workers(
+                result_reason="Task interrupted by an owner-requested managed update (restart follows).",
+                terminal_status="interrupted",
+            )
+        except Exception:
+            log.warning("update_apply: failed to stop workers before reset", exc_info=True)
         try:
             checkout_ok, checkout_msg = checkout_and_reset(
                 BRANCH_DEV,
                 reason="ui_update_apply",
-                unsynced_policy="ignore",
+                unsynced_policy="rescue_and_reset",
             )
         except Exception as checkout_exc:
             _clear_update_intent()
+            _respawn_workers_after_failed_update()
             return JSONResponse(
                 {"error": f"Prepared update but checkout failed: {checkout_exc}", **payload},
                 status_code=409,
             )
         if not checkout_ok:
             _clear_update_intent()
+            _respawn_workers_after_failed_update()
             return JSONResponse(
                 {"error": f"Prepared update but checkout failed: {checkout_msg}", **payload},
                 status_code=409,
@@ -265,8 +293,15 @@ async def api_evolution_data(request: Request) -> JSONResponse:
         from ouroboros.utils import iter_jsonl_objects
 
         checkpoints = []
-        for row in list(iter_jsonl_objects(request_drive_root(request) / CHECKPOINTS_REL))[-100:]:
-            checkpoints.append(public_task_result(row if isinstance(row, dict) else {}))
+        rows = [
+            row for row in iter_jsonl_objects(request_drive_root(request) / CHECKPOINTS_REL)
+            # cycle_outcome rows are solve-capability digest fodder (different
+            # schema: no git_sha/identity hashes); the Dashboard checkpoints
+            # view renders absorb checkpoints only.
+            if isinstance(row, dict) and row.get("kind") != "cycle_outcome"
+        ]
+        for row in rows[-100:]:
+            checkpoints.append(public_task_result(row))
     except Exception:
         checkpoints = []
     _evo_cache["ts"] = time.time()

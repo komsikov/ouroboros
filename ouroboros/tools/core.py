@@ -9,8 +9,9 @@ import logging
 import os
 import pathlib
 import re
+import subprocess
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from ouroboros.artifacts import artifact_store_path_block_reason, copy_file_to_task_artifacts
 from ouroboros.project_facts import filter_out_project_store as _filter_out_project_store
@@ -26,7 +27,6 @@ from ouroboros.tool_access import (
     resource_root_path,
     user_files_path_block_reason,
 )
-from ouroboros.tool_capabilities import LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.utils import atomic_write_json, read_text, safe_relpath, utc_now_iso
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
 from ouroboros.contracts.skill_payload_policy import (
@@ -208,7 +208,7 @@ _SUBAGENT_SECRET_FILE_NAMES = frozenset({
 })
 
 
-def _is_local_readonly_subagent(ctx: ToolContext) -> bool:
+def is_restricted_subagent_profile(ctx: ToolContext) -> bool:
     # Fail-closed SSOT for subagent READ restrictions (secret/control denials):
     # read-only subagents, acting subagents, and delegated subagents with a
     # missing/invalid constraint are ALL barred from reading owner secrets/control
@@ -365,7 +365,7 @@ def _repo_read(
 ) -> str:
     """Read a repo file; root-level memory names return a runtime_data read hint."""
     target = ctx.repo_path(path)
-    if _is_local_readonly_subagent(ctx) and _is_subagent_secret_repo_target(target, active_repo_dir_for(ctx)):
+    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, active_repo_dir_for(ctx)):
         return "⚠️ REPO_READ_BLOCKED: this subagent cannot read repo secret or control files."
     try:
         content = read_text(target)
@@ -389,14 +389,14 @@ def _repo_read(
 def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
     repo_root = active_repo_dir_for(ctx)
     target = ctx.repo_path(dir)
-    if _is_local_readonly_subagent(ctx) and _is_subagent_secret_repo_target(target, repo_root):
+    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, repo_root):
         return json.dumps(
             ["⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths."],
             ensure_ascii=False,
             indent=2,
         )
     items = _list_dir(repo_root, dir, max_entries)
-    if _is_local_readonly_subagent(ctx):
+    if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_repo_listing(items, repo_root)
     return json.dumps(items, ensure_ascii=False, indent=2)
 
@@ -436,7 +436,7 @@ def _data_read(
     norm = _normalize_data_read_path(ctx, path)
     if (b := _project_store_access_block(norm)):
         return b
-    if _is_local_readonly_subagent(ctx) and _is_subagent_secret_data_path(norm):
+    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_data_path(norm):
         return "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
     if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
@@ -445,7 +445,7 @@ def _data_read(
             return f"⚠️ DATA_READ_BLOCKED: {e}"
     else:
         target = ctx.drive_path(norm)
-    if _is_local_readonly_subagent(ctx):
+    if is_restricted_subagent_profile(ctx):
         root = pathlib.Path(ctx.drive_root).resolve(strict=False)
         try:
             resolved_rel = str(pathlib.Path(target).resolve(strict=False).relative_to(root)).replace(os.sep, "/")
@@ -503,13 +503,13 @@ def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
     norm_dir = _normalize_data_read_path(ctx, dir)
     if (b := _project_store_access_block(norm_dir)):
         return json.dumps([b], ensure_ascii=False, indent=2)
-    if _is_local_readonly_subagent(ctx) and _is_subagent_secret_data_path(norm_dir):
+    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_data_path(norm_dir):
         return json.dumps(
             ["⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."],
             ensure_ascii=False,
             indent=2,
         )
-    if _is_local_readonly_subagent(ctx):
+    if is_restricted_subagent_profile(ctx):
         try:
             list_target = ctx.drive_path(norm_dir)
         except ValueError as e:
@@ -530,7 +530,7 @@ def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
         return json.dumps(items, ensure_ascii=False, indent=2)
     # Drop any projects/<id> entry so a generic root listing never exposes the store.
     items = _filter_out_project_store(_normalize_data_read_path(ctx, dir), _list_dir(ctx.drive_root, dir, max_entries))
-    if _is_local_readonly_subagent(ctx):
+    if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_listing(items, pathlib.Path(ctx.drive_root))
     return json.dumps(items, ensure_ascii=False, indent=2)
 
@@ -895,7 +895,7 @@ def _list_files(
             items = _list_user_files_dir(ctx, base, target, max_entries)
             return json.dumps(items, ensure_ascii=False, indent=2)
         items = _list_dir(base, path, max_entries)
-        if _is_local_readonly_subagent(ctx):
+        if is_restricted_subagent_profile(ctx):
             if normalized == "system_repo":
                 items = _filter_subagent_secret_repo_listing(items, base)
             elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files"}:
@@ -1164,7 +1164,7 @@ def _send_photo(ctx: ToolContext, file_path: str = "", image_base64: str = "",
 
     ctx.pending_events.append({
         "type": "send_photo",
-        "chat_id": ctx.current_chat_id,
+        "chat_id": ctx.current_chat_id, "task_id": str(getattr(ctx, "task_id", "") or ""),  # task_id -> bound-task project-panel routing
         "image_base64": actual_b64,
         "mime": mime,
         "caption": caption or "",
@@ -1210,45 +1210,20 @@ def _send_video(ctx: ToolContext, file_path: str = "", caption: str = "") -> str
 
     ctx.pending_events.append({
         "type": "send_video",
-        "chat_id": chat_id,
+        "chat_id": chat_id, "task_id": str(getattr(ctx, "task_id", "") or ""),  # task_id -> bound-task project-panel routing
         "video_base64": actual_b64,
         "mime": mime,
         "caption": caption or "",
     })
     return "OK: video queued for delivery to owner."
 
-_SEARCH_SKIP_DIRS = frozenset({
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".pytest_cache", ".mypy_cache", ".tox", "build", "dist",
-    ".eggs", ".ruff_cache", "python-standalone", "assets",
-})
-
-_SEARCH_SKIP_GLOBS = frozenset({
-    "*.pyc", "*.pyo", "*.so", "*.dylib", "*.dll", "*.exe",
-    "*.bin", "*.o", "*.a", "*.tar", "*.gz", "*.zip",
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.webp",
-    "*.woff", "*.woff2", "*.ttf", "*.eot",
-    "*.min.js", "*.min.css", "*.map",
-    "*.db", "*.sqlite", "*.sqlite3",
-    "*.lock",
-})
-
 _MAX_SEARCH_RESULTS = 200
-_MAX_FILE_SIZE_BYTES = 1024 * 1024  # 1 MB — skip huge files
-
-
-def _is_search_skippable(path: pathlib.Path) -> bool:
-    """Return True for files excluded from search_code."""
-    name = path.name
-    for glob_pat in _SEARCH_SKIP_GLOBS:
-        if fnmatch.fnmatch(name, glob_pat):
-            return True
-    try:
-        if path.stat().st_size > _MAX_FILE_SIZE_BYTES:
-            return True
-    except OSError:
-        return True
-    return False
+# Search file-skip helper and caps live in ouroboros.code_search_rg (the search
+# module SSOT); imported with the historical private names used by call sites.
+from ouroboros.code_search_rg import (  # noqa: E402
+    MAX_SEARCH_FILES_SCANNED as _MAX_SEARCH_FILES_SCANNED,
+    is_search_skippable as _is_search_skippable,
+)
 
 
 def _code_search(ctx: ToolContext, query: str, path: str = ".",
@@ -1286,11 +1261,50 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     protected_root_read_block = block_reason_for_path(ctx, search_root, "read_bytes")
     if protected_root_read_block and search_root.is_file():
         return protected_root_read_block
-    subagent_readonly = _is_local_readonly_subagent(ctx)
+    subagent_readonly = is_restricted_subagent_profile(ctx)
     if subagent_readonly:
         block_msg = _local_readonly_resource_block(ctx, normalized, search_root, root_path, action="SEARCH")
         if block_msg:
             return block_msg
+    root_resolved = root_path.resolve(strict=False)
+    _rt_search_root = str(root_resolved) if normalized == "runtime_data" else ""
+
+    def _path_allowed_for_rg(fp: pathlib.Path) -> bool:
+        # Resolve, then CONFINE to the resource root: a path whose resolved target
+        # escapes it (e.g. an in-root symlink to outside) is rejected — no leak.
+        try:
+            fp = pathlib.Path(fp).resolve(strict=False)
+            rel_parts = fp.relative_to(root_resolved).parts
+        except Exception:
+            return False
+        # runtime_data per-project store is reachable only via scoped knowledge tools.
+        if normalized == "runtime_data" and rel_parts and str(rel_parts[0]).casefold() == "projects":
+            return False
+        return not (
+            (subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH"))
+            or (normalized == "user_files" and user_files_path_block_reason(ctx, fp))
+            or block_reason_for_path(ctx, fp, "read_bytes")
+            or _is_search_skippable(fp)
+        )
+
+    try:
+        from ouroboros.code_search_rg import format_search_result, search_with_rg
+
+        if search_root.is_dir():
+            rg_result = search_with_rg(
+                search_root, query, regex=bool(regex), include=include,
+                max_results=max_results, path_allowed=_path_allowed_for_rg,
+            )
+            return format_search_result(
+                display_path=display_search_path, root_name=normalized,
+                root_path=root_path, query=query, regex=bool(regex),
+                max_results=max_results, result=rg_result,
+            )
+    except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, OSError) as e:
+        # Degrade to the policy-aware Python scanner for rg absent/failed/timeout
+        # AND OSError (wrong-arch/non-executable bundled rg -> 'Exec format
+        # error'). MemoryError etc. still propagate rather than silently degrade.
+        logging.getLogger(__name__).debug("search_code: ripgrep unavailable, using fallback: %s", e)
 
     try:
         if regex:
@@ -1304,12 +1318,13 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     files_searched = 0
     protected_omitted = 0
     truncated = False
-    _rt_search_root = str(root_path.resolve(strict=False)) if normalized == "runtime_data" else ""
-
+    files_capped = False
     for dirpath, dirnames, filenames in os.walk(str(search_root)):
         # Prune skipped dirs in-place. For runtime_data, also prune the top-level
         # per-project store (reachable only via the scoped knowledge tools).
-        dirnames[:] = [d for d in sorted(dirnames) if d not in _SEARCH_SKIP_DIRS]
+        from ouroboros.code_intelligence import SKIP_DIRS
+
+        dirnames[:] = [d for d in sorted(dirnames) if d not in SKIP_DIRS]
         if normalized == "runtime_data" and str(pathlib.Path(dirpath).resolve(strict=False)) == _rt_search_root:
             dirnames[:] = [d for d in dirnames if d.casefold() != "projects"]
         if normalized == "user_files":
@@ -1340,6 +1355,10 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             if _is_search_skippable(fp):
                 continue
 
+            if files_searched >= _MAX_SEARCH_FILES_SCANNED:
+                files_capped = True
+                break
+
             try:
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except Exception:
@@ -1356,42 +1375,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                         break
             if truncated:
                 break
-        if truncated:
+        if truncated or files_capped:
             break
 
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}"
+        cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
+    if files_capped:
+        header += f" — scan stopped at {_MAX_SEARCH_FILES_SCANNED} files (narrow the path or glob)"
     if truncated:
         header += f" — truncated at {max_results} results"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
     return header + "\n\n" + "\n".join(matches)
-
-_SKIP_DIRS = frozenset({
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".pytest_cache", ".mypy_cache", ".tox", "build", "dist",
-})
-
-
-def _extract_python_symbols(file_path: pathlib.Path) -> Tuple[List[str], List[str]]:
-    """Extract Python class/function names with AST."""
-    try:
-        code = file_path.read_text(encoding="utf-8")
-        tree = ast.parse(code, filename=str(file_path))
-        classes = []
-        functions = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                classes.append(node.name)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                functions.append(node.name)
-        return list(dict.fromkeys(classes)), list(dict.fromkeys(functions))
-    except Exception:
-        log.warning(f"Failed to extract Python symbols from {file_path}", exc_info=True)
-        return [], []
 
 
 def _codebase_digest(ctx: ToolContext) -> str:
@@ -1404,7 +1403,7 @@ def _codebase_digest(ctx: ToolContext) -> str:
     inventory = build_code_inventory(
         repo_root,
         drive_root=pathlib.Path(ctx.drive_root),
-        persist=not _is_local_readonly_subagent(ctx) and not protected_paths,
+        persist=not is_restricted_subagent_profile(ctx) and not protected_paths,
         exclude_paths=protected_paths,
     )
     if protected_paths:
@@ -1419,7 +1418,7 @@ def _codebase_digest(ctx: ToolContext) -> str:
         for file in inventory.files:
             coverage[file.disposition] = coverage.get(file.disposition, 0) + 1
         inventory.coverage = coverage
-    if _is_local_readonly_subagent(ctx):
+    if is_restricted_subagent_profile(ctx):
         inventory.files = [
             file for file in inventory.files
             if not _is_subagent_secret_repo_target(repo_root / file.path, repo_root)
@@ -1428,7 +1427,7 @@ def _codebase_digest(ctx: ToolContext) -> str:
 
 def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
     """Forward a message to a running worker task's mailbox."""
-    from ouroboros.owner_inject import write_owner_message
+    from ouroboros.owner_mailbox import write_owner_message
     from ouroboros.task_results import STATUS_RUNNING, validate_task_id
     from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 

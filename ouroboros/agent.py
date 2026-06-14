@@ -38,7 +38,7 @@ from ouroboros.agent_startup_checks import (
     verify_system_state,
 )
 from ouroboros.agent_task_pipeline import (
-    build_trace_summary, emit_task_results, build_review_context,
+    emit_task_results, build_review_context,
 )
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
@@ -106,10 +106,19 @@ class OuroborosAgent:
         self._incoming_messages.put(text)
 
     def _emit_live_log(self, event_type: str, **fields: Any) -> None:
-        """Send a session-only live log event to supervisor/UI."""
+        """Send a session-only live log event to supervisor/UI.
+
+        The active thread (``_current_chat_id``) rides along so the browser's
+        per-thread fan-out can route the live card: a project panel builds /
+        animates / finalizes ITS OWN card, and the main chat excludes project
+        threads. A missing/None chat_id stays main-routed downstream.
+        """
+        payload: Dict[str, Any] = {"type": event_type, "ts": utc_now_iso(), **fields}
+        if self._current_chat_id is not None and "chat_id" not in payload:
+            payload["chat_id"] = self._current_chat_id
         emit_log_event(
             self._event_queue,
-            {"type": event_type, "ts": utc_now_iso(), **fields},
+            payload,
             blocking=True,
             log_label="agent live",
         )

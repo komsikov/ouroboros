@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -142,10 +142,65 @@ def make_cost_breakdown_endpoint(data_dir: pathlib.Path):
 def make_chat_history_endpoint(data_dir: pathlib.Path):
     async def api_chat_history(request: Request) -> JSONResponse:
         """Return recent chat, system, and progress messages merged chronologically."""
+        def _int_param(name: str, default: int, cap: int) -> int:
+            try:
+                return max(0, min(int(request.query_params.get(name, default)), cap))
+            except (ValueError, TypeError):
+                return default
+
+        # Separate per-type quotas so a burst of progress/telemetry can never evict
+        # the user's real conversation from a single combined tail. (`limit` is still
+        # accepted for backward-compat but no longer governs the slice.)
+        n_human = _int_param("n_human", 750, 1500)
+        n_progress = _int_param("n_progress", 300, 600)
+        # Multi-project thread filter (v6.32.0): each chat fetches its own
+        # history. Default 1 = main chat (legacy rows without chat_id are main).
+        # The filter only PARTITIONS when the requested thread is a registered
+        # project chat; for the main chat (and any non-project chat_id, e.g. an
+        # external-transport mirror) it keeps the historic behavior of showing
+        # every non-project, non-A2A row so transport conversations stay visible.
+        thread_id = _int_param("chat_id", 1, 2**31 - 1) or 1
         try:
-            limit = max(0, min(int(request.query_params.get("limit", 1000)), 2000))
-        except (ValueError, TypeError):
-            limit = 1000
+            from ouroboros.projects_registry import registered_project_chat_ids
+
+            project_chat_ids = registered_project_chat_ids(data_dir)
+        except Exception:
+            project_chat_ids = set()
+        bound_chat_cache: Dict[str, int] = {}
+
+        def _bound_project_chat(task_id: str) -> int:
+            tid = str(task_id or "").strip()
+            if not tid:
+                return 0
+            if tid in bound_chat_cache:
+                return bound_chat_cache[tid]
+            try:
+                from ouroboros.projects_registry import project_chat_for_task
+
+                bound_chat_cache[tid] = int(project_chat_for_task(data_dir, tid) or 0)
+            except Exception:
+                bound_chat_cache[tid] = 0
+            return bound_chat_cache[tid]
+
+        def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
+            # A post-hoc bound task keeps its original (main) chat_id on its rows
+            # but belongs to a project — classify by the durable binding too.
+            bound_chat = (
+                _bound_project_chat(str(entry.get("task_id") or "")) if isinstance(entry, dict) else 0
+            )
+            if thread_id in project_chat_ids:
+                if bound_chat == thread_id:
+                    return True
+                return entry_chat == thread_id
+            # Main / non-project view: everything that is NOT another project. A
+            # bound task's rows are project-owned, so mirror only its sanitized
+            # progress/task_summary and exclude its raw chat (same as a native
+            # project row), never leak raw project chat into the штаб.
+            if entry_chat in project_chat_ids or bound_chat > 0:
+                if not isinstance(entry, dict):
+                    return False
+                return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
+            return entry_chat not in project_chat_ids
 
         combined: list = []
 
@@ -154,6 +209,12 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             for entry in iter_jsonl_objects(chat_path):
                 # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):
+                    continue
+                try:
+                    entry_chat = int(entry.get("chat_id", 1) or 1)
+                except (TypeError, ValueError):
+                    entry_chat = 1
+                if not _row_matches_thread(entry_chat, entry):
                     continue
                 direction = str(entry.get("direction", "")).lower()
                 role = {"in": "user", "out": "assistant", "system": "system"}.get(direction)
@@ -191,6 +252,12 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             for entry in iter_jsonl_objects(progress_path):
                 # Skip A2A virtual chat_ids.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):
+                    continue
+                try:
+                    entry_chat = int(entry.get("chat_id", 1) or 1)
+                except (TypeError, ValueError):
+                    entry_chat = 1
+                if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
                     continue
                 text = str(entry.get("content", entry.get("text", "")))
                 if not text:
@@ -244,8 +311,7 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         # task_summary, so on reload/reconnect the client would otherwise replay
         # their progress and re-inflate a "Working" spinner that never resolves.
         try:
-            from ouroboros.task_results import load_task_result
-            from ouroboros.task_status import FINAL_STATUSES
+            from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 
             progress_task_ids = {
                 str(m.get("task_id") or "")
@@ -255,7 +321,11 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             terminal_status_by_task: Dict[str, str] = {}
             for tid in progress_task_ids:
                 try:
-                    res = load_task_result(data_dir, tid)
+                    # Effective (not raw) status: applies the stale-orphan guard so a
+                    # task whose worker was SIGKILLed (/panic, crash) and never wrote a
+                    # terminal result is treated as failed → its card finalizes instead
+                    # of replaying "Working" forever.
+                    res = load_effective_task_result(data_dir, tid)
                 except Exception:
                     res = None
                 status = str((res or {}).get("status") or "")
@@ -286,8 +356,39 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         except Exception as exc:
             log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
 
-        combined.sort(key=lambda m: m.get("ts", ""))
-        messages = combined[-limit:] if len(combined) > limit else combined
+        # Tail human conversation and progress telemetry with SEPARATE quotas so a
+        # burst of progress messages can never push the user's real conversation out
+        # (the previous single combined[-limit:] tail). Subagent lineage is kept on
+        # top of the progress quota so a flood can't evict a RECENT child's lifecycle
+        # events (the client rebuilds child-card lineage from them) — but only WITHIN
+        # the recent telemetry window: resurrecting an old finished swarm's child
+        # events would recreate an orphaned "Working" parent card whose own terminal
+        # row has already aged out of the window.
+        def _is_subagent_lineage(m: dict) -> bool:
+            # Only true SUBAGENT lifecycle (delegation_role 'subagent' or any
+            # subagent_event) is lineage-critical. delegation_role can also be
+            # 'root', which must NOT bypass the progress quota.
+            return str(m.get("delegation_role") or "").lower() == "subagent" or bool(m.get("subagent_event"))
+
+        # NOTE: guard 0 explicitly — Python's list[-0:] is list[0:] (the WHOLE list),
+        # so a `[-quota:]` slice with quota==0 would leak everything, not nothing.
+        lineage_cap = 1000  # bound lineage so a huge swarm fan-out can't balloon the response
+        human = sorted((m for m in combined if not m.get("is_progress")), key=lambda m: m.get("ts", ""))
+        progress = sorted((m for m in combined if m.get("is_progress")), key=lambda m: m.get("ts", ""))
+        human_tail = human[-n_human:] if n_human > 0 else []
+        other = [m for m in progress if not _is_subagent_lineage(m)]
+        other_tail = other[-n_progress:] if n_progress > 0 else []
+        # Recency floor = oldest retained telemetry row. Drop lineage older than it so
+        # long-finished swarms don't re-materialise as stuck "Working" parent cards.
+        floor = str(other_tail[0].get("ts") or "") if other_tail else ""
+        lineage = [
+            m for m in progress
+            if _is_subagent_lineage(m) and (not floor or str(m.get("ts") or "") >= floor)
+        ]
+        if len(lineage) > lineage_cap:
+            lineage = lineage[-lineage_cap:]  # keep the most recent lineage events
+        progress_tail = lineage + other_tail
+        messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
         return JSONResponse({"messages": messages})
 
     return api_chat_history

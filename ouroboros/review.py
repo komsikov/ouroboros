@@ -107,7 +107,11 @@ MAX_FUNCTION_LINES = 320
 # llm_observability, PWA, analytics, fixed-infra policy) on top of this fork's
 # self-evolution surface. Keep the higher cap to cover the combined surface;
 # lower again after the overlapping observability stacks are reconciled.
-MAX_TOTAL_FUNCTIONS = 3000
+# Merge with upstream ouroboros v6.32.2: upstream raised MAX_TOTAL_FUNCTIONS to
+# 3500 (paydown + headroom). The fork's redesign/telemetry surface sits on top,
+# so keep the higher 3500 cap; the OTEL-wrapped loop keeps MAX_FUNCTION_LINES at
+# 320. test_smoke.py::test_function_count_reasonable enforces the cap in CI.
+MAX_TOTAL_FUNCTIONS = 3500
 # Grandfathered modules are accepted debt until their surfaces stabilize/split.
 GRANDFATHERED_OVERSIZED_MODULES = {
     "llm.py",

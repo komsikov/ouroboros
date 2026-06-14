@@ -54,6 +54,14 @@ NONTERMINAL_STATUSES: frozenset[str] = frozenset({
     STATUS_SCHEDULED,
     STATUS_RUNNING,
 })
+# Truly settled outcomes (no cancel-intent latch): callers that must NOT treat
+# cancel_requested as terminal (e.g. wait loops surfacing the final record).
+SETTLED_STATUSES: frozenset[str] = frozenset({
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_CANCELLED,
+    STATUS_REJECTED_DUPLICATE,
+})
 ARTIFACT_TERMINAL_STATUSES: frozenset[str] = frozenset({
     ARTIFACT_STATUS_READY,
     ARTIFACT_STATUS_FAILED,
@@ -278,6 +286,64 @@ def load_effective_task_result(drive_root: pathlib.Path, task_id: str) -> Dict[s
     except ValueError:
         return {}
     return effective_task_result(drive_root, load_task_result(drive_root, tid) or {})
+
+
+def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
+    """Durably finalize on-disk RUNNING task results the effective-status
+    projection already considers terminal.
+
+    A task whose worker crashed / was SIGKILLed / manually stopped can leave
+    ``task_results/<id>.json`` at ``running`` forever (a misleading zombie). The
+    read-time ``effective_task_result`` already projects such an orphan to a
+    terminal status, but never persists it, so a headless/no-UI run that never
+    re-reads the result keeps the stale ``running`` on disk.
+
+    This sweep reuses ``load_effective_task_result`` so the persisted file matches
+    the read projection exactly and inherits ALL of its liveness gates: the grace
+    window, the worker-boot-after-task evidence, and the refusal to reconcile when
+    the queue snapshot is missing. A task that is still pending/running in the
+    queue, or whose worker has not booted after the task's last event, is never
+    reconciled. The monotonic guard in ``write_task_result`` additionally protects
+    a genuinely newer terminal/cancel write. Idempotent; safe at boot and on a
+    periodic supervisor tick.
+    """
+    from ouroboros.task_results import list_task_results, write_task_result
+
+    root = pathlib.Path(drive_root)
+    healed = 0
+    try:
+        running = list_task_results(root, statuses=[STATUS_RUNNING])
+    except Exception:
+        return 0
+    for row in running:
+        task_id = str(row.get("task_id") or row.get("id") or "")
+        if not task_id:
+            continue
+        try:
+            effective = load_effective_task_result(root, task_id)
+        except Exception:
+            continue
+        eff_status = str(effective.get("status") or "").strip().lower()
+        if eff_status not in SETTLED_STATUSES:
+            continue
+        persist_fields = {
+            key: effective[key]
+            for key in (
+                "result",
+                "reason_code",
+                "outcome_axes",
+                "status_reconciled_from",
+                "artifact_status",
+                "artifact_bundle",
+            )
+            if effective.get(key) is not None
+        }
+        try:
+            write_task_result(root, task_id, status=eff_status, **persist_fields)
+            healed += 1
+        except Exception:
+            continue
+    return healed
 
 
 def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _seen: frozenset[str] = frozenset()) -> Dict[str, Any]:

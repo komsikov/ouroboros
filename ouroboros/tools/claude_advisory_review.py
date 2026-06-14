@@ -16,15 +16,14 @@ import subprocess
 from typing import List, Optional
 
 from ouroboros.triad_review import extract_json_array
+from ouroboros.skill_review_status import SEVERITY_DRIVEN_ITEMS
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.review_state import (
     AdvisoryRunRecord,
     AdvisoryReviewState,
     compute_snapshot_hash,
-    format_status_section,
     load_state,
     make_repo_key,
-    save_state,
     update_state,
     _utc_now,
 )
@@ -58,7 +57,6 @@ from ouroboros.utils import (
     append_jsonl,
     utc_now_iso,
     truncate_review_artifact as _truncate_review_artifact,
-    truncate_review_reason as _truncate_review_reason,
 )
 from ouroboros.review_evidence import build_review_projection, build_review_status_payload
 
@@ -70,10 +68,6 @@ _MAX_DIFF_CHARS_ERROR = 500_000  # Fail loudly above this — split the commit
 _ADVISORY_PROMPT_MAX_CHARS = 1_600_000  # ~400K tokens; non-blocking skip when exceeded
 def _json_response(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def _load_doc(repo_dir: pathlib.Path, relpath: str, fallback: str = "") -> str:
-    return load_governance_doc(repo_dir, relpath, on_missing="placeholder", fallback=fallback)
 
 
 def _get_staged_diff(
@@ -276,14 +270,14 @@ def _build_advisory_prompt(
     omitted_paths = prompt_context.get("omitted_paths")
     review_surface = str(prompt_context.get("review_surface") or "repo")
     expected_items = prompt_context.get("expected_items")
-    bible = _load_doc(repo_dir, "BIBLE.md", "(BIBLE.md not found)")
+    bible = load_governance_doc(repo_dir, "BIBLE.md", on_missing="placeholder", fallback="(BIBLE.md not found)")
     try:
         checklist_name = "Skill Review Checklist" if review_surface == "skill" else "Repo Commit Checklist"
         checklists = load_checklist_section(checklist_name)
     except Exception:
-        checklists = _load_doc(repo_dir, "docs/CHECKLISTS.md", "(CHECKLISTS.md not found)")
-    dev_guide = _load_doc(repo_dir, "docs/DEVELOPMENT.md", "(DEVELOPMENT.md not found)")
-    arch_doc = _load_doc(repo_dir, "docs/ARCHITECTURE.md", "(ARCHITECTURE.md not found)")
+        checklists = load_governance_doc(repo_dir, "docs/CHECKLISTS.md", on_missing="placeholder", fallback="(CHECKLISTS.md not found)")
+    dev_guide = load_governance_doc(repo_dir, "docs/DEVELOPMENT.md", on_missing="placeholder", fallback="(DEVELOPMENT.md not found)")
+    arch_doc = load_governance_doc(repo_dir, "docs/ARCHITECTURE.md", on_missing="placeholder", fallback="(ARCHITECTURE.md not found)")
     if diff is None:
         diff = _get_staged_diff(repo_dir, paths=resolved_paths)
     if changed_files is None:
@@ -510,6 +504,22 @@ def _check_expected_items(items: list, expected_items: Optional[List[str]]) -> t
         for item in items
         if isinstance(item, dict)
     ]
+    # Severity-driven checklist items (bug_hunting, companion_process_safety,
+    # extension_namespace_discipline, widget_module_safety) legitimately emit one
+    # row per distinct issue, so collapse their repeated rows to a single
+    # occurrence BEFORE the contract comparison. Single-row items keep their
+    # multiplicity, so a genuine duplicate of e.g. permissions_honesty still warns.
+    # Without this, a valid multi-bug advisory falsely triggered duplicates=/count=
+    # contract warnings and got marked advisory_sdk_suspect_result.
+    collapsed: List[str] = []
+    seen_severity: set[str] = set()
+    for item in actual:
+        if item in SEVERITY_DRIVEN_ITEMS:
+            if item in seen_severity:
+                continue
+            seen_severity.add(item)
+        collapsed.append(item)
+    actual = collapsed
     if actual == expected:
         return "", ""
     missing = [item for item in expected if item not in actual]
@@ -931,6 +941,19 @@ def _record_bypass(ctx: ToolContext, state: "AdvisoryReviewState", snapshot_hash
         ))
 
     update_state(drive_root, _mutate)
+    # Persistent visibility (same mechanism as advisory-enforcement overrides):
+    # review_status surfaces how often the advisory layer was bypassed/absent.
+    try:
+        from ouroboros.utils import update_json_locked, utc_now_iso as _now_iso
+
+        def _bump(current: dict) -> dict:
+            recent = list(current.get("recent") or [])
+            recent.append({"ts": _now_iso(), "block_reason": f"advisory_bypass: {reason}"[:200], "message_head": str(commit_message or "")[:200]})
+            return {"count": int(current.get("count") or 0) + 1, "recent": recent[-10:]}
+
+        update_json_locked(pathlib.Path(drive_root) / "state" / "advisory_overrides.json", _bump)
+    except Exception:
+        log.debug("Failed to persist advisory bypass visibility", exc_info=True)
     if "ANTHROPIC_API_KEY" in reason:
         msg = (
             "⚠️ ANTHROPIC_API_KEY is not set — advisory review skipped automatically. "
@@ -1411,11 +1434,20 @@ def _handle_advisory_pre_review(
         prompt_chars=prompt_chars, model_used=model_used,
         session_id=advisory_session_id, duration_sec=_advisory_duration,
     )
-    state.add_run(run)
+
+    # Locked read-modify-write against the LIVE ledger: the SDK call above runs
+    # for minutes, and a state object loaded before it would clobber stale-marks
+    # and concurrent runs recorded meanwhile (the pre-SDK `state` snapshot is
+    # only used for gating decisions, never persisted from here on).
+    def _record_run(live_state: "AdvisoryReviewState") -> None:
+        live_state.add_run(run)
+        if run_status != "parse_failure" and items:
+            _resolve_matching_obligations(live_state, items, snapshot_hash, repo_key=repo_key)
+
+    update_state(drive_root, _record_run)
 
     # Surface parse failures explicitly.
     if run_status == "parse_failure":
-        save_state(drive_root, state)
         return _json_response({
             "status": "parse_failure",
             "snapshot_hash": snapshot_hash,
@@ -1428,12 +1460,6 @@ def _handle_advisory_pre_review(
                 "or use skip_advisory_review=True to bypass (will be audited)."
             ),
         })
-
-    # Resolve only unambiguous PASSed obligations, even if unrelated findings fail.
-    if items:
-        _resolve_matching_obligations(state, items, snapshot_hash, repo_key=repo_key)
-
-    save_state(drive_root, state)
 
     # Build human-readable summary.
     findings_summary: List[str] = []
@@ -1509,7 +1535,7 @@ def get_tools() -> list:
             schema={
                 "name": "advisory_review",
                 "description": (
-                    "Run an advisory pre-commit review via Claude Agent SDK (read-only: Read, Grep, Glob only). MUST be called before commit_reviewed. Returns structured JSON findings. Findings are advisory (non-blocking), but commit_reviewed is blocked when ANY of the following holds: (a) no fresh matching advisory run for the current staged snapshot, (b) open obligations from prior blocked rounds remain unresolved, or (c) repo-scoped commit-readiness debt is still open (see review_status for details). Correct workflow: finish edits -> advisory_review(...) -> commit_reviewed(...) immediately. WARNING: any edit after advisory_review automatically marks advisory as stale and requires re-running it. Use skip_advisory_review=True to bypass the entire commit gate (bypass is durably audited). Open obligations and commit-readiness debt remain in state for review_status but do not block the bypassed commit."
+                    "Run an advisory pre-commit review via Claude Agent SDK (read-only: Read, Grep, Glob only). MUST be called before commit_reviewed. Returns structured JSON findings. Findings are advisory (non-blocking), but commit_reviewed is blocked when ANY of the following holds: (a) no fresh matching advisory run for the current staged snapshot, (b) open obligations from prior blocked rounds remain unresolved, or (c) repo-scoped commit-readiness debt is still open (see review_status for details). Correct workflow: finish edits -> advisory_review(...) -> commit_reviewed(...) immediately. WARNING: any edit after advisory_review automatically marks advisory as stale and requires re-running it. Use skip_advisory_review=True to bypass the entire commit gate (bypass is durably audited). Open obligations and commit-readiness debt remain in state for review_status but do not block the bypassed commit. NOTE: after 3 genuine review-verdict blocks of a byte-identical staged diff, commit_reviewed refuses further attempts (attempt_cap_reached) until the diff changes or a review_rebuttal is provided."
                 ),
                 "parameters": {
                     "type": "object",

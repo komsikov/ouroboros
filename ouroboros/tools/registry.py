@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import logging
 import os
 import pathlib
@@ -15,8 +14,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.runtime_mode_policy import (
     PROTECTED_RUNTIME_PATHS,
-    core_patch_notice,
-    is_protected_runtime_path,
     mode_allows_protected_write,
     protected_paths_in,
     protected_write_block_message,
@@ -56,7 +53,7 @@ from ouroboros.protected_artifacts import shell_block_reason as protected_artifa
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
 from ouroboros.tool_access import light_cognitive_or_root_redirect, normalize_root, resolve_shell_cwd, workspace_mode_block_reason
 from ouroboros.utils import safe_relpath
-from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint, resolve_payload_path
+from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_OWNER_STATE_FILENAMES,
     SKILL_OWNER_STATE_STEMS,
@@ -300,10 +297,6 @@ def _heal_protected_payload_sidecar(path_text: str) -> bool:
     return is_skill_payload_control_filename(path_text)
 
 
-def _skill_payload_cwd_allowed(cwd_text: str, drive_root: pathlib.Path) -> bool:
-    return is_skill_payload_path(drive_root, cwd_text, allow_control_plane=False)
-
-
 def _heal_claude_code_edit_block(ctx: Any, args: Dict[str, Any], task_constraint: Optional[TaskConstraint]) -> str:
     expected_bucket, expected_skill = constraint_bucket_skill(task_constraint)
     requested_bucket = str(args.get("bucket", "") or "").strip()
@@ -329,6 +322,7 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "edit_text",
     "claude_code_edit",
     "search_code",
+    "query_code",
     "codebase_digest",
     "run_command",
     "run_script",
@@ -349,6 +343,16 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "knowledge_read",
     "knowledge_list",
     "knowledge_write",
+    # Per-project durable MEMORY tools — usable inside project/workspace tasks
+    # exactly like knowledge_*, else a project task cannot record/read its own
+    # journal/workpad (multi-project, v6.32.0). NOTE: promote_chat_to_task is
+    # deliberately NOT here — it spawns a top-level pooled task and belongs to the
+    # conversational lane; a constrained workspace/subagent task must not escalate
+    # by promoting an unconstrained task.
+    "journal_read",
+    "journal_write",
+    "workpad_read",
+    "workpad_write",
     "web_search",
     "browse_page",
     "browser_action",
@@ -484,43 +488,6 @@ def _git_ref_snapshot(repo_dir: pathlib.Path) -> Optional[Dict[str, str]]:
         return None
 
 
-def _revert_protected_files(repo_dir, *, runtime_mode: str = "advanced") -> list:
-    """Revert protected files after claude_code_edit unless pro mode is active."""
-    if mode_allows_protected_write(runtime_mode):
-        return []
-    try:
-        unstaged_diff = subprocess.run(
-            ["git", "diff", "--name-only"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=5,
-        )
-        staged_diff = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=5,
-        )
-        if unstaged_diff.returncode != 0 and staged_diff.returncode != 0:
-            return []
-        modified = set()
-        if unstaged_diff.returncode == 0:
-            modified.update(unstaged_diff.stdout.strip().splitlines())
-        if staged_diff.returncode == 0:
-            modified.update(staged_diff.stdout.strip().splitlines())
-        reverted = []
-        for rel in sorted(modified):
-            if is_protected_runtime_path(rel):
-                subprocess.run(
-                    ["git", "reset", "HEAD", "--", rel],
-                    cwd=str(repo_dir), capture_output=True, timeout=5,
-                )
-                subprocess.run(
-                    ["git", "checkout", "--", rel],
-                    cwd=str(repo_dir), capture_output=True, timeout=5,
-                )
-                reverted.append(rel)
-        return reverted
-    except Exception:
-        return []
-
-
 @dataclass
 class BrowserState:
     """Per-task Playwright lifecycle state."""
@@ -602,7 +569,20 @@ class ToolContext:
 
     def repo_path(self, rel: str) -> pathlib.Path:
         root = self.active_repo_dir()
-        resolved = (root / safe_relpath(rel)).resolve()
+        rel_str = str(rel)
+        # An absolute path that already points INSIDE the active root (e.g. an
+        # agent passing /app/out.txt for a workspace rooted at /app) must
+        # resolve to that file, not be re-nested as /app/app/out.txt. That
+        # double-prefix (safe_relpath strips the leading "/") silently wrote
+        # deliverables to the wrong place and pushed agents toward the blocked
+        # user_files root. Paths not under the root fall through to safe_relpath
+        # (kept inside the root); the boundary check below still guards escapes.
+        try:
+            if pathlib.PurePath(rel_str).is_absolute():
+                rel_str = str(pathlib.Path(rel_str).resolve().relative_to(root.resolve()))
+        except (ValueError, OSError):
+            pass
+        resolved = (root / safe_relpath(rel_str)).resolve()
         try:
             resolved.relative_to(root.resolve())
         except ValueError:
@@ -640,6 +620,11 @@ class ToolEntry:
     handler: Callable  # fn(ctx: ToolContext, **args) -> str
     is_code_tool: bool = False
     timeout_sec: int = 360
+    # Capability flag: tool can mutate the live repo worktree. The dispatcher
+    # snapshots `git status --porcelain` around flagged tools and invalidates
+    # advisory freshness when the worktree ACTUALLY changed — covering error
+    # and timeout paths uniformly, and never invalidating for read-only runs.
+    mutates_worktree: bool = False
 
 
 class ToolRegistry:
@@ -654,8 +639,9 @@ class ToolRegistry:
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
         "core", "evolution_stats", "git", "git_pr", "git_rollback", "github",
-        "health", "knowledge", "memory_tools", "plan_review", "recent_tasks",
-        "review", "search", "services", "shell", "skill_exec", "skill_publish",
+        "health", "knowledge", "memory_tools", "plan_review", "project_journal",
+        "recent_tasks",
+        "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
         "skill_preflight", "subagent_integration", "tool_discovery", "vision",
     ]
 
@@ -757,10 +743,10 @@ class ToolRegistry:
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
         schema = entry.schema
         if self._is_local_readonly_subagent():
-            if entry.name in {"read_file", "list_files", "search_code"}:
+            if entry.name in {"read_file", "list_files", "search_code", "query_code"}:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                allowed = {"active_workspace", "system_repo"} if entry.name == "search_code" else {"active_workspace", "system_repo", "runtime_data", "task_drive", "artifact_store"}
+                allowed = {"active_workspace", "system_repo"} if entry.name in {"search_code", "query_code"} else {"active_workspace", "system_repo", "runtime_data", "task_drive", "artifact_store"}
                 if isinstance(root_schema.get("enum"), list): root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
             elif entry.name in {"browse_page", "browser_action"}:
                 schema = copy.deepcopy(entry.schema)
@@ -789,12 +775,12 @@ class ToolRegistry:
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if isinstance(root_schema.get("enum"), list):
                     root_schema["enum"] = [root for root in root_schema["enum"] if root == "active_workspace"]
-            elif entry.name in {"read_file", "list_files", "search_code"}:
+            elif entry.name in {"read_file", "list_files", "search_code", "query_code"}:
                 # Acting profile reads its own surface + data roots, NOT the live
                 # system_repo (no system_repo in _POLICY['acting_subagent']).
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                allowed = {"active_workspace"} if entry.name == "search_code" else {"active_workspace", "runtime_data", "task_drive", "artifact_store"}
+                allowed = {"active_workspace"} if entry.name in {"search_code", "query_code"} else {"active_workspace", "runtime_data", "task_drive", "artifact_store"}
                 if isinstance(root_schema.get("enum"), list):
                     root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
             elif entry.name == "browser_action":
@@ -1059,6 +1045,22 @@ class ToolRegistry:
                     )
         return None
 
+    def _external_workspace_git_block(self, raw_cmd: Any, args: Dict[str, Any]) -> Optional[str]:
+        from ouroboros.git_shell_policy import external_workspace_git_violation
+
+        git_violation = external_workspace_git_violation(
+            raw_cmd,
+            active_root=active_repo_dir_for(self._ctx),
+            cwd=str(args.get("cwd") or ""),
+            protected_roots=[pathlib.Path(self._ctx.repo_dir), pathlib.Path(self._ctx.drive_root)],
+            allow_network=_resource_allowed(self._ctx, "network"),
+        )
+        if not git_violation:
+            return None
+        if git_violation.startswith("task_contract.allowed_resources"):
+            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
+        return f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}."
+
     def _run_shell_safety_check(self, args: Dict[str, Any], runtime_mode: str) -> Optional[str]:
         """Pre-execution run_command filter; returns a block message or ``None``."""
         raw_cmd = args.get("cmd", args.get("command", ""))
@@ -1317,8 +1319,19 @@ class ToolRegistry:
         if "gh auth" in cmd_words:
             return "⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted."
 
-        # Direct git mutative ban via shell.
+        # Direct git policy via shell.
+        if workspace_mode and not acting_self_worktree:
+            # External workspace: full git is legitimate task work (clone,
+            # checkout, commit, push to task-local remotes). Deterministic
+            # protection only covers the Ouroboros runtime itself plus the
+            # network resource gate; the LLM safety layer keeps judging intent.
+            if git_block := self._external_workspace_git_block(raw_cmd, args):
+                return git_block
+            return None
         if workspace_mode:
+            # Acting self_worktree: a checkout of the Ouroboros repo itself.
+            # The acting-child contract (no commits; patch-based integration)
+            # keeps the strict read-only git policy.
             git_violation = workspace_git_safety_violation(
                 raw_cmd,
                 active_root=active_repo_dir_for(self._ctx),
@@ -1769,15 +1782,26 @@ class ToolRegistry:
         )
         workspace_refs_before = (
             _git_ref_snapshot(active_repo_dir_for(self._ctx))
-            if name in _PROCESS_COMMAND_TOOLS and workspace_mode
+            if name in _PROCESS_COMMAND_TOOLS and workspace_mode and acting_self_worktree
             else None
         )
+        worktree_before = (
+            self._worktree_status_snapshot() if entry.mutates_worktree else None
+        )
         try:
-            result = entry.handler(self._ctx, **args)
-        except TypeError as e:
-            return f"⚠️ TOOL_ARG_ERROR ({name}): {e}"
-        except Exception as e:
-            return f"⚠️ TOOL_ERROR ({name}): {e}"
+            try:
+                result = entry.handler(self._ctx, **args)
+            except TypeError as e:
+                return f"⚠️ TOOL_ARG_ERROR ({name}): {e}"
+            except Exception as e:
+                return f"⚠️ TOOL_ERROR ({name}): {e}"
+        finally:
+            # Central advisory invalidation by OBSERVED worktree diff: runs on
+            # success, tool error, and exception paths alike (the per-tool
+            # manual calls missed early-return/error paths), and skips
+            # invalidation when a flagged tool ran read-only.
+            if worktree_before is not None:
+                self._invalidate_advisory_if_worktree_changed(name, worktree_before)
         if name in _PROCESS_COMMAND_TOOLS:
             result = self._run_shell_post_checks(
                 result,
@@ -1791,6 +1815,31 @@ class ToolRegistry:
             return f"{safety_msg}\n\n---\n{result}"
         return result
 
+    def _worktree_status_snapshot(self) -> str:
+        try:
+            from ouroboros.utils import run_cmd
+
+            return run_cmd(["git", "status", "--porcelain"], cwd=self._ctx.repo_dir, timeout=20)
+        except Exception:
+            return "<status-unavailable>"
+
+    def _invalidate_advisory_if_worktree_changed(self, tool_name: str, before: str) -> None:
+        after = self._worktree_status_snapshot()
+        if after == before:
+            return
+        try:
+            from ouroboros.review_state import invalidate_advisory_after_mutation
+
+            invalidate_advisory_after_mutation(
+                pathlib.Path(self._ctx.drive_root),
+                mutation_root=pathlib.Path(self._ctx.repo_dir),
+                source_tool=tool_name,
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Central advisory invalidation failed for %s", tool_name, exc_info=True
+            )
+
     def override_handler(self, name: str, handler) -> None:
         """Override the handler for a registered tool (used for closure injection)."""
         entry = self._entries.get(name)
@@ -1799,7 +1848,9 @@ class ToolRegistry:
                 name=entry.name,
                 schema=entry.schema,
                 handler=handler,
+                is_code_tool=entry.is_code_tool,
                 timeout_sec=entry.timeout_sec,
+                mutates_worktree=entry.mutates_worktree,
             )
 
     @property

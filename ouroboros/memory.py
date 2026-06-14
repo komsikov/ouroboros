@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import pathlib
-import hashlib
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
@@ -46,12 +45,15 @@ class Memory:
         return default
 
     def load_scratchpad_blocks(self) -> List[Dict[str, Any]]:
+        # Lock the STABLE sidecar (not the data fd): writers atomically replace
+        # the data file via rename, so an fd-lock on the data inode would
+        # synchronize against an orphaned inode after a swap.
         bp = self.scratchpad_blocks_path()
         if not bp.exists():
             return []
         fd = None
         try:
-            fd = os.open(str(bp), os.O_RDONLY)
+            fd = os.open(str(bp) + ".lock", os.O_RDONLY | os.O_CREAT, 0o644)
             _lock_sh(fd)
             data = bp.read_text(encoding="utf-8")
             blocks = json.loads(data) if data.strip() else []
@@ -104,18 +106,17 @@ class Memory:
         if metadata:
             new_block["metadata"] = dict(metadata)
 
+        # Same stable sidecar lock as load/consolidation; the data file itself
+        # is replaced atomically so a crash mid-append cannot truncate memory.
         fd = None
         try:
-            fd = os.open(str(bp), os.O_RDWR | os.O_CREAT, 0o644)
+            fd = os.open(str(bp) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
             _lock_ex(fd)
 
-            raw = b""
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                raw += chunk
-            text = raw.decode("utf-8", errors="replace").strip()
+            try:
+                text = bp.read_text(encoding="utf-8").strip() if bp.exists() else ""
+            except OSError:
+                text = ""
             blocks = json.loads(text) if text else []
             if not isinstance(blocks, list):
                 blocks = []
@@ -133,11 +134,24 @@ class Memory:
                     })
                 blocks = blocks[-_SCRATCHPAD_MAX_BLOCKS:]
 
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(fd, json.dumps(blocks, ensure_ascii=False, indent=2).encode("utf-8"))
+            from ouroboros.utils import atomic_write_json
+
+            atomic_write_json(bp, blocks)
         except Exception:
+            # An honest journal (P1): a failed write must be journaled as a
+            # failure and surfaced to the caller — the old path logged
+            # block_appended success for a block that was never persisted.
             log.error("Failed to append scratchpad block", exc_info=True)
+            try:
+                append_jsonl(self.journal_path(), {
+                    "ts": utc_now_iso(),
+                    "type": "block_append_failed",
+                    "source": source,
+                    "block": dict(new_block),
+                })
+            except Exception:
+                log.debug("Failed to journal block_append_failed", exc_info=True)
+            raise
         finally:
             if fd is not None:
                 try:
@@ -166,6 +180,17 @@ class Memory:
     def regenerate_scratchpad_md(self) -> None:
         blocks = self.load_scratchpad_blocks()
         if not blocks:
+            bp = self.scratchpad_blocks_path()
+            if bp.exists() and bp.stat().st_size > 2:
+                # Storage exists but did not parse — rendering the default
+                # "(empty)" scratchpad would mask memory corruption as amnesia.
+                write_text(
+                    self.scratchpad_path(),
+                    "# Scratchpad\n\n⚠️ scratchpad_blocks.json exists but could not be "
+                    "parsed — working memory storage is corrupt, NOT empty. "
+                    "Inspect/restore the file before appending new blocks.\n",
+                )
+                return
             write_text(self.scratchpad_path(), self._default_scratchpad())
             return
 
@@ -178,9 +203,6 @@ class Memory:
             parts.append(f"### [{ts} — {source}]\n{content}\n\n---\n")
 
         write_text(self.scratchpad_path(), "\n".join(parts))
-
-    def save_scratchpad(self, content: str) -> None:
-        write_text(self.scratchpad_path(), content)
 
     def load_dialogue_blocks(self) -> List[Dict[str, Any]]:
         path = self.drive_root / "memory" / "dialogue_blocks.json"
@@ -236,6 +258,12 @@ class Memory:
             return "(chat history is empty)"
 
         try:
+            # Full project awareness (v6.32.0): active recall spans the one
+            # identity's WHOLE conversation — main + ALL project threads (BIBLE P1,
+            # one awareness across direct chat, project rooms, and consciousness);
+            # only A2A virtual transport is excluded. The project-task FOCUS lives
+            # in the passive default context (build_recent_sections), NOT in this
+            # explicit recall tool — the one mind can deliberately recall anything.
             entries = self._read_jsonl_entries("chat.jsonl", exclude_a2a=True)
 
             if search:
@@ -284,6 +312,12 @@ class Memory:
         offset: int,
         max_entries: int = 100,
     ) -> List[Dict[str, Any]]:
+        # Full project awareness (v6.32.0): the one identity's dialogue stream is
+        # its WHOLE conversation — main + project threads alike — because Ouroboros
+        # is one awareness across direct chat, project rooms, and background
+        # consciousness (BIBLE P1). Only A2A virtual-transport ids are excluded
+        # (machine-to-machine traffic, not the human dialogue). A project task's
+        # OWN focused recent-chat view is built separately in build_recent_sections.
         entries = self._read_jsonl_entries(log_name, exclude_a2a=True)
         if offset <= 0:
             return entries[-max_entries:] if max_entries < len(entries) else entries
@@ -299,28 +333,25 @@ class Memory:
         return suffix[-max_entries:] if max_entries < len(suffix) else suffix
 
     def jsonl_generation_signature(self, log_name: str) -> Dict[str, Any]:
-        path = self.logs_path(log_name)
-        if not path.exists():
-            return {}
-        try:
-            stat = path.stat()
-            first = ""
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.strip():
-                        first = line.strip()
-                        break
-            return {
-                "first_line_sha256": hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest(),
-                "size": int(stat.st_size),
-            }
-        except OSError:
-            return {}
+        from ouroboros.utils import jsonl_generation_signature
 
-    def summarize_chat(self, entries: List[Dict[str, Any]]) -> str:
+        return jsonl_generation_signature(self.logs_path(log_name))
+
+    def summarize_chat(self, entries: List[Dict[str, Any]], limit: int = 1000) -> str:
+        """Render recent chat entries; never hide a horizon cut silently (P1).
+
+        Callers that want the FULL window (e.g. low-context mode passes a huge
+        tail intent) pass a large ``limit``; when truncation does happen the
+        output says exactly how many older unconsolidated messages were omitted.
+        """
         if not entries:
             return ""
-        return "\n".join(self._format_chat_line(e, compact=True) for e in entries[-1000:])
+        limit = max(1, int(limit))
+        shown = entries[-limit:]
+        prefix = ""
+        if len(entries) > len(shown):
+            prefix = f"[{len(entries) - len(shown)} older unconsolidated messages omitted]\n"
+        return prefix + "\n".join(self._format_chat_line(e, compact=True) for e in shown)
 
     @staticmethod
     def _format_chat_line(e: Dict[str, Any], *, compact: bool) -> str:
@@ -394,12 +425,6 @@ class Memory:
                 sha = short(str(e.get("sha") or e.get("git_sha") or ""), 12)
                 return f"{e['type']}: {e.get('ts', '')} branch={branch} sha={sha}"
         return ""
-
-    def append_journal(self, entry: Dict[str, Any]) -> None:
-        append_jsonl(self.journal_path(), entry)
-
-    def append_identity_journal(self, entry: Dict[str, Any]) -> None:
-        append_jsonl(self.identity_journal_path(), entry)
 
     def _default_scratchpad(self) -> str:
         return f"# Scratchpad\n\nUpdatedAt: {utc_now_iso()}\n\n(empty — write anything here)\n"

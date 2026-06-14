@@ -552,6 +552,40 @@ def current_process_group_id() -> int:
         return 0
 
 
+def process_start_time(pid: int) -> str:
+    """Best-effort stable start-time token for (pid, start_time) fingerprints.
+
+    POSIX: ``ps -o lstart=`` (portable across macOS/Linux); Linux fallback
+    reads /proc/<pid>/stat field 22 (clock ticks since boot). Windows:
+    empty string — callers degrade to pid-liveness semantics there.
+    Returns "" when the pid is gone or the platform offers no stable token.
+    """
+    if pid <= 0:
+        return ""
+    if os.name == "nt":
+        return ""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        text = (out.stdout or "").strip()
+        if out.returncode == 0 and text:
+            return text
+    except Exception:
+        pass
+    try:
+        stat_path = pathlib.Path(f"/proc/{pid}/stat")
+        if stat_path.exists():
+            fields = stat_path.read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[-1].split()
+            # rsplit removed fields 1-2 (pid, comm); starttime is field 22 → index 19 here.
+            if len(fields) >= 20:
+                return fields[19]
+    except Exception:
+        pass
+    return ""
+
+
 def process_command(pid: int) -> str:
     """Return a best-effort command line for a Unix process."""
     if IS_WINDOWS:
@@ -585,9 +619,22 @@ def force_kill_pid(pid: int) -> None:
             pass
 
 
-def kill_pid_tree(pid: int) -> None:
-    """Force-kill a PID tree recursively."""
+def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
+    """Force-kill a PID tree recursively.
+
+    ``exclude_pids`` are spared along with their own descendants. Used to keep
+    deliberately-kept (``service_teardown=keep``) services alive when a worker is
+    force-killed on cancel/timeout, so a verifier can still reach them; spared
+    children reparent to init and are governed by the custody reaper thereafter.
+    """
+    exclude = {int(p) for p in (exclude_pids or set())}
     if IS_WINDOWS:
+        # exclude_pids is a POSIX-only nicety: descendant enumeration relies on
+        # `pgrep -P`, which does not exist on Windows, so honouring exclusions
+        # here would enumerate nothing and LEAK the worker's whole subprocess
+        # tree (only the root would die). taskkill /T reliably kills the tree;
+        # kept-service sparing is not supported on Windows (and leaking the tree
+        # is strictly worse than not sparing). Always tree-kill.
         try:
             _hidden_run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -599,11 +646,21 @@ def kill_pid_tree(pid: int) -> None:
 
     descendants: list[int] = []
     _collect_descendants(pid, descendants)
+    spared: set[int] = set()
+    for ep in exclude:
+        spared.add(ep)
+        sub: list[int] = []
+        _collect_descendants(ep, sub)
+        spared.update(sub)
     for dpid in reversed(descendants):
+        if dpid in spared:
+            continue
         try:
             os.kill(dpid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+    if pid in spared:
+        return
     try:
         os.kill(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -728,6 +785,13 @@ def embedded_node_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     return [base_dir / "node-standalone" / "bin" / "node"]
 
 
+def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
+    """Return candidate bundled ripgrep paths."""
+    if IS_WINDOWS:
+        return [base_dir / "ripgrep-standalone" / "rg.exe"]
+    return [base_dir / "ripgrep-standalone" / "bin" / "rg"]
+
+
 def resolve_bundled_node() -> Optional[str]:
     """Return the path to the bundled, signed Node.js runtime if present.
 
@@ -753,16 +817,21 @@ def resolve_bundled_node() -> Optional[str]:
     return None
 
 
-def embedded_pip(base_dir: pathlib.Path) -> Optional[pathlib.Path]:
-    """Return path to pip inside embedded python-standalone."""
-    if IS_WINDOWS:
-        p = base_dir / "python-standalone" / "Scripts" / "pip3.exe"
-        if p.exists():
-            return p
-        p = base_dir / "python-standalone" / "Scripts" / "pip.exe"
-        return p if p.exists() else None
-    p = base_dir / "python-standalone" / "bin" / "pip3"
-    return p if p.exists() else None
+def resolve_bundled_ripgrep() -> Optional[str]:
+    """Return the bundled rg path if present."""
+    bases: List[pathlib.Path] = []
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base:
+        bases.append(pathlib.Path(frozen_base))
+    bases.append(pathlib.Path(__file__).resolve().parent.parent)
+    for base in bases:
+        for candidate in embedded_ripgrep_candidates(base):
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+    return None
 
 
 # Claude runtime resolution.
@@ -922,25 +991,6 @@ def resolve_claude_runtime() -> ClaudeRuntimeState:
             state.error = f"Claude SDK {state.sdk_version} is below the required baseline."
 
     return state
-
-
-# Node.js download.
-
-def node_download_info(version: str) -> tuple[str, str, str]:
-    """Return ``(url, extracted_dir_name, archive_type)`` for Node.js."""
-    arch = platform.machine()
-    if IS_WINDOWS:
-        na = "x64"
-        name = f"node-{version}-win-{na}"
-        return f"https://nodejs.org/dist/{version}/{name}.zip", name, "zip"
-    elif IS_MACOS:
-        na = "arm64" if arch == "arm64" else "x64"
-        name = f"node-{version}-darwin-{na}"
-        return f"https://nodejs.org/dist/{version}/{name}.tar.gz", name, "tar.gz"
-    else:
-        na = "arm64" if arch == "aarch64" else "x64"
-        name = f"node-{version}-linux-{na}"
-        return f"https://nodejs.org/dist/{version}/{name}.tar.gz", name, "tar.gz"
 
 
 # System profiling helpers.

@@ -177,9 +177,12 @@ def _read_update_intent() -> Dict[str, Any]:
 
 
 def _write_update_intent(payload: Dict[str, Any]) -> None:
+    # Atomic: a torn marker would make the next restart silently skip the
+    # prepared managed update (reader fails closed on parse errors).
+    from ouroboros.utils import atomic_write_json
+
     path = _update_intent_marker_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, payload, trailing_newline=True)
 
 
 def _clear_update_intent() -> None:
@@ -1030,7 +1033,7 @@ def safe_restart(
     if t2["ok"]:
         return True, f"OK: fell back to {BRANCH_STABLE}"
 
-    return False, f"Both branches failed import (dev and stable)"
+    return False, "Both branches failed import (dev and stable)"
 
 
 def list_versions(max_count: int = 50) -> List[Dict[str, Any]]:
@@ -1220,11 +1223,6 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     elif err:
         state["warnings"].append(f"divergence_error:{err}")
     return state
-
-
-def preserve_local_head_branch(prefix: str = "local-keep") -> Tuple[bool, str]:
-    """Create a local branch pointing at current HEAD before replacing it."""
-    return preserve_local_ref_branch("HEAD", prefix=prefix)
 
 
 def prepare_managed_update(strategy: str = "replace") -> Tuple[bool, Dict[str, Any]]:

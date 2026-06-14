@@ -16,12 +16,9 @@ Verifies that:
 from __future__ import annotations
 
 import json
-import types
 import pathlib
-import tempfile
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -29,6 +26,11 @@ import pytest
 def _make_ctx(tmp_path: pathlib.Path) -> MagicMock:
     ctx = MagicMock()
     ctx.repo_dir = str(tmp_path)
+    # Pin drive_root to a real temp path. Left unset, ``ctx.drive_root`` is an
+    # auto-MagicMock and any production ``ctx.drive_root / "state" / ...`` write
+    # materialises a literal ``MagicMock/mock.drive_root.__truediv__()...`` dir
+    # in the repo CWD (then committed by a careless ``git add -A``).
+    ctx.drive_root = str(tmp_path)
     ctx.task_id = "test-task"
     ctx._review_history = []
     ctx._review_iteration_count = 0
@@ -551,8 +553,7 @@ def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path):
          patch.object(review_mod, "_handle_multi_model_review", return_value=mock_review_output), \
          patch.object(review_mod, "_load_checklist_section", return_value="## checklist"), \
          patch.object(review_mod, "_preflight_check", return_value=None), \
-         patch.object(review_mod, "_load_dev_guide_text", return_value=""), \
-         patch.object(review_mod, "_load_architecture_text", return_value=""), \
+         patch.object(review_mod, "load_governance_doc", return_value=""), \
          patch("ouroboros.tools.review_helpers.build_touched_file_pack",
                return_value=("(files)", [])):
         review_mod._run_unified_review(ctx, "test commit")
@@ -574,7 +575,6 @@ def test_parse_failure_does_not_count_toward_quorum(tmp_path):
     was counted as a successful quorum participant, silently undermining epistemic
     integrity.
     """
-    from ouroboros.tools import review as review_mod
     from ouroboros.tools.review import _collect_review_findings
 
     ctx = _make_ctx(tmp_path)
@@ -690,7 +690,7 @@ def test_scope_budget_exceeded_has_prompt_chars(tmp_path):
     Before this fix, _handle_prompt_signals set prompt_chars=0 on the budget_exceeded
     path, losing the only forensic fact about why scope review was skipped.
     """
-    from ouroboros.tools.scope_review import ScopeReviewResult, _handle_prompt_signals, _TouchedContextStatus
+    from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
 
     token_count = 800_000  # exceeds the 750K gate
     context_status = _TouchedContextStatus(status="budget_exceeded", token_count=token_count)

@@ -63,7 +63,15 @@ def _effective_swarm_max_wait() -> float:
 
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
 
-_PLAN_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
+# Reserve output headroom inside the reviewer's 1M window (same class of fix as
+# scope_review/deep_self_review): SSOT input budget + max output must not
+# exceed the window, or atlas-heavy plan packs hit a deterministic provider 400.
+_PLAN_MODEL_CONTEXT_WINDOW = 1_000_000
+_PLAN_OUTPUT_MARGIN_TOKENS = 155_000
+_PLAN_BUDGET_TOKEN_LIMIT = min(
+    _REVIEW_BUDGET,
+    _PLAN_MODEL_CONTEXT_WINDOW - _PLAN_REVIEW_MAX_TOKENS - _PLAN_OUTPUT_MARGIN_TOKENS,
+)
 
 
 def get_tools():
@@ -335,7 +343,7 @@ def _collect_planning_handoffs(
         # Check the ceiling BEFORE each slice and shrink the final slice to the
         # remaining budget, so total wait never overshoots the ceiling by a slice.
         remaining = ceiling - (time.monotonic() - start)
-        if remaining <= 0:
+        if remaining <= 0.01:
             stop_reason = "ceiling"
             break
         waited = wait_for_effective_tasks(
@@ -452,6 +460,7 @@ def _start_planning_swarm(
     if get_max_workers() < 2:
         return {
             "started": False,
+            "failure_class": "capacity",
             "error": (
                 "ERROR: plan_task planning swarm failed closed: no spare worker "
                 "capacity for scout subagents. Increase OUROBOROS_MAX_WORKERS to at least 2."
@@ -538,8 +547,14 @@ def _start_planning_swarm(
             f" (wait_stop_reason={stop_reason}, waited {handoffs.get('wait_elapsed_sec')}s)"
             if stop_reason else ""
         )
+        # Pool-capacity failures only: saturated (scouts queued, none running)
+        # or the wait ceiling. "stalled" (RUNNING scouts with stale heartbeats)
+        # is a worker-health failure, NOT capacity — it stays fail-closed even
+        # when the last wait slice also reports timed_out.
+        is_capacity = stop_reason in {"saturated", "ceiling"}
         return {
             "started": False,
+            "failure_class": "capacity" if is_capacity else "",
             "error": (
                 "ERROR: plan_task planning swarm failed closed: no planning subagent "
                 f"completed with a non-empty handoff.{reason_note}{capacity_note}"
@@ -562,6 +577,67 @@ def _start_planning_swarm(
         "task_ids": task_ids,
         "handoffs": handoffs,
     }
+
+
+def _inline_planning_critique(
+    ctx: ToolContext,
+    *,
+    plan: str,
+    goal: str,
+    files_to_touch: list,
+    context_level: str,
+    context_notes: str,
+    capacity_reason: str,
+) -> str:
+    """Degraded single-pass scout substitute for CAPACITY-class swarm failures.
+
+    One inline light-lane LLM call producing the same handoff sections a scout
+    would return. Explicitly labeled degraded — it never impersonates the
+    multi-scout swarm — and returns "" on any failure so the caller keeps the
+    original fail-closed error. Non-capacity failures must not reach here.
+    """
+    prompt = "\n".join([
+        "You are a single planning scout reviewing a proposed implementation plan "
+        "before any code is written. (Degraded mode: the usual independent scout "
+        "swarm could not run — be extra thorough; you are the only scout pass.)",
+        "",
+        _planning_swarm_context(
+            plan=plan,
+            goal=goal,
+            files_to_touch=files_to_touch,
+            context_level=context_level,
+            context_notes=context_notes,
+        ),
+        "",
+        "Return a concise planning handoff with sections: summary, "
+        "missed_touchpoints, risks, suggested_scope_adjustments, tests_to_run, blockers.",
+    ])
+    try:
+        from ouroboros.config import get_light_model
+        from ouroboros.llm_observability import chat_observed
+
+        resp, usage = chat_observed(
+            LLMClient(),
+            drive_root=pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root)),
+            task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
+            call_type="plan_task_inline_critique",
+            messages=[{"role": "user", "content": prompt}],
+            model=get_light_model(),
+            reasoning_effort="medium",
+            max_tokens=8192,
+        )
+        emit_review_usage(ctx, model=get_light_model(), usage=usage, source="plan_task_inline_critique")
+        text = str((resp or {}).get("content") or "").strip()
+        if not text:
+            return ""
+        return (
+            "## Planning Critique (DEGRADED single-pass fallback — scout swarm unavailable)\n\n"
+            f"The planning-scout swarm could not run ({capacity_reason}). This is ONE inline "
+            "light-lane critique pass, not independent scout subagents.\n\n" + text
+        )
+    except Exception:
+        log.debug("plan_task inline critique fallback failed", exc_info=True)
+        return ""
 
 
 def _format_planning_handoffs(handoffs: dict, *, raw: bool) -> str:
@@ -641,16 +717,38 @@ async def _run_plan_review_async(
         context_level=resolved_context_level,
         context_notes=context_notes,
     )
+    degraded_scout_note = ""
     if not swarm.get("started"):
-        return str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed.")
-    planning_handoff_raw = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=True)
-    planning_handoff_compact = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=False)
+        swarm_error = str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed.")
+        if str(swarm.get("failure_class") or "") != "capacity":
+            return swarm_error
+        critique = _inline_planning_critique(
+            ctx,
+            plan=plan,
+            goal=goal,
+            files_to_touch=files_to_touch,
+            context_level=resolved_context_level,
+            context_notes=context_notes,
+            capacity_reason=swarm_error,
+        )
+        if not critique:
+            return swarm_error
+        ctx.emit_progress_fn("📐 plan_task: scout swarm lacked capacity — using degraded inline critique pass.")
+        planning_handoff_raw = planning_handoff_compact = critique
+        degraded_scout_note = (
+            "⚠️ DEGRADED PLANNING EVIDENCE: the scout swarm could not run "
+            "(worker-pool capacity); reviewers saw ONE inline light-lane critique "
+            "pass instead of independent scout handoffs.\n\n"
+        )
+    else:
+        planning_handoff_raw = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=True)
+        planning_handoff_compact = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=False)
 
     checklist = _load_plan_checklist()
-    bible_text = _load_bible(repo_dir)
-    dev_md = _load_doc(repo_dir, "docs/DEVELOPMENT.md")
-    arch_md = _load_doc(repo_dir, "docs/ARCHITECTURE.md")
-    checklists_md = _load_doc(repo_dir, "docs/CHECKLISTS.md")
+    bible_text = load_governance_doc(repo_dir, "BIBLE.md", on_missing="explicit")
+    dev_md = load_governance_doc(repo_dir, "docs/DEVELOPMENT.md", on_missing="explicit")
+    arch_md = load_governance_doc(repo_dir, "docs/ARCHITECTURE.md", on_missing="explicit")
+    checklists_md = load_governance_doc(repo_dir, "docs/CHECKLISTS.md", on_missing="explicit")
 
     ctx.emit_progress_fn("📐 plan_task: reading planned-touch file snapshots…")
     canonical_docs = {
@@ -711,7 +809,7 @@ async def _run_plan_review_async(
         if atlas.status == "budget_exceeded":
             estimated = int((atlas.manifest or {}).get("estimated_total_tokens") or 0)
             return (
-                f"⚠️ PLAN_REVIEW_SKIPPED: generated repository atlas exceeded hard budget"
+                "⚠️ PLAN_REVIEW_SKIPPED: generated repository atlas exceeded hard budget"
                 + (f" ({estimated:,} estimated tokens)" if estimated else "")
                 + ". Split the plan into a smaller scope or choose a smaller context_level."
             )
@@ -739,7 +837,7 @@ async def _run_plan_review_async(
 
     raw_results = await _run_plan_review_slots(ctx, models, system_prompt, user_content)
 
-    return _format_output(raw_results, models, goal, estimated_tokens)
+    return degraded_scout_note + _format_output(raw_results, models, goal, estimated_tokens)
 
 
 async def _run_plan_review_slots(
@@ -1132,9 +1230,3 @@ def _load_plan_checklist() -> str:
         return ""
 
 
-def _load_bible(repo_dir) -> str:
-    return load_governance_doc(repo_dir, "BIBLE.md", on_missing="explicit")
-
-
-def _load_doc(repo_dir, rel_path: str) -> str:
-    return load_governance_doc(repo_dir, rel_path, on_missing="explicit")

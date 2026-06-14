@@ -9,9 +9,11 @@ import os
 import pathlib
 import queue
 import threading
-import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from ouroboros.tools.registry import ToolRegistry
 
 from ouroboros.loop_tool_execution import StatefulToolExecutor, _truncate_tool_result
 from ouroboros.utils import (
@@ -523,14 +525,14 @@ class BackgroundConsciousness:
         "send_user_message", "update_scratchpad",
         "update_identity", "set_next_wakeup",
         "knowledge_read", "knowledge_write", "knowledge_list",
-        "web_search", "read_file", "list_files",
+        "web_search", "read_file", "list_files", "query_code",
         "chat_history", "recent_tasks",
         "list_github_issues", "get_github_issue",
     })
 
     def _build_registry(self) -> "ToolRegistry":
         """Create a ToolRegistry scoped to background-allowed tools."""
-        from ouroboros.tools.registry import ToolRegistry, ToolContext, ToolEntry
+        from ouroboros.tools.registry import ToolRegistry, ToolEntry
 
         registry = ToolRegistry(repo_dir=self._repo_dir, drive_root=self._drive_root)
 

@@ -4,12 +4,10 @@ from __future__ import annotations
 import concurrent.futures as _cf
 import hashlib
 import logging
-from typing import Optional
 
 from ouroboros.utils import run_cmd
 from ouroboros.tools.review_helpers import build_scope_actor_record, format_review_history_entry
 from ouroboros.tools.scope_review import (
-    ScopeReviewResult,
     run_scope_review,
     _degraded_scope_requested,
     _get_scope_model,
@@ -86,10 +84,6 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     _stored = getattr(ctx, '_scope_review_history', None) or {}
     _scope_history = _stored.get(snapshot_key, []) if isinstance(_stored, dict) else []
     _history_snapshot = list(getattr(ctx, '_review_history', []))
-
-    def _run_triad():
-        return _run_unified_review(ctx, commit_message, review_rebuttal=review_rebuttal,
-                                   goal=goal, scope=scope)
 
     def _run_scope():
         try:
@@ -199,7 +193,8 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     # Snapshot advisory state before threads mutate it.
     _advisory_snapshot_before = list(getattr(ctx, '_review_advisory', []))
     with _cf.ThreadPoolExecutor(max_workers=2) as pool:
-        triad_fut = pool.submit(_run_triad)
+        triad_fut = pool.submit(_run_unified_review, ctx, commit_message,
+                                review_rebuttal=review_rebuttal, goal=goal, scope=scope)
         scope_fut = pool.submit(_run_scope)
         try:
             review_err = triad_fut.result()

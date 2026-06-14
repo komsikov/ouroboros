@@ -7,11 +7,11 @@ import logging
 import queue
 import re
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
-from supervisor.state import append_jsonl, load_state, save_state
+from supervisor.state import append_jsonl, load_state
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -70,7 +70,6 @@ class LocalChatBridge:
 
     def __init__(self, settings: Optional[Dict[str, Any]] = None):
         self._inbox = queue.Queue()   # user -> agent
-        self._outbox = queue.Queue()  # agent -> UI
         self._log_queue: queue.Queue = queue.Queue(maxsize=1000)
         self._update_counter = 0
         self._broadcast_fn = None  # set by server.py for WebSocket streaming
@@ -167,10 +166,25 @@ class LocalChatBridge:
         *,
         sender_session_id: str = "",
         client_message_id: str = "",
+        image_base64: str = "",
+        image_mime: str = "",
+        image_caption: str = "",
         task_metadata: Optional[Dict[str, Any]] = None,
+        chat_id: int = 1,
+        project_id: str = "",
     ) -> None:
+        # Multi-project (v6.32.0): the web owner may address a project chat by
+        # positive chat_id. The OWNER identity never changes (user_id stays 1 —
+        # binding is security-load-bearing); only the thread id varies. A2A
+        # negative ids are rejected here — they are not a web surface.
+        try:
+            thread_id = int(chat_id or 1)
+        except (TypeError, ValueError):
+            thread_id = 1
+        if thread_id < 1:
+            thread_id = 1
         clean_text = str(text or "").strip()
-        if not clean_text:
+        if not clean_text and not image_base64:
             return
         ts = utc_now_iso()
         if self._broadcast_fn:
@@ -180,18 +194,25 @@ class LocalChatBridge:
                 "content": clean_text,
                 "ts": ts,
                 "source": "web",
+                "chat_id": thread_id,
                 "sender_session_id": sender_session_id,
                 "client_message_id": client_message_id,
             })
+        metadata = dict(task_metadata or {})
+        if str(project_id or "").strip():
+            metadata.setdefault("project_id", str(project_id).strip())
         self.enqueue_local_message(
             clean_text,
-            chat_id=1,
+            chat_id=thread_id,
             user_id=1,
             source="web",
             sender_label="",
             sender_session_id=sender_session_id,
             client_message_id=client_message_id,
-            task_metadata=task_metadata,
+            image_base64=image_base64,
+            image_mime=image_mime,
+            image_caption=image_caption,
+            task_metadata=metadata or None,
         )
 
     def enqueue_local_message(
@@ -265,7 +286,6 @@ class LocalChatBridge:
         }
         if meta:
             msg.update(meta)
-        self._outbox.put(msg)
         with self._response_subs_lock:
             subs = [(sid, cb) for sid, (cid, cb) in self._response_subs.items()
                     if cid == chat_id and not is_progress]
@@ -283,6 +303,7 @@ class LocalChatBridge:
                 "is_progress": bool(is_progress),
                 "ts": message_ts,
                 "task_id": str(task_id or ""),
+                "chat_id": int(chat_id or 0),
                 "transport": transport,
             }
             if meta:
@@ -307,12 +328,8 @@ class LocalChatBridge:
         """Send typing indicator to UI/event subscribers."""
         if is_a2a_chat_id(chat_id):
             return True
-        self._outbox.put({
-            "type": "action",
-            "content": action,
-        })
         if self._broadcast_fn:
-            self._broadcast_fn({"type": "typing", "action": action})
+            self._broadcast_fn({"type": "typing", "action": action, "chat_id": int(chat_id or 0)})
         typing_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
         publish_event(CHAT_TYPING, {"chat_id": int(chat_id or 0), "action": str(action or ""), "transport": typing_transport})
         return True
@@ -335,8 +352,8 @@ class LocalChatBridge:
             "mime": mime,
             "caption": caption,
             "ts": utc_now_iso(),
+            "chat_id": int(chat_id or 0),
         }
-        self._outbox.put(msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
         photo_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -368,8 +385,8 @@ class LocalChatBridge:
             "mime": mime,
             "caption": caption,
             "ts": utc_now_iso(),
+            "chat_id": int(chat_id or 0),
         }
-        self._outbox.put(msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
         video_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -397,7 +414,10 @@ class LocalChatBridge:
             except queue.Full:
                 pass
         if self._broadcast_fn:
-            self._broadcast_fn({"type": "log", "data": event})
+            # Surface the event's chat_id top-level so the browser's per-thread
+            # fan-out (isMyThread) can route the live card to its project panel
+            # instead of the main chat. Events without a chat_id default to main.
+            self._broadcast_fn({"type": "log", "data": event, "chat_id": int(event.get("chat_id") or 0)})
 
     def ui_poll_logs(self) -> list:
         """Drain pending log events for the web UI."""
@@ -417,8 +437,13 @@ class LocalChatBridge:
         sender_session_id: str = "",
         client_message_id: str = "",
         suppress_chat_log: bool = False,
+        image_base64: str = "",
+        image_mime: str = "",
+        image_caption: str = "",
         task_constraint: Optional[Dict[str, Any]] = None,
         task_metadata: Optional[Dict[str, Any]] = None,
+        chat_id: int = 1,
+        project_id: str = "",
     ):
         """Accept a web UI message for the agent."""
         if broadcast:
@@ -426,7 +451,12 @@ class LocalChatBridge:
                 text,
                 sender_session_id=sender_session_id,
                 client_message_id=client_message_id,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                image_caption=image_caption,
                 task_metadata=task_metadata,
+                chat_id=chat_id,
+                project_id=project_id,
             )
             return
         self.enqueue_local_message(
@@ -436,12 +466,6 @@ class LocalChatBridge:
             task_metadata=task_metadata,
         )
 
-    def ui_receive(self, timeout: float = 0.1) -> Optional[Dict[str, Any]]:
-        """Poll agent messages for the web UI."""
-        try:
-            return self._outbox.get(timeout=timeout)
-        except queue.Empty:
-            return None
 
 
 def _strip_markdown(text: str) -> str:
@@ -495,22 +519,25 @@ def _format_budget_line(st: Dict[str, Any]) -> str:
 
 def budget_line(force: bool = False) -> str:
     try:
-        st = load_state()
+        from supervisor.state import update_state
+
         every = max(1, int(BUDGET_REPORT_EVERY_MESSAGES))
-        if force:
-            st["budget_messages_since_report"] = 0
-            save_state(st)
-            return _format_budget_line(st)
+        report_box: Dict[str, Any] = {"emit": False}
 
-        counter = int(st.get("budget_messages_since_report") or 0) + 1
-        if counter < every:
-            st["budget_messages_since_report"] = counter
-            save_state(st)
-            return ""
+        def _tick_counter(live: Dict[str, Any]) -> None:
+            if force:
+                live["budget_messages_since_report"] = 0
+                report_box["emit"] = True
+                return
+            counter = int(live.get("budget_messages_since_report") or 0) + 1
+            if counter < every:
+                live["budget_messages_since_report"] = counter
+                return
+            live["budget_messages_since_report"] = 0
+            report_box["emit"] = True
 
-        st["budget_messages_since_report"] = 0
-        save_state(st)
-        return _format_budget_line(st)
+        st = update_state(_tick_counter)
+        return _format_budget_line(st) if report_box["emit"] else ""
     except Exception:
         log.debug("Suppressed exception in budget_line", exc_info=True)
         return ""

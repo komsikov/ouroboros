@@ -18,6 +18,8 @@ from ouroboros.context_budget import (
     CONTEXT_SOFT_CAP_TOKENS,
     LARGE_CONTEXT_SECTION_CHARS,
     MAX_RECENT_CHAT_TAIL,
+    SCRATCHPAD_BLOAT_WARN_CHARS,
+    SCRATCHPAD_SECTION_BUDGET_CHARS,
 )
 from ouroboros.context_layout import (
     architecture_context_section,
@@ -65,7 +67,13 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     combined_text = "\n".join(part for part in (image_caption, text if text != image_caption else "") if part) or "Analyze the screenshot"
     return [
         {"type": "text", "text": combined_text},
-        {"type": "image_url", "image_url": {"url": f"data:{task.get('image_mime', 'image/jpeg')};base64,{image_b64}"}},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{task.get('image_mime', 'image/jpeg')};base64,{image_b64}"},
+            # Eviction metadata (stripped before provider calls): the K-newest
+            # image policy replaces older blocks with this caption.
+            "_caption": str(image_caption or "")[:200],
+        },
     ]
 
 
@@ -82,9 +90,9 @@ def _task_requires_development_context(task: Dict[str, Any]) -> bool:
     return str(task.get("type") or "") == "task" or not bool(task.get("_is_direct_chat"))
 
 
-def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
-    """Return True when the task is structurally about Ouroboros itself."""
-
+def _explicit_self_body_docs_flag(task: Dict[str, Any]) -> Optional[bool]:
+    """Explicit context_requires_self_body_docs from the task or its contract;
+    None when neither declares it."""
     explicit = task.get("context_requires_self_body_docs")
     if explicit is not None:
         return normalize_bool(explicit)
@@ -92,6 +100,16 @@ def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
     explicit = contract.get("context_requires_self_body_docs") if isinstance(contract, dict) else None
     if explicit is not None:
         return normalize_bool(explicit)
+    return None
+
+
+def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
+    """Return True when the task is structurally about Ouroboros itself."""
+
+    explicit = _explicit_self_body_docs_flag(task)
+    if explicit is not None:
+        return explicit
+    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
     task_type = str(task.get("type") or contract.get("task_type") or "").strip().lower()
     return task_type in {"evolution", "deep_self_review", "review"}
 
@@ -252,6 +270,30 @@ def build_knowledge_sections(
         if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
             log.warning("context: %s is large (%d chars)", label, len(text))
         sections.append(f"{header}\n\n{text}")
+    if pid:
+        # Bounded per-project journal tail + workpad (multi-project, v6.32.0):
+        # the project's durable progress memory rides along with its knowledge.
+        try:
+            from ouroboros.project_facts import project_workpad_path
+            from ouroboros.tools.project_journal import journal_tail_digest
+
+            journal = journal_tail_digest(pid)
+            if journal:
+                sections.append(
+                    f"## Project journal ({pid}) — recent milestones\n\n{journal}\n\n"
+                    "(journal_read shows the full history; journal_write appends.)"
+                )
+            workpad = safe_read(project_workpad_path(pid))
+            if workpad.strip():
+                # Cognitive artifact: never silently prefix-slice (BIBLE P1 — that
+                # is partial amnesia). The project's own working memory rides in
+                # full; an oversized workpad is a workpad-discipline signal to
+                # consolidate, not a reason to amputate context.
+                if len(workpad) > _LARGE_CONTEXT_SECTION_CHARS:
+                    log.warning("context: project workpad (%s) is large (%d chars)", pid, len(workpad))
+                sections.append(f"## Project workpad ({pid})\n\n{workpad}")
+        except Exception:
+            log.debug("project journal/workpad context injection failed", exc_info=True)
     return sections
 
 
@@ -271,81 +313,13 @@ def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label:
     return sections
 
 
-_SECTION_BUDGETS = {"scratchpad": 90_000, "identity": 80_000, "registry": 30_000}
+_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000}
 
 
 def _warn_if_over_budget(name: str, content: str) -> None:
     budget = _SECTION_BUDGETS.get(name)
     if budget and len(content) > budget:
         log.warning("Context section '%s' exceeds budget: %d chars > %d", name, len(content), budget)
-
-
-def _parse_budget_chars(raw: str) -> Optional[int]:
-    token = str(raw or "").strip().lower().replace("chars", "").replace("char", "").strip().replace(",", "").replace("_", "")
-    if token.endswith("k"):
-        try:
-            return int(float(token[:-1]) * 1000)
-        except ValueError:
-            return None
-    return int(token) if token.isdigit() else None
-
-
-def _parse_file_size_budgets(dev_text: str) -> List[Tuple[str, int]]:
-    budgets: List[Tuple[str, int]] = []
-    in_section = False
-    for line in dev_text.splitlines():
-        if line.startswith("### File Size Budgets"):
-            in_section = True
-            continue
-        if in_section and line.startswith("### "):
-            break
-        if not in_section or not line.startswith("|"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2:
-            continue
-        if cells[0].lower() in {"file", "path"} or set(cells[0]) == {"-"}:
-            continue
-        budget = _parse_budget_chars(cells[1])
-        if budget:
-            budgets.append((cells[0], budget))
-    return budgets
-
-
-def _iter_budget_paths(root: pathlib.Path, pattern: str) -> List[pathlib.Path]:
-    if any(marker in pattern for marker in "*?["):
-        return sorted(p for p in root.glob(pattern) if p.is_file())
-    path = root / pattern
-    return [path] if path.exists() and path.is_file() else []
-
-
-def _append_file_size_budget_checks(env: Any, checks: List[str]) -> None:
-    try:
-        repo_root = env.repo_dir if not isinstance(env, dict) else pathlib.Path(env["repo_dir"])
-        drive_root = env.drive_root if not isinstance(env, dict) else pathlib.Path(env["drive_root"])
-        dev_text = read_text(repo_root / "docs" / "DEVELOPMENT.md")
-        seen: set[str] = set()
-        for relpath, budget in _parse_file_size_budgets(dev_text):
-            root = drive_root if relpath.startswith("memory/") else repo_root
-            for fpath in _iter_budget_paths(root, relpath):
-                resolved = str(fpath.resolve())
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                size = fpath.stat().st_size
-                label = str(fpath.relative_to(root)).replace("\\", "/")
-                if size > budget:
-                    checks.append(
-                        f"WARNING: FILE SIZE BUDGET EXCEEDED — {label} is {size:,} chars "
-                        f"(budget {budget:,}). Consolidate it or revise the budget in DEVELOPMENT.md."
-                    )
-                elif size >= int(budget * 0.9):
-                    checks.append(
-                        f"WARNING: FILE SIZE NEAR BUDGET — {label} is {size:,} chars "
-                        f"({int(size * 100 / budget)}% of {budget:,}). Consider consolidation."
-                    )
-    except Exception:
-        log.debug("Failed to append file size budget checks", exc_info=True)
 
 
 def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
@@ -365,8 +339,11 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
         sections.append("## Identity (from `memory/identity.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw)
         world_raw = memory.load_world_profile().strip()
         if world_raw:
-            world_text = truncate_review_artifact(world_raw, limit=4096)
-            sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_text)
+            # Generated environment profile: include in FULL and warn rather than
+            # silently prefix-slicing (BIBLE P1 no-silent-truncation). An oversized
+            # WORLD.md is a generation-discipline bug, not a context-budget excuse.
+            _warn_if_over_budget("world", world_raw)
+            sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
 
     if include_volatile:
         dialogue_blocks = memory.load_dialogue_blocks()
@@ -432,38 +409,92 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
     return "\n\n".join(blocks)
 
 
-def build_recent_sections(memory: Memory, env: Any, task_id: str = "") -> List[str]:
+def _entry_chat_id(entry: Any) -> int:
+    """Best-effort chat_id of a chat.jsonl row (missing/blank -> 0 = main)."""
+    try:
+        return int((entry or {}).get("chat_id", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+# How many trailing chat.jsonl rows to scan when reconstructing a single project
+# thread's own recent tail (project threads are bounded/recent, unlike the штаб's
+# fully-consolidated main dialogue).
+_PROJECT_THREAD_SCAN = 4000
+
+
+def build_recent_sections(
+    memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0
+) -> List[str]:
     sections = []
 
-    dialogue_meta = memory.load_dialogue_meta()
+    # Full project awareness (v6.32.0): registry membership is the SSOT for "is
+    # this a project thread" (a numeric range cannot disambiguate large external
+    # transport ids). The one identity (main chat + background consciousness) sees
+    # its WHOLE conversation, project threads included, because Ouroboros is one
+    # awareness/biography (BIBLE P1). A project TASK gets a FOCUSED view of its own
+    # thread as working context to reduce interference — focus, not isolation.
     try:
-        consolidated_offset = int(dialogue_meta.get("last_consolidated_offset") or 0)
-    except (TypeError, ValueError):
-        consolidated_offset = 0
-    if consolidated_offset > 0:
-        expected_signature = dialogue_meta.get("chat_log_signature")
-        current_signature = memory.jsonl_generation_signature("chat.jsonl")
-        if not _chat_log_signature_matches(expected_signature, current_signature):
-            log.warning(
-                "Ignoring dialogue consolidation offset %s because chat log generation signature is missing or stale",
-                consolidated_offset,
-            )
-            consolidated_offset = 0
-    # Raw recent-dialogue tail: smaller in low context mode only when it cannot
-    # silently drop unconsolidated dialogue. If a valid consolidation offset
-    # exists, the older span is represented by dialogue_blocks.json and the whole
-    # suffix after that offset remains raw (P1: horizon preserved, granularity
-    # varies but unconsolidated dialogue is not cut away).
+        from ouroboros.projects_registry import registered_project_chat_ids
+
+        _project_chat_ids = registered_project_chat_ids(memory.drive_root)
+    except Exception:
+        _project_chat_ids = set()
+
     _context_mode = get_context_mode()
     _chat_tail = MAX_RECENT_CHAT_TAIL
-    if _context_mode == "low" and consolidated_offset > 0:
-        _chat_tail = 10**9
-    chat_entries = memory.read_jsonl_tail_after_offset(
-        "chat.jsonl",
-        consolidated_offset,
-        _chat_tail,
-    )
-    chat_summary = memory.summarize_chat(chat_entries)
+
+    if thread_chat_id and thread_chat_id in _project_chat_ids:
+        # Project task: a FOCUSED working view of its OWN thread (reduces
+        # cross-project interference while executing) — NOT isolation from the one
+        # mind, which sees everything via the main/background path below. Read the
+        # project's raw tail directly. Post-hoc bound tasks keep their original main
+        # chat_id but belong to this project — include their rows via the binding.
+        try:
+            from ouroboros.projects_registry import all_task_bindings
+
+            _bound = all_task_bindings(memory.drive_root)
+        except Exception:
+            _bound = {}
+        recent = memory.read_jsonl_tail("chat.jsonl", _PROJECT_THREAD_SCAN)
+        chat_entries = [
+            e for e in recent
+            if _entry_chat_id(e) == thread_chat_id
+            or _bound.get(str((e or {}).get("task_id") or "")) == thread_chat_id
+        ][-_chat_tail:]
+    else:
+        dialogue_meta = memory.load_dialogue_meta()
+        try:
+            consolidated_offset = int(dialogue_meta.get("last_consolidated_offset") or 0)
+        except (TypeError, ValueError):
+            consolidated_offset = 0
+        if consolidated_offset > 0:
+            expected_signature = dialogue_meta.get("chat_log_signature")
+            current_signature = memory.jsonl_generation_signature("chat.jsonl")
+            if not _chat_log_signature_matches(expected_signature, current_signature):
+                log.warning(
+                    "Ignoring dialogue consolidation offset %s because chat log generation signature is missing or stale",
+                    consolidated_offset,
+                )
+                consolidated_offset = 0
+        # Raw recent-dialogue tail: smaller in low context mode only when it cannot
+        # silently drop unconsolidated dialogue. If a valid consolidation offset
+        # exists, the older span is represented by dialogue_blocks.json and the whole
+        # suffix after that offset remains raw (P1: horizon preserved, granularity
+        # varies but unconsolidated dialogue is not cut away).
+        if _context_mode == "low" and consolidated_offset > 0:
+            _chat_tail = 10**9
+        # read_jsonl_tail_after_offset returns the one identity's WHOLE dialogue
+        # (main + project threads; only A2A virtual transport excluded), aligned
+        # with the consolidator so the shared offset indexes the same stream.
+        chat_entries = memory.read_jsonl_tail_after_offset(
+            "chat.jsonl",
+            consolidated_offset,
+            _chat_tail,
+        )
+    # Pass the same tail intent down: summarize_chat's internal default cap
+    # would silently re-cut the low-mode full-window read to 1000 lines.
+    chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
     if chat_summary:
         sections.append("## Recent chat\n\n" + chat_summary)
 
@@ -714,7 +745,7 @@ def build_health_invariants(env: Any) -> str:
         sp_len = len(read_text(env.drive_path("memory/scratchpad.md")).strip())
         if sp_len < 50:
             checks.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
-        elif sp_len > 50000:
+        elif sp_len > SCRATCHPAD_BLOAT_WARN_CHARS:
             checks.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
         else:
             checks.append(f"OK: scratchpad size ({sp_len} chars)")
@@ -749,10 +780,6 @@ def build_health_invariants(env: Any) -> str:
         pass
 
     _collect_log_analysis_checks(env, checks)
-    try:
-        _append_file_size_budget_checks(env, checks)
-    except Exception:
-        pass
     if not checks:
         return ""
     return "## Health Invariants\n\n" + "\n".join(f"- {check}" for check in checks)
@@ -906,6 +933,17 @@ def build_llm_messages(
     if _task_uses_external_context(task) and not _task_requires_self_body_docs(task):
         docs_context_mode = "low"
         docs_need_development = False
+    elif (
+        str(task.get("type") or "").strip().lower() == "evolution"
+        and _explicit_self_body_docs_flag(task) is not True
+    ):
+        # Evolution cycles are long multi-round code tasks: serve ARCHITECTURE as
+        # the lossless navigation map (sections read on demand) instead of ~45K
+        # always-resident tokens, but keep the engineering handbook inline. An
+        # explicit context_requires_self_body_docs=true (task field or contract)
+        # keeps the full docs.
+        docs_context_mode = "low"
+        docs_need_development = True
     static_parts.extend(
         reference_doc_sections(
             env,
@@ -991,7 +1029,9 @@ def build_llm_messages(
         except Exception:
             log.debug("Failed to build advisory review status section", exc_info=True)
 
-    dynamic_parts.extend(build_recent_sections(memory, env, task_id=task.get("id", "")))
+    dynamic_parts.extend(build_recent_sections(
+        memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0)
+    ))
 
     dynamic_text = "\n\n".join(dynamic_parts)
 
@@ -1041,11 +1081,6 @@ def apply_message_token_soft_cap(
     return messages, info
 
 
-from ouroboros.context_compaction import (
-    _COMPACTION_PROTECTED_TOOLS,
-    compact_tool_history,
-    compact_tool_history_llm,
-)
 
 
 def safe_read(path: pathlib.Path, fallback: str = "") -> str:

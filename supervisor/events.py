@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import subprocess
-import sys
 import time
 import uuid
 from typing import Any, Dict, Optional
 
-from ouroboros.utils import truncate_for_log, utc_now_iso
+from ouroboros.utils import append_jsonl, truncate_for_log, utc_now_iso
 from ouroboros.config import get_max_active_subagents_per_root, get_max_subagent_depth
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
@@ -35,6 +33,19 @@ _PARENT_CONTEXT_MARKER = "[BEGIN_PARENT_CONTEXT"
 _PARENT_CONTEXT_END = "[END_PARENT_CONTEXT]"
 VALID_SUBAGENT_MEMORY_MODES = frozenset({"forked", "empty"})
 _GIT_UNBORN_HEAD = "(unborn)"
+
+
+def _bound_project_chat_id(ctx: Any, task_id: Any) -> int:
+    """Resolve project chat for a task that was post-hoc bound via UI."""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return 0
+    try:
+        from ouroboros.projects_registry import project_chat_for_task
+
+        return int(project_chat_for_task(ctx.DRIVE_ROOT, tid) or 0)
+    except Exception:
+        return 0
 
 
 def _is_active_subagent_task(task: Dict[str, Any], root_task_id: str) -> bool:
@@ -348,27 +359,28 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     usage: Dict[str, Any] = usage_raw if isinstance(usage_raw, dict) else {}
 
     # Normalize usage across loop.py, web_search, and claude_code_edit producers.
-    prompt_tokens = int(
-        usage.get("prompt_tokens")
-        or usage.get("input_tokens")
-        or evt.get("prompt_tokens")
-        or 0
+    # Tolerant coercion: one malformed token field must not raise and drop the
+    # whole round from the budget ledger and events.jsonl (the exception would
+    # be swallowed by dispatch_event and the cost silently lost).
+    def _tolerant_int(*candidates: Any) -> int:
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                log.warning("llm_usage: non-numeric token field %r ignored", value)
+        return 0
+
+    prompt_tokens = _tolerant_int(
+        usage.get("prompt_tokens"), usage.get("input_tokens"), evt.get("prompt_tokens")
     )
-    completion_tokens = int(
-        usage.get("completion_tokens")
-        or usage.get("output_tokens")
-        or evt.get("completion_tokens")
-        or 0
+    completion_tokens = _tolerant_int(
+        usage.get("completion_tokens"), usage.get("output_tokens"), evt.get("completion_tokens")
     )
-    cached_tokens = int(
-        usage.get("cached_tokens")
-        or evt.get("cached_tokens")
-        or 0
-    )
-    cache_write_tokens = int(
-        usage.get("cache_write_tokens")
-        or evt.get("cache_write_tokens")
-        or 0
+    cached_tokens = _tolerant_int(usage.get("cached_tokens"), evt.get("cached_tokens"))
+    cache_write_tokens = _tolerant_int(
+        usage.get("cache_write_tokens"), evt.get("cache_write_tokens")
     )
     prompt_cache_ttl = str(
         usage.get("prompt_cache_ttl")
@@ -395,7 +407,6 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     }
     ctx.update_budget_from_usage(usage_for_budget)
 
-    from ouroboros.utils import utc_now_iso, append_jsonl
     try:
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": evt.get("ts", utc_now_iso()),
@@ -438,12 +449,22 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
         runtime_sec = round(max(0.0, time.time() - started_at), 1) if started_at > 0 else None
+        # Stamp the project thread so the live heartbeat routes to the project
+        # panel (and not default-to-main); post-hoc bound tasks fall back to the
+        # binding. Heartbeats themselves carry no chat_id from the worker. A
+        # post-hoc bound task keeps its original (main) chat_id, so the binding
+        # must take PRECEDENCE (same order as _handle_send_message/_handle_log_event).
+        try:
+            _hb_chat_id = _bound_project_chat_id(ctx, task_id) or int(task.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            _hb_chat_id = 0
         try:
             ctx.bridge.push_log({
                 "ts": evt.get("ts", utc_now_iso()),
                 "type": "task_heartbeat",
                 "task_id": task_id,
                 "task_type": task.get("type"),
+                "chat_id": _hb_chat_id,
                 "phase": phase or meta.get("heartbeat_phase") or "running",
                 "runtime_sec": runtime_sec,
                 "subagent_event": evt.get("subagent_event", ""),
@@ -473,13 +494,16 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         fmt = str(evt.get("format") or "")
         is_progress = bool(evt.get("is_progress"))
         raw_ts = evt.get("ts")
+        task_id = str(evt.get("task_id") or "")
+        bound_chat = _bound_project_chat_id(ctx, task_id)
+        chat_id = bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
-            int(evt["chat_id"]),
+            chat_id,
             str(evt.get("text") or ""),
             log_text=(str(log_text) if isinstance(log_text, str) else None),
             fmt=fmt,
             is_progress=is_progress,
-            task_id=str(evt.get("task_id") or ""),
+            task_id=task_id,
             progress_meta=evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None,
             ts=(str(raw_ts) if raw_ts else None),
         )
@@ -545,7 +569,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             final_task_result = {}
 
     # Persist here so send_message reaches the UI before task_done collapses the card.
-    from ouroboros.utils import utc_now_iso, append_jsonl
     outcome_axes = normalize_outcome_axes({**evt, **(final_task_result if isinstance(final_task_result, dict) else {})})
     reason_code = final_task_result.get("reason_code") or evt.get("reason_code")
     artifact_status = final_task_result.get("artifact_status") or evt.get("artifact_status")
@@ -563,6 +586,13 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         "type": "task_done",
         "task_id": task_id,
         "task_type": task_type,
+        # Thread tag so the terminal card finalizes in its project panel.
+        "chat_id": int(
+            _bound_project_chat_id(ctx, task_id)
+            or evt.get("chat_id")
+            or (final_task_result.get("chat_id") if isinstance(final_task_result, dict) else 0)
+            or 0
+        ),
         "status": str(final_task_result.get("status") or evt.get("status") or ""),
         "outcome_axes": outcome_axes,
         "reason_code": reason_code,
@@ -588,7 +618,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to log task_done to events.jsonl", exc_info=True)
 
     if task_type == "evolution":
-        st = ctx.load_state()
         # Meaningful evolution work has non-trivial cost plus at least one round.
         # eff_* falls back to the persisted (reconstructed) result on abnormal
         # termination so a zeroed terminal event cannot understate the tally or
@@ -596,7 +625,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         cost = eff_cost
         rounds = eff_rounds
         try:
-            from supervisor.queue import _read_evolution_campaign, update_evolution_campaign_after_task
+            from supervisor.evolution_lifecycle import _read_evolution_campaign, update_evolution_campaign_after_task
 
             metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
             if not metadata and isinstance(evt.get("metadata"), dict):
@@ -644,29 +673,39 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         if replayed_evolution_terminal:
             pass
         elif not failed_by_axes and rounds >= 1:
-            st["evolution_consecutive_failures"] = 0
-            ctx.save_state(st)
+            from supervisor.state import update_state
+
+            update_state(lambda live: live.update(evolution_consecutive_failures=0))
         else:
-            failures = int(st.get("evolution_consecutive_failures") or 0) + 1
-            st["evolution_consecutive_failures"] = failures
-            ctx.save_state(st)
+            from supervisor.state import update_state
+
+            failures_box: Dict[str, int] = {}
+
+            def _bump_failures(live: Dict[str, Any]) -> None:
+                failures_box["n"] = int(live.get("evolution_consecutive_failures") or 0) + 1
+                live["evolution_consecutive_failures"] = failures_box["n"]
+
+            update_state(_bump_failures)
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
                     "ts": utc_now_iso(),
                     "type": "evolution_task_failure_tracked",
                     "task_id": task_id,
-                    "consecutive_failures": failures,
+                    "consecutive_failures": failures_box.get("n", 0),
                     "cost_usd": cost,
                     "rounds": rounds,
                 },
             )
         try:
-            cur = ctx.load_state()
-            if cur.get("post_task_autostop"):
-                cur["evolution_mode_enabled"] = False
-                cur["post_task_autostop"] = False
-                ctx.save_state(cur)
+            from supervisor.state import update_state
+
+            def _consume_autostop(live: Dict[str, Any]) -> None:
+                if live.get("post_task_autostop"):
+                    live["evolution_mode_enabled"] = False
+                    live["post_task_autostop"] = False
+
+            update_state(_consume_autostop)
         except Exception:
             log.debug("Post-task evolution autostop failed", exc_info=True)
 
@@ -710,14 +749,20 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
                         "artifact_status": str(effective_result.get("artifact_status") or ""),
                     },
                 )
-        ctx.RUNNING.pop(str(task_id), None)
-    if wid in ctx.WORKERS and ctx.WORKERS[wid].busy_task_id == task_id:
-        ctx.WORKERS[wid].busy_task_id = None
+    from supervisor.queue import _queue_lock
+
+    with _queue_lock:
+        if task_id:
+            ctx.RUNNING.pop(str(task_id), None)
+        if wid in ctx.WORKERS and ctx.WORKERS[wid].busy_task_id == task_id:
+            ctx.WORKERS[wid].busy_task_id = None
     ctx.persist_queue_snapshot(reason="task_done")
     try:
         ctx.bridge.push_log(task_done_event)
     except Exception:
-        log.debug("Failed to forward task_done to live logs", exc_info=True)
+        # Visible at WARNING: if this terminal-event forward fails, the task's
+        # live card may never finalize, so it must not be silently swallowed.
+        log.warning("Failed to forward task_done to live logs (card may not finalize)", exc_info=True)
 
     try:
         from pathlib import Path
@@ -1204,6 +1249,65 @@ def _resolve_subagent_constraint(
     return constraint, resolved, "external_workspace", ""
 
 
+def _handle_project_digest(evt: Dict[str, Any], ctx: Any) -> None:
+    """Surface a concise per-project cycle completion digest to consciousness.
+
+    Full project awareness (v6.32.0): the one identity already sees the project's
+    chat thread in its unified memory, so this is a crisp "task finished" summary
+    (project_id + full objective + outcome statuses), NOT an isolation boundary.
+    Per-cycle RAW internal facts stay in the per-project knowledge/journal store
+    (scoped tools); the единый agent decides what to do with the digest — backlog,
+    identity, or nothing (BIBLE P5).
+    """
+    pid = str(evt.get("project_id") or "").strip()
+    if not pid:
+        return
+    try:
+        from ouroboros.projects_registry import touch_project
+
+        touch_project(ctx.DRIVE_ROOT, pid)
+    except Exception:
+        log.debug("project_digest touch failed", exc_info=True)
+    try:
+        # Digest into the штаб's consciousness: carry the objective WHOLE (BIBLE P1
+        # — no silent/lossy clip of cognitive text). The one mind is aware of its
+        # project work in full; only raw per-cycle facts stay in the project store.
+        digest = (
+            f"Project '{pid}' task {str(evt.get('task_id') or '')} finished: "
+            f"execution={str(evt.get('execution_status') or 'unknown')}, "
+            f"objective={str(evt.get('objective_status') or 'not_evaluated')}. "
+            f"Goal: {str(evt.get('objective') or '')}"
+        )
+        consciousness = getattr(ctx, "consciousness", None)
+        if consciousness is not None:
+            consciousness.inject_observation(digest)
+    except Exception:
+        log.debug("project_digest consciousness injection failed", exc_info=True)
+
+
+def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> None:
+    """Spawn a first-class pooled owner task from a conversation-lane promote.
+
+    Unlike ``schedule_subagent`` the child is NOT a subagent: it is a normal
+    owner task (live card, canonical drive, project lease participation). The
+    conversation lane that emitted the event stays free.
+    """
+    from supervisor.workers import promote_chat_to_task
+
+    try:
+        promote_chat_to_task(evt, ctx)
+    except Exception:
+        log.warning("promote_chat_to_task event failed", exc_info=True)
+        ctx.append_jsonl(
+            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "promote_chat_to_task_failed",
+                "event_repr": repr(evt)[:500],
+            },
+        )
+
+
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
@@ -1522,7 +1626,7 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle evolution mode from LLM tool call."""
     enabled = bool(evt.get("enabled"))
     if enabled:
-        from supervisor.queue import evolution_block_reason
+        from supervisor.evolution_lifecycle import evolution_block_reason
 
         block = evolution_block_reason()
         if block:
@@ -1530,16 +1634,19 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(int(st["owner_chat_id"]), block)
             return
-    st = ctx.load_state()
-    st["evolution_mode_enabled"] = enabled
-    if enabled:
-        st["evolution_consecutive_failures"] = 0
-    # Symmetry with the owner /evolve path: an explicit toggle must not inherit a
-    # stale post-task one-shot autostop that would disable the campaign after one cycle.
-    st["post_task_autostop"] = False
-    ctx.save_state(st)
+    from supervisor.state import update_state
+
+    def _toggle_evolution(live: Dict[str, Any]) -> None:
+        live["evolution_mode_enabled"] = enabled
+        if enabled:
+            live["evolution_consecutive_failures"] = 0
+        # Symmetry with the owner /evolve path: an explicit toggle must not inherit a
+        # stale post-task one-shot autostop that would disable the campaign after one cycle.
+        live["post_task_autostop"] = False
+
+    st = update_state(_toggle_evolution)
     try:
-        from supervisor.queue import pause_evolution_campaign, start_evolution_campaign
+        from supervisor.evolution_lifecycle import pause_evolution_campaign, start_evolution_campaign
 
         if enabled:
             start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool")
@@ -1583,7 +1690,10 @@ def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
     """Send a photo to the owner's chat."""
     import base64 as b64mod
     try:
-        chat_id = int(evt.get("chat_id") or 0)
+        # Binding precedence (matches _handle_send_message/_handle_log_event): a
+        # post-hoc bound task keeps its original main chat_id, so its media must
+        # still route to the project panel.
+        chat_id = _bound_project_chat_id(ctx, evt.get("task_id")) or int(evt.get("chat_id") or 0)
         image_b64 = str(evt.get("image_base64") or "")
         caption = str(evt.get("caption") or "")
         mime = str(evt.get("mime") or "image/png")
@@ -1614,10 +1724,13 @@ def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
     """Send a video to the owner's chat."""
     import base64 as b64mod
     try:
+        # Binding precedence (matches the sibling handlers): a post-hoc bound
+        # task's media routes to its project panel, not the old main thread.
+        bound_chat = _bound_project_chat_id(ctx, evt.get("task_id"))
         raw_chat_id = evt.get("chat_id")
-        if raw_chat_id is None or raw_chat_id == "":
+        if not bound_chat and (raw_chat_id is None or raw_chat_id == ""):
             return
-        chat_id = int(raw_chat_id)
+        chat_id = bound_chat or int(raw_chat_id)
         video_b64 = str(evt.get("video_base64") or "")
         caption = str(evt.get("caption") or "")
         mime = str(evt.get("mime") or "video/mp4")
@@ -1646,7 +1759,6 @@ def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
     """Log owner injections so health checks can detect duplicate processing."""
-    from ouroboros.utils import utc_now_iso
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": evt.get("ts", utc_now_iso()),
@@ -1667,6 +1779,9 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         "ts": data.get("ts", utc_now_iso()),
         **data,
     }
+    bound_chat = _bound_project_chat_id(ctx, payload.get("task_id"))
+    if bound_chat:
+        payload["chat_id"] = bound_chat
     try:
         ctx.bridge.push_log(payload)
     except Exception:
@@ -1707,6 +1822,8 @@ EVENT_HANDLERS = {
     "promote_to_stable": _handle_promote_to_stable,
     "schedule_task": _handle_schedule_task,
     "schedule_subagent": _handle_schedule_task,
+    "promote_chat_to_task": _handle_promote_chat_to_task,
+    "project_digest": _handle_project_digest,
     "cancel_task": _handle_cancel_task,
     "send_photo": _handle_send_photo,
     "send_video": _handle_send_video,
@@ -1748,6 +1865,7 @@ def dispatch_event(evt: Dict[str, Any], ctx: Any) -> None:
 
     handler = EVENT_HANDLERS.get(event_type)
     if handler is None:
+        log.warning("No handler for worker event type %r — event dropped", event_type)
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
@@ -1762,6 +1880,10 @@ def dispatch_event(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         handler(evt, ctx)
     except Exception as e:
+        # Surface the failure with a full traceback. Previously this only wrote a
+        # repr(e) to supervisor.jsonl, so a crashing handler (e.g. an ImportError
+        # in a task_done/heartbeat handler) was invisible and left the UI stuck.
+        log.warning("Worker event handler %r failed: %s", event_type, e, exc_info=True)
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {

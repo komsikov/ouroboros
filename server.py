@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import socket
 
 import os
 import pathlib
@@ -112,18 +113,15 @@ def _restart_current_process(host: str, port: int) -> None:
     _restart_current_process_impl(host, port, repo_dir=REPO_DIR, log=log)
 
 from ouroboros.config import (
-    SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS,
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
 )
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
-    has_local_routing,
-    has_supervisor_provider,
+    has_startup_ready_provider,
     needs_local_model_autostart,
     setup_remote_if_configured,
     ws_heartbeat_loop,
 )
-from ouroboros.onboarding_wizard import build_onboarding_html
 
 _supervisor_ready = threading.Event()
 _supervisor_error: Optional[str] = None
@@ -153,7 +151,7 @@ def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
     elif requested_enabled and running:
         status = "running"
         detail = (
-            f"Background consciousness is idle between wakeups."
+            "Background consciousness is idle between wakeups."
             + (f" Next wakeup in {next_wakeup_sec}s." if next_wakeup_sec > 0 else "")
         )
     elif requested_enabled:
@@ -175,7 +173,7 @@ def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
 def _start_supervisor_if_needed(settings: dict) -> bool:
     """Start the supervisor once when runtime providers become available."""
     global _supervisor_thread, _supervisor_error
-    if not has_supervisor_provider(settings):
+    if not has_startup_ready_provider(settings):
         return False
     if _supervisor_thread and _supervisor_thread.is_alive():
         return False
@@ -188,6 +186,173 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
     )
     _supervisor_thread.start()
     return True
+
+
+def _route_project_chat_to_running_task(ctx: Any, chat_id: int, message: str) -> str:
+    """Steer a PROJECT chat message into its running pooled task's mailbox.
+
+    Multi-project (v6.32.0): a project thread with an ACTIVE pooled task
+    steers that task (the loop drains the mailbox every round). The MAIN chat
+    stays a free conversation lane — discussing or starting parallel work
+    never blocks on a running task. Returns the routed task id or "".
+
+    A chat is a project thread by REGISTRY membership, not a bare numeric
+    range — large external-transport (Telegram-style) chat ids must not be
+    misclassified and have their owner messages swallowed.
+    """
+    try:
+        from ouroboros.projects_registry import registered_project_chat_ids
+
+        if int(chat_id or 0) not in registered_project_chat_ids(ctx.DRIVE_ROOT):
+            return ""
+    except Exception:
+        return ""
+    try:
+        for tid, running in list(ctx.RUNNING.items()):
+            if not isinstance(running, dict):
+                continue
+            task_obj = running.get("task") if isinstance(running.get("task"), dict) else running
+            if int(task_obj.get("chat_id") or 0) != int(chat_id or 0):
+                # A post-hoc "Turn into project" task keeps its original (main)
+                # chat_id on the live object but belongs to this project thread;
+                # match it via the durable binding so follow-ups still steer it.
+                try:
+                    from ouroboros.projects_registry import project_chat_for_task
+
+                    if int(project_chat_for_task(ctx.DRIVE_ROOT, tid) or 0) != int(chat_id or 0):
+                        continue
+                except Exception:
+                    continue
+            if task_obj.get("_is_direct_chat"):
+                continue
+            if str(task_obj.get("delegation_role") or "") == "subagent":
+                continue
+            from ouroboros.owner_mailbox import write_owner_message
+
+            task_drive = str(task_obj.get("drive_root") or "") or str(ctx.DRIVE_ROOT)
+            write_owner_message(pathlib.Path(task_drive), message, str(tid))
+            return str(tid)
+    except Exception:
+        log.debug("Mailbox follow-up routing failed; falling back to direct lane", exc_info=True)
+    return ""
+
+
+def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
+    """Bind a chat frame's task_metadata to the thread's project via chat_id (the
+    SSOT). A registered project chat scopes to its OWN project, overriding any
+    client-supplied project_id; a non-project chat DROPS an untrusted client
+    project_id (work is scoped to a project only via the promote_chat_to_task tool,
+    never a raw ws frame). Prevents a stale/malformed frame (chat_id A + project_id
+    B) from rendering in A while loading/writing project B's memory."""
+    if project_id:
+        return {**(task_metadata or {}), "project_id": project_id}
+    if task_metadata and task_metadata.get("project_id"):
+        return {k: v for k, v in task_metadata.items() if k != "project_id"}
+    return task_metadata
+
+
+def _owner_binding_chat_id(ctx: Any, chat_id: int, is_external_transport: bool) -> int:
+    """The owner's canonical chat for owner-targeted notices (restart, supervisor
+    death, consciousness). External transports bind to their own chat; a WEB owner
+    always binds to MAIN (1), never a project panel — so if the first post-reset
+    web message lands in a project room, owner notices still reach main."""
+    if not is_external_transport and _project_id_for_registered_chat(ctx, chat_id):
+        return 1
+    try:
+        return int(chat_id or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
+    """Return the registered project id for a project chat_id, else ``""``.
+
+    NOT an isolation gate (full project awareness, v6.32.0): the one mind notices
+    EVERY human message via inject_observation, project rooms included. This just
+    classifies a chat as a project thread so the message is scoped to that project
+    (task_metadata.project_id) and routed to its panel. Includes ARCHIVED projects
+    so the classification stays consistent; archiving is a UI-visibility concern
+    only (web/app.js filters it).
+    """
+    try:
+        from ouroboros.projects_registry import list_projects
+
+        cid = int(chat_id or 0)
+        for project in list_projects(ctx.DRIVE_ROOT):
+            try:
+                if int(project.get("chat_id") or 0) == cid:
+                    return str(project.get("id") or "").strip()
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        log.debug("Project chat_id lookup failed", exc_info=True)
+    return ""
+
+
+def _enqueue_project_chat_task(
+    ctx: Any,
+    *,
+    chat_id: int,
+    project_id: str,
+    text: str,
+    image_data: Optional[tuple] = None,
+    task_constraint: Optional[dict] = None,
+    task_metadata: Optional[dict] = None,
+) -> str:
+    """Hybrid B+ escape hatch: a busy global direct-chat lane must not block a
+    project thread. Enqueue a normal project-scoped pooled task instead.
+
+    This keeps idle project chat conversational, while preserving actual
+    parallelism when the main direct lane is occupied. The task enters the
+    regular worker pool, carries the project chat_id, and is subject to the
+    existing one-writer project lease.
+    """
+    pid = str(project_id or "").strip()
+    body = str(text or "").strip()
+    if not pid or (not body and not image_data):
+        return ""
+    try:
+        from ouroboros.contracts.task_contract import attach_task_contract
+        from supervisor.state import budget_remaining, load_state
+
+        if budget_remaining(load_state()) <= 0:
+            ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.")
+            return ""
+        task_id = uuid.uuid4().hex[:8]
+        task = {
+            "id": task_id,
+            "type": "task",
+            "chat_id": int(chat_id or 0),
+            "project_id": pid,
+            "text": body or "(image attached)",
+            "description": body[:200] or "(image attached)",
+            "objective": body[:500] or "(image attached)",
+            "source": "project_chat_busy_fallback",
+            "metadata": {
+                **(task_metadata or {}),
+                "project_id": pid,
+                "direct_lane_busy_fallback": True,
+            },
+        }
+        if task_constraint:
+            task["task_constraint"] = dict(task_constraint)
+        if image_data:
+            task["image_base64"] = image_data[0]
+            task["image_mime"] = image_data[1]
+            if len(image_data) > 2 and image_data[2]:
+                task["image_caption"] = image_data[2]
+        attach_task_contract(task)
+        ctx.enqueue_task(task)
+        try:
+            from ouroboros.projects_registry import touch_project
+
+            touch_project(ctx.DRIVE_ROOT, pid)
+        except Exception:
+            log.debug("Busy project chat task touch_project failed", exc_info=True)
+        return task_id
+    except Exception:
+        log.debug("Busy project chat task enqueue failed", exc_info=True)
+    return ""
 
 
 def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
@@ -224,7 +389,6 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
 
         st = ctx.load_state()
         owner_id = st.get("owner_id")
-        owner_chat_id = st.get("owner_chat_id")
         lowered = text.strip().lower()
         is_slash_command = lowered.startswith("/")
         is_external_transport = source != "web"
@@ -232,10 +396,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
         # Global owner = primary chat for outbound notices (web on desktop, the
         # first transport on headless Colab). Bound once, on the first message.
         if owner_id is None and external_identity_present:
-            st["owner_id"] = user_id
-            st["owner_chat_id"] = chat_id
             owner_id = user_id
-            owner_chat_id = chat_id
 
         from supervisor.message_bus import log_chat
 
@@ -267,8 +428,15 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     "transport": transport,
                     "chat_id": chat_id,
                 })
-        st["last_owner_message_at"] = now_iso
-        ctx.save_state(st)
+        # Atomic owner-binding + activity stamp: the old load→(log/broadcast)→save
+        # span could overwrite concurrent budget/state writers with stale data.
+        def _stamp_owner_activity(live: dict) -> None:
+            if live.get("owner_id") is None and external_identity_present:
+                live["owner_id"] = user_id
+                live["owner_chat_id"] = _owner_binding_chat_id(ctx, chat_id, is_external_transport)
+            live["last_owner_message_at"] = now_iso
+
+        ctx.update_state(_stamp_owner_activity)
 
         if not text and not image_base64:
             continue
@@ -284,10 +452,13 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             owner_ext_id = st.get("owner_external_id")
             owner_ext_chat_id = st.get("owner_external_chat_id")
             if owner_ext_id is None:
-                st["owner_external_id"] = user_id
-                st["owner_external_chat_id"] = chat_id
-                st["owner_external_bound_at"] = now_iso
-                ctx.save_state(st)
+                def _bind_external_owner(live: dict) -> None:
+                    if live.get("owner_external_id") is None:
+                        live["owner_external_id"] = user_id
+                        live["owner_external_chat_id"] = chat_id
+                        live["owner_external_bound_at"] = now_iso
+
+                ctx.update_state(_bind_external_owner)
                 ctx.send_with_budget(chat_id, "✅ Owner chat registered. Send the command again to execute it.")
                 continue
             try:
@@ -355,7 +526,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.queue import evolution_block_reason
+                from supervisor.evolution_lifecycle import evolution_block_reason
 
                 block = evolution_block_reason()
                 if block:
@@ -370,7 +541,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             st2["post_task_autostop"] = False
             ctx.save_state(st2)
             try:
-                from supervisor.queue import pause_evolution_campaign, start_evolution_campaign
+                from supervisor.evolution_lifecycle import pause_evolution_campaign, start_evolution_campaign
 
                 if turn_on:
                     start_evolution_campaign(objective, source="owner_chat")
@@ -418,8 +589,35 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             status = status_text(ctx.WORKERS, ctx.PENDING, ctx.RUNNING, SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC)
             ctx.send_with_budget(chat_id, status)
         else:
+            project_id = _project_id_for_registered_chat(ctx, chat_id)
+            # Full project awareness (v6.32.0): the one mind notices EVERY human
+            # message, including in a project room — project history is part of its
+            # continuous awareness (BIBLE P1), not a separate isolated stream.
             ctx.consciousness.inject_observation(f"Message from my human: {log_text}")
+            task_metadata = _scoped_task_metadata(project_id, task_metadata)
+            routed_to_task = _route_project_chat_to_running_task(
+                ctx, chat_id, text or image_caption
+            )
+            if routed_to_task:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"📨 Forwarded to the running task {routed_to_task} "
+                    "(it will see this on its next round).",
+                )
+                continue
             agent = ctx.get_chat_agent()
+            if project_id and getattr(agent, "_busy", False):
+                queued_task = _enqueue_project_chat_task(
+                    ctx,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    text=text or image_caption,
+                    image_data=image_data,
+                    task_constraint=task_constraint,
+                    task_metadata=task_metadata,
+                )
+                if queued_task:
+                    continue
 
             def _run_constrained_or_resume(cid, txt, img, constraint, metadata, resume_consciousness: bool):
                 try:
@@ -488,7 +686,7 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
         ok, msg = git_ops_module.safe_restart(reason="bootstrap", unsynced_policy=policy)
         if not ok and policy == "rescue_and_block":
             try:
-                from supervisor.queue import pause_evolution_campaign
+                from supervisor.evolution_lifecycle import pause_evolution_campaign
                 from supervisor.state import load_state, save_state
 
                 st = load_state()
@@ -510,11 +708,55 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     return False, f"Local-dev import test failed (rc={import_result.get('returncode', -1)})"
 
 
+def _periodic_zombie_reconcile() -> None:
+    """Heal zombie 'running' records on a supervisor cadence.
+
+    A worker that died mid-review (crash / SIGKILL / manual stop) leaves
+    ``review_job.json`` at status=running forever in headless/no-UI runs, where
+    the boot and ``GET /api/extensions`` reconciles never fire; the same death
+    leaves ``task_results/<id>.json`` at running. Both reconciles are
+    liveness-gated (pid-dead / queue-empty + worker-boot evidence), so a live
+    review or task is never touched.
+    """
+    try:
+        from ouroboros.skill_review_runner import reconcile_stale_review_jobs
+        reconcile_stale_review_jobs(DATA_DIR)
+    except Exception:
+        log.debug("Periodic skill review-job reconcile failed", exc_info=True)
+    try:
+        from ouroboros.task_status import reconcile_orphaned_running_tasks
+        reconcile_orphaned_running_tasks(DATA_DIR)
+    except Exception:
+        log.debug("Periodic orphaned running-task reconcile failed", exc_info=True)
+    try:
+        from ouroboros.projects_registry import reconcile_projects
+        reconcile_projects(DATA_DIR)
+    except Exception:
+        log.debug("Project registry reconcile failed", exc_info=True)
+
+
 def _run_supervisor(settings: dict) -> None:
     """Initialize and run the supervisor loop. Called in a background thread."""
     global _supervisor_error, _supervisor_thread, _consciousness
 
     _apply_settings_to_env(settings)
+
+    # Supervisor revival (e.g. settings POST after a loop death) must not leak
+    # the previous generation: the old BackgroundConsciousness daemon thread
+    # would keep burning budget unreachable by /bg stop, and the cached direct
+    # chat agent stays bound to the OLD event queue (messages to a dead queue).
+    if _consciousness is not None:
+        try:
+            _consciousness.stop()
+        except Exception:
+            log.debug("Failed to stop previous consciousness instance", exc_info=True)
+        _consciousness = None
+    try:
+        from supervisor import workers as _workers_mod
+
+        _workers_mod._chat_agent = None
+    except Exception:
+        log.debug("Failed to reset cached chat agent", exc_info=True)
 
     try:
         from supervisor.message_bus import init as bus_init
@@ -533,7 +775,7 @@ def _run_supervisor(settings: dict) -> None:
             chat_bridge=bridge,
         )
 
-        from supervisor.state import init as state_init, init_state, load_state, save_state
+        from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
         from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed
         state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", 10.0)))
         init_state()
@@ -579,9 +821,12 @@ def _run_supervisor(settings: dict) -> None:
         persist_queue_snapshot(reason="startup")
         try:
             from ouroboros.headless import prune_headless_task_drives, prune_task_drives
+            from ouroboros.utils import sweep_stale_temp_files
 
             prune_report = prune_headless_task_drives(DATA_DIR)
             task_drive_report = prune_task_drives(DATA_DIR)
+            # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
+            sweep_stale_temp_files(DATA_DIR)
             if (
                 prune_report.get("pruned")
                 or prune_report.get("errors")
@@ -596,6 +841,14 @@ def _run_supervisor(settings: dict) -> None:
                 })
         except Exception:
             log.debug("Headless task drive prune failed", exc_info=True)
+        try:
+            from ouroboros.process_custody import reap_orphaned_processes
+
+            reaped = reap_orphaned_processes(DATA_DIR)
+            if reaped:
+                log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
+        except Exception:
+            log.debug("Process custody startup reap failed", exc_info=True)
 
         try:
             from ouroboros import subagent_worktrees
@@ -669,6 +922,7 @@ def _run_supervisor(settings: dict) -> None:
             bridge=bridge, WORKERS=WORKERS, PENDING=PENDING, RUNNING=RUNNING,
             MAX_WORKERS=max_workers,
             send_with_budget=send_with_budget, load_state=load_state, save_state=save_state,
+            update_state=update_state,
             update_budget_from_usage=update_budget_from_usage, append_jsonl=append_jsonl,
             enqueue_task=enqueue_task, cancel_task_by_id=cancel_task_by_id,
             queue_deep_self_review_task=queue_deep_self_review_task, persist_queue_snapshot=persist_queue_snapshot,
@@ -691,6 +945,8 @@ def _run_supervisor(settings: dict) -> None:
 
     offset = 0
     crash_count = 0
+    _last_custody_reap = [time.time()]
+    _last_review_job_reconcile = [time.time()]
     while not _restart_requested.is_set():
         try:
             rotate_chat_log_if_needed(DATA_DIR)
@@ -716,15 +972,37 @@ def _run_supervisor(settings: dict) -> None:
                 check_scheduled_tasks()
             except Exception:
                 log.warning("Scheduled task check failed", exc_info=True)
-            try:
-                from ouroboros.post_task_evolution import apply_pending_request
-                from supervisor import state as _pte_state
+            # Periodic custody reap: catches task-scoped processes whose owning
+            # task finished (or was SIGKILLed) within this server generation.
+            if time.time() - _last_custody_reap[0] > 600:
+                _last_custody_reap[0] = time.time()
+                try:
+                    from ouroboros.process_custody import reap_orphaned_processes
+                    from supervisor.queue import RUNNING as _running_tasks
 
-                apply_pending_request(_pte_state.DRIVE_ROOT)
-            except Exception:
-                log.debug("Post-task evolution apply failed", exc_info=True)
-            enqueue_evolution_task_if_needed()
-            assign_tasks()
+                    reap_orphaned_processes(
+                        DATA_DIR, running_task_ids=set(_running_tasks.keys()),
+                    )
+                except Exception:
+                    log.debug("Periodic custody reap failed", exc_info=True)
+            if time.time() - _last_review_job_reconcile[0] > 300:
+                _last_review_job_reconcile[0] = time.time()
+                _periodic_zombie_reconcile()
+            # Loop-tick restart drain (no sleep, events keep flowing): while
+            # draining a deferred restart, skip starting new work the restart
+            # deadline would immediately chop (evolution / pending project tasks).
+            if not _check_pending_restart_drain(_event_ctx):
+                try:
+                    from ouroboros.post_task_evolution import apply_pending_request
+                    from supervisor import state as _pte_state
+
+                    apply_pending_request(_pte_state.DRIVE_ROOT)
+                except Exception:
+                    log.debug("Post-task evolution apply failed", exc_info=True)
+                enqueue_evolution_task_if_needed()
+                assign_tasks()
+            if _restart_requested.is_set():
+                break  # restart just triggered (drain done) — don't intake new bridge work as we exit
             persist_queue_snapshot(reason="main_loop")
 
             offset = _process_bridge_updates(bridge, offset, _event_ctx)
@@ -736,26 +1014,119 @@ def _run_supervisor(settings: dict) -> None:
             crash_count += 1
             log.error("Supervisor loop crash #%d: %s", crash_count, exc, exc_info=True)
             if crash_count >= 3:
-                log.critical("Supervisor exceeded max retries.")
+                # Visible death: previously the loop returned with
+                # _supervisor_ready still set and no _supervisor_error, so
+                # tasks silently stopped being assigned with a healthy-looking
+                # /api/state. Record the failure and tell the owner.
+                _supervisor_error = f"Supervisor loop died after 3 consecutive crashes: {exc}"
+                _supervisor_ready.clear()
+                log.critical("Supervisor exceeded max retries: %s", _supervisor_error)
+                try:
+                    st = load_state()
+                    if st.get("owner_chat_id"):
+                        send_with_budget(
+                            int(st["owner_chat_id"]),
+                            "🛑 Supervisor loop died after repeated crashes; tasks are no "
+                            "longer being assigned. Saving settings or restarting the app "
+                            f"will revive it. Last error: {exc}",
+                        )
+                except Exception:
+                    log.debug("Failed to notify owner about supervisor death", exc_info=True)
                 return
             time.sleep(min(30, 2 ** crash_count))
     _supervisor_thread = None
 
 
+# Deferred restart-drain state (multi-project, v6.32.0). The drain MUST NOT
+# sleep on the supervisor loop thread (it is the only thread that processes
+# heartbeats / task_done and shrinks RUNNING). Instead a restart with live
+# tasks is recorded here and re-checked every loop tick, so events keep
+# flowing and the drain actually observes tasks finishing.
+_pending_restart: Dict[str, Any] = {}
+
+
+def _live_running_task_ids(ctx: Any) -> list:
+    """RUNNING task ids with a fresh heartbeat — structured facts only.
+
+    Heartbeat-staleness reuses the swarm SSOT getter
+    (``config.get_plan_task_swarm_heartbeat_stale_sec``) so there is one
+    definition of "a worker is still alive", not a scattered magic cutoff.
+    """
+    from ouroboros.config import get_plan_task_swarm_heartbeat_stale_sec
+
+    stale_sec = get_plan_task_swarm_heartbeat_stale_sec()
+    now = time.time()
+    live = []
+    for tid, meta in dict(ctx.RUNNING or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            hb = float(meta.get("last_heartbeat_at") or 0.0)
+        except (TypeError, ValueError):
+            hb = 0.0
+        if hb and (now - hb) < stale_sec:
+            live.append(str(tid))
+    return live
+
+
 def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
-    """Handle agent restart request via graceful shutdown + exit(42)."""
+    """Handle agent restart request: drain live tasks across loop ticks, then
+    graceful shutdown + exit(42). Never sleeps on the dispatch thread."""
     st = ctx.load_state()
     if st.get("owner_chat_id"):
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"♻️ Restart requested by agent: {evt.get('reason')}",
         )
+    from ouroboros.config import get_restart_drain_max_sec
+
+    max_wait = get_restart_drain_max_sec()
+    live = _live_running_task_ids(ctx) if max_wait > 0 else []
+    if live:
+        # Defer: re-checked each tick by _check_pending_restart_drain so the
+        # loop keeps draining events (heartbeats advance, RUNNING shrinks).
+        _pending_restart.clear()
+        _pending_restart.update({
+            "reason": str(evt.get("reason") or "agent_restart_request"),
+            "deadline": time.time() + min(max_wait, 1800),
+        })
+        if st.get("owner_chat_id"):
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                f"⏳ Restart drain: waiting up to {max_wait}s for running task(s) "
+                f"{', '.join(sorted(live))} to finish.",
+            )
+        return
+    _perform_supervisor_restart(ctx)
+
+
+def _check_pending_restart_drain(ctx: Any) -> bool:
+    """Loop-tick hook: complete a deferred restart once tasks drain or the
+    deadline passes (proceeds fail-closed). Returns True while STILL draining, so
+    the loop can skip starting new work that the restart would immediately chop."""
+    if not _pending_restart:
+        return False
+    live = _live_running_task_ids(ctx)
+    if live and time.time() < float(_pending_restart.get("deadline") or 0.0):
+        return True  # keep draining — events still flow each tick
+    _pending_restart.clear()
+    _perform_supervisor_restart(ctx)
+    # Still "quiescing" this tick: _perform_supervisor_restart sets up the exit
+    # (or fail-closed pauses) and returns to the loop — the process exits on the
+    # next `while not _restart_requested` check. Returning True keeps the caller
+    # from starting new enqueue/assign work on this final pre-exit tick.
+    return True
+
+
+def _perform_supervisor_restart(ctx: Any) -> None:
+    """Graceful shutdown + exit(42) (the post-drain tail; never sleeps)."""
+    st = ctx.load_state()
     ok, msg = ctx.safe_restart(
         reason="agent_restart_request", unsynced_policy="rescue_and_block",
     )
     if not ok:
         try:
-            from supervisor.queue import pause_evolution_campaign
+            from supervisor.evolution_lifecycle import pause_evolution_campaign
 
             st["evolution_mode_enabled"] = False
             ctx.save_state(st)
@@ -894,7 +1265,19 @@ async def lifespan(app):
     except Exception:
         log.warning("Native skills bootstrap failed", exc_info=True)
 
-    if has_supervisor_provider(settings):
+    # Boot-reconcile the project registry BEFORE /api/state and context-building
+    # can rely on registered_project_chat_ids (the multi-project isolation SSOT):
+    # register any pre-existing data/projects/<id>/ store whose row is missing, so
+    # an inherited project's raw chat is partitioned from turn one (not only after
+    # the 300s periodic tick). Idempotent and never prunes.
+    try:
+        if not pytest_default_real_data_dir:
+            from ouroboros.projects_registry import reconcile_projects
+            reconcile_projects(lifespan_drive_root)
+    except Exception:
+        log.warning("Project registry boot reconcile failed", exc_info=True)
+
+    if has_startup_ready_provider(settings):
         _start_supervisor_if_needed(settings)
     else:
         _supervisor_ready.set()
@@ -923,6 +1306,18 @@ async def lifespan(app):
         init_global_supervisor(lifespan_drive_root)
         host_service_app = create_host_service_app(lifespan_drive_root)
         host_port = host_service_port()
+        # Probe the port first: uvicorn's Server.startup() calls sys.exit(1) on a
+        # bind error, and SystemExit raised inside an asyncio task escapes
+        # run_forever and takes down the WHOLE main server (a stale prior
+        # instance still holding the port is exactly the realistic trigger).
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _probe:
+            _probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                _probe.bind((DEFAULT_HOST_SERVICE_HOST, host_port))
+            except OSError as bind_exc:
+                raise RuntimeError(
+                    f"Host Service port {host_port} is busy: {bind_exc}"
+                ) from bind_exc
         host_service_config = uvicorn.Config(
             host_service_app,
             host=DEFAULT_HOST_SERVICE_HOST,
@@ -947,6 +1342,17 @@ async def lifespan(app):
             reconcile_stale_review_jobs(lifespan_drive_root)
     except Exception:
         log.warning("Stale skill-review reconciliation at startup failed", exc_info=True)
+
+    # Durably finalize orphaned RUNNING task results (worker died / SIGKILL /
+    # manual stop) so a zombie cannot masquerade as still-running across restart.
+    # Liveness-gated inside the projection; never touches a still-live task.
+    try:
+        from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+        if not pytest_default_real_data_dir:
+            reconcile_orphaned_running_tasks(lifespan_drive_root)
+    except Exception:
+        log.warning("Orphaned running-task reconciliation at startup failed", exc_info=True)
 
     # Reload enabled+reviewed extensions across restarts.
     try:
@@ -1090,6 +1496,14 @@ app.app.state.default_port = DEFAULT_PORT  # type: ignore[attr-defined]
 app.app.state.start_supervisor_if_needed = _start_supervisor_if_needed  # type: ignore[attr-defined]
 
 
+_ACTUAL_BOUND_PORT: Optional[int] = None
+
+
+def _actual_bound_port() -> int:
+    """Port the server actually bound (set in main(); DEFAULT_PORT before that)."""
+    return _ACTUAL_BOUND_PORT if _ACTUAL_BOUND_PORT else DEFAULT_PORT
+
+
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
     try:
@@ -1131,9 +1545,17 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
             force_kill_pid(child.pid)
         except (ProcessLookupError, PermissionError):
             pass
+        # Reap the Process object so it does not linger as a zombie / keep
+        # active_children non-empty if the main process exits before it dies.
+        try:
+            child.join(timeout=2)
+        except Exception:
+            pass
     if port_sweep:
-        kill_process_on_port(DEFAULT_PORT)
-        kill_process_on_port(8766)
+        # Sweep the ACTUALLY bound port (find_free_port may have moved off
+        # DEFAULT_PORT); the old hardcoded 8765/8766 pair could kill an
+        # unrelated process on a custom-port install.
+        kill_process_on_port(_actual_bound_port())
     try:
         from ouroboros.extension_companion import panic_kill_all
         from ouroboros.gateway.host_service import host_service_port
@@ -1163,6 +1585,8 @@ def main() -> int:
     actual_port = find_free_port(args.host, args.port)
     if actual_port != args.port:
         log.info("Port %d busy on %s, using %d instead", args.port, args.host, actual_port)
+    global _ACTUAL_BOUND_PORT
+    _ACTUAL_BOUND_PORT = actual_port
     write_port_file(PORT_FILE, actual_port)
     log.info("Starting Ouroboros server on %s:%d", args.host, actual_port)
     config = uvicorn.Config(

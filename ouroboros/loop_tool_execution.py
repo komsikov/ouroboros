@@ -95,6 +95,41 @@ def _tool_correlation(tools: ToolRegistry) -> Dict[str, Any]:
     return dict(meta) if isinstance(meta, dict) else {}
 
 
+def _tool_task_metadata(tools: ToolRegistry) -> Dict[str, Any]:
+    ctx = getattr(tools, "_ctx", None)
+    meta = getattr(ctx, "task_metadata", {}) if ctx is not None else {}
+    data = dict(meta) if isinstance(meta, dict) else {}
+    for key in ("parent_task_id", "root_task_id", "delegation_role"):
+        if data.get(key):
+            continue
+        value = getattr(ctx, key, "") if ctx is not None else ""
+        if value:
+            data[key] = value
+    if ctx is not None and getattr(ctx, "task_depth", None) is not None:
+        data.setdefault("task_depth", getattr(ctx, "task_depth"))
+    if ctx is not None and getattr(ctx, "budget_drive_root", ""):
+        data.setdefault("budget_drive_root", getattr(ctx, "budget_drive_root"))
+    return data
+
+
+def _append_tool_log(tools: ToolRegistry, drive_logs: pathlib.Path, payload: Dict[str, Any]) -> None:
+    meta = _tool_task_metadata(tools)
+    for key in ("parent_task_id", "root_task_id", "delegation_role", "task_depth"):
+        if meta.get(key) not in (None, ""):
+            payload[key] = meta.get(key)
+    append_jsonl(drive_logs / "tools.jsonl", payload)
+    root = str(meta.get("budget_drive_root") or "").strip()
+    if not root:
+        return
+    candidate = pathlib.Path(root).resolve(strict=False) / "logs" / "tools.jsonl"
+    try:
+        if candidate.resolve(strict=False) == (pathlib.Path(drive_logs) / "tools.jsonl").resolve(strict=False):
+            return
+    except Exception:
+        pass
+    append_jsonl(candidate, payload)
+
+
 def _with_correlation(payload: Dict[str, Any], correlation: Dict[str, Any], *, tool_call_id: str = "") -> Dict[str, Any]:
     out = dict(payload)
     for key in ("execution_id", "round_id", "llm_call_id"):
@@ -265,6 +300,11 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     # late ARTIFACT_OUTPUTS marker (e.g. a stopped service after a long log tail).
     if not is_error and "ARTIFACT_OUTPUTS" in text:
         meta["artifact_registered"] = True
+    # Same full-result capture for the Consilium force-plan gate: the review
+    # aggregate marker sits at the END of a long plan_task result, far past the
+    # 700-char trace preview the gate used to substring-match against.
+    if fn_name == "plan_task" and not is_error and "## Plan Review Results" in text and "AGGREGATE:" in text:
+        meta["plan_review_aggregate"] = True
     exit_match = _EXIT_CODE_RE.search(text)
     if exit_match:
         try:
@@ -398,7 +438,7 @@ def _execute_single_tool(
     except Exception:
         log.debug("Failed to persist tool observability payload", exc_info=True)
 
-    append_jsonl(drive_logs / "tools.jsonl", _with_correlation({
+    _append_tool_log(tools, drive_logs, _with_correlation({
         "ts": utc_now_iso(), "type": "tool_call", "tool": fn_name, "task_id": task_id,
         "args": args_for_log,
         "result_preview": sanitize_tool_result_for_log(truncate_for_log(result, 2000)),

@@ -79,8 +79,9 @@ def _counter_due(drive_root: pathlib.Path, k: int) -> bool:
         n = 0
     n += 1
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"n": n}), encoding="utf-8")
+        from ouroboros.utils import atomic_write_json
+
+        atomic_write_json(path, {"n": n})
     except Exception:
         pass
     return (n % max(1, k)) == 0
@@ -114,10 +115,13 @@ _DECISION_PROMPT = """You decide whether Ouroboros should run ONE reviewed self-
 [CURRENT IMPROVEMENT BACKLOG]
 {backlog}
 
+[SOLVE-CAPABILITY HISTORY — what past evolution cycles actually landed]
+{capability}
+
 Return ONLY a JSON object:
 {{"promote": true|false, "objective": "<one concrete, self-contained improvement to Ouroboros's own code/process; empty if not promoting>", "requires_plan_review": true|false, "backlog_id": "<id if this maps to a backlog item, else empty>"}}
 
-Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog. If nothing is clearly worthwhile, return promote=false. {force_note}"""
+Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. If nothing is clearly worthwhile, return promote=false. {force_note}"""
 
 
 def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional[Dict[str, Any]],
@@ -129,29 +133,40 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
     # omission-note truncation helper so the model sees that content was capped.
     reflection = truncate_review_artifact(str((reflection_entry or {}).get("reflection") or ""), 1500)
     backlog = truncate_review_artifact(_backlog_digest(drive_root), 3000)
+    try:
+        from ouroboros.evolution_checkpoints import build_solve_capability_digest
+        capability = truncate_review_artifact(build_solve_capability_digest(drive_root), 2000)
+    except Exception:
+        capability = ""
     force_note = (
         "The cadence already decided WHEN to evolve; choose the single most valuable "
         "objective and set promote=true unless the backlog is empty/irrelevant."
         if force else ""
     )
     prompt = _DECISION_PROMPT.format(
-        reflection=reflection or "(none)", backlog=backlog or "(empty)", force_note=force_note,
+        reflection=reflection or "(none)", backlog=backlog or "(empty)",
+        capability=capability or "(no evolution-cycle history yet)", force_note=force_note,
     )
     try:
-        from ouroboros.config import get_light_model
+        from ouroboros.config import SETTINGS_DEFAULTS
         from ouroboros.llm import LLMClient
         from ouroboros.llm_observability import chat_observed
 
         client = llm_client or LLMClient()
+        # Main-slot chooser (plan 5C): picking the next evolution objective is a
+        # high-leverage cognitive decision, not a cheap-lane formatting call.
+        chooser_model = str(
+            os.environ.get("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+        ).strip()
         resp, usage = chat_observed(
             client,
             drive_root=drive_root,
             task_id=str(task.get("id") or "post_task_evolution"),
             call_type="post_task_evolution_decision",
             messages=[{"role": "user", "content": prompt}],
-            model=get_light_model(),
-            reasoning_effort="low",
-            max_tokens=2048,
+            model=chooser_model,
+            reasoning_effort="medium",
+            max_tokens=8192,
         )
         if usage:
             try:
@@ -188,12 +203,11 @@ def _write_request(drive_root: pathlib.Path, decision: Dict[str, Any], task: Dic
         "origin_task_id": str(task.get("id") or ""),
     }
     path = drive_root / _REQUEST_REL
-    path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic publish: the supervisor polls every tick, so a partial write must
     # never be observable (else it could parse-fail and drop the signal).
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(req, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    from ouroboros.utils import atomic_write_json
+
+    atomic_write_json(path, req)
 
 
 def maybe_promote(env: Any, task: Dict[str, Any], reflection_entry: Optional[Dict[str, Any]],
@@ -271,8 +285,8 @@ def apply_pending_request(drive_root: Any) -> bool:
             _safe_unlink(path)
             return False
 
-        from supervisor.queue import evolution_block_reason, start_evolution_campaign
-        from supervisor.state import load_state, save_state
+        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
+        from supervisor.state import load_state
 
         if evolution_block_reason():  # light runtime mode, etc.
             _safe_unlink(path)
@@ -282,6 +296,11 @@ def apply_pending_request(drive_root: Any) -> bool:
             # Evolution requires an owner-bound chat; without it the cycle could
             # never run. Drop the stale request rather than leaking it.
             _safe_unlink(path)
+            return False
+        if bool(st.get("evolution_mode_enabled")):
+            # A campaign is already enabled (owner-driven or a previous
+            # promotion). Activating another would hijack its objective and
+            # clear its failure counter; leave the request for a later tick.
             return False
         # Per-window budget floor (V4 envelope): if configured, do not start a
         # post-task cycle unless at least that much budget remains.
@@ -319,18 +338,21 @@ def apply_pending_request(drive_root: Any) -> bool:
                 backlog_id = ""
         if backlog_id:
             try:
-                from supervisor.queue import _read_evolution_campaign, _write_evolution_campaign
+                from supervisor.evolution_lifecycle import _read_evolution_campaign, _write_evolution_campaign
 
                 camp = _read_evolution_campaign()
                 camp["post_task_backlog_id"] = backlog_id
                 _write_evolution_campaign(camp)
             except Exception:
                 pass
-        st = load_state()
-        st["evolution_mode_enabled"] = True
-        st["evolution_consecutive_failures"] = 0
-        st["post_task_autostop"] = True
-        save_state(st)
+        from supervisor.state import update_state
+
+        def _activate_one_shot(live: dict) -> None:
+            live["evolution_mode_enabled"] = True
+            live["evolution_consecutive_failures"] = 0
+            live["post_task_autostop"] = True
+
+        update_state(_activate_one_shot)
         _safe_unlink(path)
         log.info("post_task_evolution: promotion applied -> gated evolution campaign activated")
         return True

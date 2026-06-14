@@ -30,7 +30,7 @@ import json
 import queue
 import types
 import unittest
-from unittest.mock import MagicMock, patch, call as mock_call
+from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def _make_fake_registry(messages, pending_compaction=None):
 
 def _run_loop(messages, *, use_local=False, pending_compaction=None,
               rounds_before_stop=1, checkpoint_on_round=None,
-              checkpoint_persist_ok=True):
+              checkpoint_persist_ok=True, model="test-model"):
     """
     Drive run_llm_loop with mocked LLM and tools.
 
@@ -120,7 +120,8 @@ def _run_loop(messages, *, use_local=False, pending_compaction=None,
 
     def fake_llm_call(llm, msgs, model, tools, effort,
                       max_retries, drive_logs, task_id, round_idx,
-                      event_queue, accum, task_type, use_local=False):
+                      event_queue, accum, task_type, use_local=False,
+                      deadline_ts=None):
         call_count[0] += 1
         if call_count[0] < rounds_before_stop:
             # Return a tool-calling response to keep the loop alive
@@ -147,13 +148,13 @@ def _run_loop(messages, *, use_local=False, pending_compaction=None,
 
     fake_registry = _make_fake_registry(messages, pending_compaction)
     fake_llm = MagicMock()
-    fake_llm.default_model.return_value = "test-model"
+    fake_llm.default_model.return_value = model
 
     env_patch = {"USE_LOCAL_MAIN": "1" if use_local else ""}
 
     with patch.object(loop_mod, "compact_tool_history_llm", side_effect=fake_compact), \
          patch.object(loop_mod, "call_llm_with_retry", side_effect=fake_llm_call), \
-         patch.object(loop_mod, "_drain_incoming_messages", return_value=None), \
+         patch.object(loop_mod, "_drain_incoming_messages", return_value={}), \
          patch.object(loop_mod, "_maybe_inject_self_check", side_effect=fake_self_check), \
          patch.object(loop_mod, "_persist_compaction_checkpoint", return_value=checkpoint_persist_ok), \
          patch.object(loop_mod, "seal_task_transcript", return_value=None), \
@@ -194,14 +195,14 @@ class TestEstimateMessagesChars(unittest.TestCase):
         self.assertEqual(_emc(msgs), expected)
 
     def test_multipart_image_url_block_counted(self):
-        """Non-text multipart blocks (image_url) must be fully counted."""
+        """image_url blocks count as the fixed vision-token equivalent (v6.26.0)."""
+        from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+
         block = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 100}}
         msgs = [_msg("user", [block])]
         result = _emc(msgs)
-        # Must be substantially more than just len("") = 0
-        self.assertGreater(result, 100,
-            "image_url block must be counted in size estimate")
-        self.assertEqual(result, len(json.dumps(block, ensure_ascii=False)))
+        self.assertGreater(result, 100, "image_url block must be counted in size estimate")
+        self.assertEqual(result, IMAGE_BLOCK_CHAR_EQUIVALENT)
 
     def test_tool_calls_counted(self):
         tc = [{"id": "t1", "function": {"name": "foo", "arguments": "{}"}}]
@@ -242,14 +243,19 @@ class TestCompactionPolicyRemote(unittest.TestCase):
             "Remote mode should not compact with small context over 13 rounds")
 
     def test_emergency_compaction_fires_when_large_context(self):
-        """Remote: emergency fires when _estimate_messages_chars > 1.2M."""
+        """Remote: emergency fires when _estimate_messages_chars > 1.2M.
+
+        keep_recent adapts to the span count (min(50, max(6, spans//2)));
+        the old fixed 50 silently no-opped whenever the oversized transcript
+        had <= 50 rounds — exactly the emergency case.
+        """
         messages = _make_tool_rounds(5, content_size=50)
         # Add a huge message to push size over threshold
         messages.append({"role": "user", "content": "x" * 1_300_000})
         calls = _run_loop(messages, use_local=False, rounds_before_stop=1)
         self.assertTrue(
-            any(c["keep_recent"] == 50 for c in calls),
-            "Emergency compaction (keep_recent=50) must fire at >1.2M chars",
+            any(c["keep_recent"] <= 6 for c in calls),
+            "Emergency compaction must fire at >1.2M chars with keep_recent below the span count",
         )
 
     def test_emergency_fires_on_checkpoint_round(self):
@@ -260,25 +266,54 @@ class TestCompactionPolicyRemote(unittest.TestCase):
         calls = _run_loop(messages, use_local=False, rounds_before_stop=1,
                           checkpoint_on_round=1)
         self.assertTrue(
-            any(c["keep_recent"] == 50 for c in calls),
+            any(c["keep_recent"] <= 6 for c in calls),
             "Emergency compaction must be unconditional — not suppressed by checkpoint",
         )
 
     def test_emergency_counts_image_url_blocks(self):
-        """image_url multipart blocks must be counted by the emergency guard."""
+        """image_url blocks count as a FIXED token equivalent (v6.26.0): vision
+        models bill per tile, so one image must never look like ~300K tokens
+        and permanently wedge emergency compaction."""
+        from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+
         big_image_block = {
             "type": "image_url",
             "image_url": {"url": "data:image/png;base64," + "A" * 1_300_000},
         }
         messages = [{"role": "user", "content": [big_image_block]}]
         size = _emc(messages)
-        self.assertGreater(size, 1_200_000,
-            "_estimate_messages_chars must count image_url blocks in size")
+        self.assertEqual(size, IMAGE_BLOCK_CHAR_EQUIVALENT,
+            "an image block must count as the fixed equivalent, not base64 length")
         calls = _run_loop(messages, use_local=False, rounds_before_stop=1)
-        self.assertTrue(
+        self.assertFalse(
             any(c["keep_recent"] == 50 for c in calls),
-            "Emergency compaction must fire when image_url content pushes size over threshold",
+            "ONE image must NOT trigger emergency compaction anymore",
         )
+
+    def test_window_derived_emergency_fires_below_profile_constant(self):
+        """A2: a KNOWN 200K-window remote model (anthropic family) tightens the
+        max-mode emergency trigger to window*4*0.6 = 480K chars — a transcript
+        that the fixed 1.2M constant would have let overflow the provider."""
+        messages = _make_tool_rounds(5, content_size=50)
+        messages.append({"role": "user", "content": "x" * 500_000})  # 480K < size < 1.2M
+        calls = _run_loop(messages, use_local=False, rounds_before_stop=1,
+                          model="anthropic/claude-opus-4-8")
+        self.assertTrue(
+            any(c["keep_recent"] <= 6 for c in calls),
+            "Emergency compaction must fire at the window-derived threshold for a 200K-window model",
+        )
+
+    def test_window_derivation_never_raises_profile_constant(self):
+        """A2 floor: a 1M-window model keeps the 1.2M profile ceiling (min());
+        an unknown model keeps the old behavior entirely."""
+        for model in ("google/gemini-3.5-flash", "unknown/mystery-model"):
+            messages = _make_tool_rounds(5, content_size=50)
+            messages.append({"role": "user", "content": "x" * 500_000})
+            calls = _run_loop(messages, use_local=False, rounds_before_stop=1, model=model)
+            self.assertEqual(
+                [c for c in calls if c["keep_recent"] <= 6], [],
+                f"500K chars must NOT trigger max-mode emergency for {model}",
+            )
 
     def test_emergency_compaction_skips_when_checkpoint_persist_fails(self):
         """Compaction is fail-closed: pre-compaction transcript must be durable."""
@@ -357,6 +392,34 @@ class TestCompactionPolicyLocal(unittest.TestCase):
         self.assertEqual(
             routine_calls, [],
             "With only ~10 messages after 7 rounds, local compaction must NOT fire",
+        )
+
+
+# ===========================================================================
+# 3b. Small-window remote — routine compaction (A3)
+# ===========================================================================
+
+class TestCompactionPolicySmallWindowRemote(unittest.TestCase):
+
+    def test_small_window_remote_gets_routine_compaction_in_max_mode(self):
+        """A3: a 200K-window remote model gets ROUTINE compaction (like local /
+        low) even in max context mode — it cannot rely on emergency alone."""
+        messages = _make_tool_rounds(25, content_size=10)  # 50 messages
+        calls = _run_loop(messages, use_local=False, rounds_before_stop=8,
+                          model="anthropic/claude-opus-4-8")
+        self.assertTrue(
+            any(c["keep_recent"] == 20 for c in calls),
+            "Routine compaction must fire for a small-window remote model in max mode",
+        )
+
+    def test_big_window_remote_keeps_no_routine_compaction(self):
+        """1M-window remote models keep the cache-friendly max-mode behavior."""
+        messages = _make_tool_rounds(25, content_size=10)
+        calls = _run_loop(messages, use_local=False, rounds_before_stop=8,
+                          model="openai/gpt-5.5")
+        self.assertEqual(
+            [c for c in calls if c["keep_recent"] == 20], [],
+            "Routine compaction must stay off for big-window remote models in max mode",
         )
 
 

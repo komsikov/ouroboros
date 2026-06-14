@@ -33,11 +33,66 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # non-blocking skip gate leaves headroom for default 1M-context reviewer models.
 REVIEW_PROMPT_TOKEN_BUDGET = 920_000
 
+# Tokenizer-density calibration shared by the review surfaces (scope review,
+# deep self-review). estimate_tokens (chars/4) tracks GPT-style tokenizers
+# within each surface's fixed headroom margin, but Claude-family tokenizers cut
+# code-heavy packs at ~2.5 chars/token: a real scope pack estimated at 739,508
+# tokens measured 1,166,914 REAL tokens (1.58x) and drew a deterministic 400
+# "prompt is too long: > 1,000,000 maximum" from every Anthropic upstream.
+# The calibration sizes the PROMPT for the configured reviewer's real
+# tokenizer — it never changes the reviewer model or a surface's window floor.
+CLAUDE_REAL_TOKENS_PER_ESTIMATED = 1.65  # measured 1.58 on code + margin
+
+
+def is_claude_family_model(model_id: str) -> bool:
+    """Whether a configured model id resolves to a Claude-family tokenizer.
+
+    "fable"/"mythos" cover bare Anthropic 5th-gen aliases configured without a
+    provider prefix (e.g. a Claude Code-style "fable" slot value).
+    """
+    low = str(model_id or "").strip().lower().lstrip("~")
+    return any(marker in low for marker in ("anthropic", "claude", "fable", "mythos"))
+
+
+def calibrated_input_token_limit(
+    model_id: str,
+    *,
+    context_window: int,
+    output_reserve: int,
+    tokenizer_margin: int,
+    budget_cap: int = REVIEW_PROMPT_TOKEN_BUDGET,
+) -> int:
+    """Model-family-aware estimated-token INPUT cap inside ``context_window``.
+
+    GPT-family: window − output_reserve − tokenizer_margin (historical shape).
+    Claude-family: (window − output_reserve) / CLAUDE_REAL_TOKENS_PER_ESTIMATED,
+    so the assembled prompt fits the model's denser real tokenizer. Both forms
+    are clamped to the shared prompt-size SSOT (``budget_cap``).
+    """
+    if is_claude_family_model(model_id):
+        return min(budget_cap, int((context_window - output_reserve) / CLAUDE_REAL_TOKENS_PER_ESTIMATED))
+    return min(budget_cap, context_window - output_reserve - tokenizer_margin)
+
 SKILL_HOST_CONTEXT_FILES = (
     ("docs/CREATING_SKILLS.md", "markdown"),
     ("ouroboros/contracts/plugin_api.py", "python"),
     ("ouroboros/extension_ui_validation.py", "python"),
 )
+
+
+def review_drive_root(ctx: Any) -> pathlib.Path:
+    """Resolve the drive root for review surfaces (ctx → DATA_DIR → ../data)."""
+    if ctx is not None:
+        try:
+            return pathlib.Path(ctx.drive_root)
+        except Exception:
+            pass
+    try:
+        from ouroboros.config import DATA_DIR
+
+        return pathlib.Path(DATA_DIR)
+    except Exception:
+        return pathlib.Path("../data").resolve(strict=False)
 
 
 def emit_review_event(ctx: Any, event: dict) -> None:
@@ -167,8 +222,7 @@ BINARY_EXTENSIONS = frozenset({
     ".exe", ".pyo",
 })
 
-_FILE_SIZE_LIMIT = 1_048_576  # 1 MB
-
+_FILE_SIZE_LIMIT = 1_048_576  # 1 MB per file
 # File-classification constants shared by legacy pack helpers and generated atlases.
 _SENSITIVE_EXTENSIONS = frozenset({
     ".env", ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
@@ -267,6 +321,9 @@ Return ONLY a JSON array. Each element:
   "severity": "critical" | "advisory",
   "reason": "<for FAIL: file, line/symbol, what is wrong, how to fix>"
 }
+If you reviewed everything and found NOTHING to report, return the empty array
+followed by the sentinel word NO_FINDINGS on its own line. An empty array
+without NO_FINDINGS is treated as a non-response and excluded from quorum.
 """
 
 REVIEW_SEVERITY_THRESHOLDS = """\
@@ -712,11 +769,20 @@ def build_scope_actor_record(scope_result: object, *, fallback_model_id: str = "
     advisory_findings = list(getattr(scope_result, "advisory_findings", None) or [])
     if not parsed_items:
         parsed_items = critical_findings + advisory_findings
+    status = getattr(scope_result, "status", "responded")
+    # Surface the failure text on non-responded actors: the provider error
+    # (e.g. a deterministic 400 prompt-too-long) lives in block_message, and
+    # dropping it here previously forced operators to dig observability blobs
+    # to learn WHY a scope slot recorded status=error with empty raw_text.
+    error_text = ""
+    if status not in ("responded", "ok"):
+        error_text = str(getattr(scope_result, "block_message", "") or "")
     return {
         "slot": slot_id,
         "slot_id": slot_id,
         "model_id": getattr(scope_result, "model_id", "") or fallback_model_id,
-        "status": getattr(scope_result, "status", "responded"),
+        "status": status,
+        "error": error_text,
         "raw_text": getattr(scope_result, "raw_text", ""),
         "prompt_chars": getattr(scope_result, "prompt_chars", 0),
         "tokens_in": getattr(scope_result, "tokens_in", 0),
@@ -1216,7 +1282,6 @@ def build_scope_section(scope: str = "") -> str:
 def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
                                      touched_paths: list) -> dict:
     """Collect best-effort advisory SDK diagnostics; never raises."""
-    import sys
 
     diag: dict = {
         "model": model,

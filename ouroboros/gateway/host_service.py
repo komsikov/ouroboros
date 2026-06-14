@@ -46,10 +46,31 @@ class _RateLimiter:
         self.window_sec = window_sec
         self._hits: Dict[str, Deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._last_sweep = time.monotonic()
+
+    def _sweep(self, now: float) -> None:
+        # Drop keys idle past the window so _hits does not grow unbounded as
+        # distinct skill keys ({skill}:{endpoint}) churn over the process
+        # lifetime. Must pop each key's stale timestamps FIRST, then delete the
+        # ones left empty (an idle key still holds stale, un-popped entries).
+        # Collect-then-delete avoids mutating the dict during iteration.
+        # Caller holds self._lock.
+        stale = []
+        for key, hits in self._hits.items():
+            while hits and now - hits[0] > self.window_sec:
+                hits.popleft()
+            if not hits:
+                stale.append(key)
+        for key in stale:
+            del self._hits[key]
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
+            # Amortized cleanup: at most once per window, under the existing lock.
+            if now - self._last_sweep > self.window_sec:
+                self._sweep(now)
+                self._last_sweep = now
             hits = self._hits[key]
             while hits and now - hits[0] > self.window_sec:
                 hits.popleft()
@@ -186,10 +207,6 @@ class HostServiceContext:
             return chat_id
 
 
-def _token_from_request(request: Request) -> str:
-    return request.headers.get("x-skill-token", "")
-
-
 def _token_from_websocket(websocket: WebSocket) -> str:
     header = websocket.headers.get("x-skill-token", "")
     if header:
@@ -205,7 +222,7 @@ def _token_from_websocket(websocket: WebSocket) -> str:
 async def _api_identity(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        ctx.authenticate_token(_token_from_request(request))
+        ctx.authenticate_token(request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     identity_path = ctx.data_dir / "memory" / "identity.md"
@@ -229,7 +246,7 @@ async def _api_identity(request: Request) -> JSONResponse:
 async def _api_tool_schemas(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name = ctx.authenticate_token(_token_from_request(request))
+        skill_name = ctx.authenticate_token(request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:tools"):
@@ -241,7 +258,7 @@ async def _api_tool_schemas(request: Request) -> JSONResponse:
 async def _api_allocate_internal(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(_token_from_request(request))
+        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     try:
@@ -259,7 +276,7 @@ async def _api_allocate_internal(request: Request) -> JSONResponse:
 async def _api_chat_inject(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(_token_from_request(request))
+        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     try:
@@ -338,7 +355,7 @@ async def _api_ws_message(request: Request) -> JSONResponse:
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, _payload = ctx.authenticate_token_payload(_token_from_request(request))
+        skill_name, _payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     loaded = find_skill(ctx.data_dir, skill_name)

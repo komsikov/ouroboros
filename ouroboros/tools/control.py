@@ -232,7 +232,7 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
         })
         if str(ctx.current_task_type or "") == "evolution":
             try:
-                from supervisor.queue import update_evolution_transaction
+                from supervisor.evolution_lifecycle import update_evolution_transaction
 
                 update_evolution_transaction(
                     str(ctx.task_id or ""),
@@ -272,6 +272,64 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
 def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
     ctx.pending_events.append({"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()})
     return f"Promote to stable requested: {reason}"
+
+
+def _promote_chat_to_task(
+    ctx: ToolContext,
+    objective: str,
+    expected_output: str = "",
+    project_id: str = "",
+    workspace_root: str = "",
+) -> str:
+    """Route real work out of the conversation lane into a supervised pooled task.
+
+    Option B of the multi-project chat plane (v6.32.0): the conversation stays
+    in the fast in-process lane; ANY substantial work spawns a first-class
+    pooled task with a live card. The decision is the model's own structural
+    tool call (BIBLE P5 — no keyword routing). Follow-up owner messages reach
+    the running task through its owner-mailbox.
+    """
+    goal = str(objective or "").strip()
+    if not goal:
+        return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
+    from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
+
+    pid = ""
+    if str(project_id or "").strip():
+        if not explicit_project_id_ok(project_id):
+            return (
+                f"⚠️ TOOL_ARG_ERROR (promote_chat_to_task): project_id {project_id!r} is not "
+                "filesystem-clean; use lowercase alphanumeric/_/-/. (<=64 chars)"
+            )
+        pid = sanitize_project_id(project_id)
+    else:
+        # No explicit arg: inherit the CURRENT project scope so a project-chat
+        # task that promotes follow-up work stays in its own project (the model
+        # still chose to promote — scope is contextual, never a keyword gate).
+        pid = sanitize_project_id(getattr(ctx, "project_id", "") or "")
+    try:
+        current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
+    except (TypeError, ValueError):
+        current_chat_id = 0
+    tid = uuid.uuid4().hex[:8]
+    evt: Dict[str, Any] = {
+        "type": "promote_chat_to_task",
+        "task_id": tid,
+        "objective": goal,
+        "expected_output": str(expected_output or "").strip(),
+        "project_id": pid,
+        "workspace_root": str(workspace_root or "").strip(),
+        "chat_id": current_chat_id,
+        "ts": utc_now_iso(),
+    }
+    mode = _emit_control_event(ctx, evt)
+    scope_note = f" in project '{pid}'" if pid else ""
+    return (
+        f"OK: promoted to supervised task {tid}{scope_note} ({mode}). The conversation "
+        "lane stays free; the owner sees a live task card and can steer the running "
+        "task from chat (messages are delivered to its mailbox). Use wait_task/"
+        "get_task_result to follow up if the result is needed in this conversation."
+    )
 
 
 def _build_acting_constraint(
@@ -694,6 +752,9 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
 def _chat_history(ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "") -> str:
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
+    # Full project awareness (v6.32.0): the one mind's active recall spans every
+    # thread (main + projects). The project-task working FOCUS is applied to the
+    # passive default context only, never to this deliberate recall tool.
     return mem.chat_history(count=count, offset=offset, search=search)
 
 
@@ -790,7 +851,7 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
-    mem.append_identity_journal({
+    append_jsonl(mem.identity_journal_path(), {
         "ts": utc_now_iso(),
         "task_id": str(getattr(ctx, "task_id", "") or ""),
         "source_type": str((getattr(ctx, "task_metadata", {}) or {}).get("delegation_role", "task")) if isinstance(getattr(ctx, "task_metadata", {}), dict) else "task",
@@ -822,7 +883,7 @@ def _toggle_evolution(ctx: ToolContext, enabled: bool, objective: str = "") -> s
         # Reflect the light-mode hard block in the tool's own result so the agent
         # is not told "ON" while the supervisor silently refuses it.
         try:
-            from supervisor.queue import evolution_block_reason
+            from supervisor.evolution_lifecycle import evolution_block_reason
 
             block = evolution_block_reason()
         except Exception:
@@ -1001,6 +1062,27 @@ def get_tools() -> List[ToolEntry]:
             "description": "Promote ouroboros -> ouroboros-stable. Call when you consider the code stable.",
             "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
         }, _promote_to_stable),
+        ToolEntry("promote_chat_to_task", {
+            "name": "promote_chat_to_task",
+            "description": (
+                "Promote real work out of this conversation into a supervised pooled task "
+                "with a live card (the conversation lane stays free for the owner). Use it "
+                "whenever a chat request needs tools/files/multi-step work rather than a "
+                "conversational answer. Optional project_id scopes the task to a project's "
+                "memory/journal; optional workspace_root points at its working folder. "
+                "Owner follow-ups in chat reach the running task via its mailbox."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string", "description": "What the task must accomplish."},
+                    "expected_output": {"type": "string", "description": "What done looks like.", "default": ""},
+                    "project_id": {"type": "string", "description": "Optional project scope (filesystem-clean id).", "default": ""},
+                    "workspace_root": {"type": "string", "description": "Optional absolute working-folder path.", "default": ""},
+                },
+                "required": ["objective"],
+            },
+        }, _promote_chat_to_task),
         ToolEntry("schedule_subagent", {
             "name": "schedule_subagent",
             "description": (

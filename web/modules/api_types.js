@@ -24,6 +24,8 @@
  * @property {string} context_mode
  * @property {boolean} skills_repo_configured
  * @property {boolean} github_token_configured
+ * @property {Array<Object>} projects  // [{id, name, status, chat_id, working_dir, last_active_at}] (v6.32.0)
+ * @property {Array<number>} project_chat_ids  // complete (uncapped, all-status) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  */
 
 /**
@@ -61,6 +63,9 @@
  * @property {string=} sender_session_id
  * @property {string=} client_message_id
  * @property {boolean=} force_plan
+ * @property {Array<Object>=} attachments  // [{filename, display_name, mime}] — image uploads become native blocks (v6.26.0)
+ * @property {number=} chat_id     // multi-project thread routing (v6.32.0); main chat = 1
+ * @property {string=} project_id  // per-project memory scope (v6.32.0)
  */
 
 /**
@@ -157,6 +162,14 @@
  * @typedef {Object} LogOutbound
  * @property {"log"} type
  * @property {Object} data
+ * @property {number=} chat_id  // multi-project thread routing (v6.32.0); main chat = 1
+ */
+
+/**
+ * @typedef {Object} ProjectsChangedOutbound
+ * @property {"projects_changed"} type
+ * @property {string=} project_id
+ * @property {number=} chat_id  // new project thread; client learns it before /api/state (v6.32.0)
  */
 
 /**
@@ -227,6 +240,7 @@
  * @property {Object=} allowed_resources
  * @property {Object=} resource_policy
  * @property {ExecutorRef=} executor_ref
+ * @property {"stop"|"keep"=} service_teardown Task service finalization policy; `keep` is for external verifiers/owners that need live services after task completion. POSIX-only: on Windows a cancel/hard-timeout tree-kills all task processes, so `keep` is not preserved there.
  * @property {string=} deadline_at
  * @property {number=} timeout_sec
  * @property {number=} timeout
@@ -312,4 +326,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.24.0-rc.4';
+export const GATEWAY_CONTRACT_VERSION = '6.32.2';

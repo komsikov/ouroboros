@@ -795,7 +795,6 @@ def test_set_tool_timeout_cannot_smuggle_elevation(isolated_settings, monkeypatc
     carries an elevated mode that the on-disk baseline does not.
     """
     from ouroboros.config import load_settings
-    from ouroboros.tools import control as control_mod
 
     # Step 1: legitimate baseline = light.
     _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "light"})
@@ -1017,7 +1016,6 @@ def test_launcher_skill_key_grant_supports_extensions(monkeypatch, tmp_path):
     runs in the launcher process and would not affect the server).
     """
     import launcher
-    from io import BytesIO
 
     class _Manifest:
         env_from_settings = ["OPENROUTER_API_KEY"]
@@ -1323,6 +1321,31 @@ def test_elevation_indicators_block_attack_patterns_in_all_modes(blocked_cmd, tm
             f"mode={mode!r} cmd={blocked_cmd!r}: "
             f"got {result[:200]!r}"
         )
+
+
+def test_workspace_mode_still_blocks_runtime_mode_elevation(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    workspace.mkdir()
+    repo.mkdir()
+    data.mkdir()
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    reg.set_context(ToolContext(
+        repo_dir=repo,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+    result = reg.execute(
+        "run_command",
+        {"cmd": "python -c \"from ouroboros.config import save_settings; save_settings({'OUROBOROS_RUNTIME_MODE': 'pro'}, allow_elevation=True)\""},
+    )
+
+    assert "ELEVATION_BLOCKED" in result
 
 
 @pytest.mark.parametrize(
