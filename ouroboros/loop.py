@@ -1324,30 +1324,13 @@ def _run_llm_loop_impl(
         while True:
             round_idx += 1
 
+            # Per-round OTEL CHAIN span (fork telemetry): close the previous
+            # round's span and open this one so its LLM/tool spans nest under it.
             if _round_span_cm is not None:
                 _round_span_cm.__exit__(None, None, None)
             _round_span_cm = chain_span(name=f"round.{round_idx}")
             _round_span_cm.__enter__()
 
-            if round_idx > MAX_ROUNDS:
-                finish_reason = f"⚠️ Task exceeded MAX_ROUNDS ({MAX_ROUNDS}). Consider decomposing into subtasks via schedule_subagent."
-                _append_or_merge_user_message(messages, f"[ROUND_LIMIT] {finish_reason}")
-                try:
-                    final_msg, final_cost = call_llm_with_retry(
-                        llm, messages, active_model, None, active_effort,
-                        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
-                        use_local=active_use_local,
-                    )
-                    accumulated_usage["execution_status"] = "failed"
-                    accumulated_usage["reason_code"] = "round_limit"
-                    if final_msg:
-                        return (final_msg.get("content") or finish_reason), accumulated_usage, llm_trace
-                    return finish_reason, accumulated_usage, llm_trace
-                except Exception:
-                    log.warning("Failed to get final response after round limit", exc_info=True)
-                    accumulated_usage["execution_status"] = "failed"
-                    accumulated_usage["reason_code"] = "round_limit"
-                    return finish_reason, accumulated_usage, llm_trace
             ctx = tools._ctx
             active_model, active_use_local, active_effort = _apply_runtime_overrides(
                 ctx, active_model, active_use_local, active_effort,

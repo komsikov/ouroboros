@@ -525,7 +525,7 @@ export function initMarketplace(pane, controlsHost = null) {
         const summary = state.results.find((item) => item.slug === slug) || { slug };
         const installed = state.installedMap.get(slug);
         if (action === 'widgets') {
-            document.querySelector('[data-page="widgets"]')?.click();
+            document.querySelector('[data-nav-page="widgets"]')?.click();
             return;
         }
         if (action === 'disable' && installed) {
@@ -580,7 +580,7 @@ export function initMarketplace(pane, controlsHost = null) {
             });
             showStatus(pane, `${slug}: задача исправления поставлена в очередь`, 'ok');
             emitSkillLifecycle('repair', installed.name || slug);
-            document.querySelector('.nav-btn[data-page="chat"]')?.click();
+            document.querySelector('[data-nav-page="chat"]')?.click();
             return;
         }
         if (action === 'review' && installed) {

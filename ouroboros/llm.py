@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.guardrails_llm import apply_output as _guardrails_apply_output
 from ouroboros.guardrails_llm import enforce_input as _guardrails_enforce_input
-from ouroboros.telemetry import llm_span, record_llm_response
 from ouroboros.provider_models import PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity
+from ouroboros.telemetry import llm_span, record_llm_response
 from ouroboros.utils import in_worker_process
 
 log = logging.getLogger(__name__)
@@ -937,6 +937,7 @@ class LLMClient:
                     tool_choice,
                     temperature,
                     no_proxy,
+                    timeout,
                 )
                 msg, usage = _guardrails_apply_output(msg, usage)
                 record_llm_response(span, message=msg, usage=usage)

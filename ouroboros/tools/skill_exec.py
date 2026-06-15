@@ -709,6 +709,7 @@ def _handle_skill_exec(
                 f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} payload changed between "
                 "the review-freshness check and execution. Re-run skill_review."
             )
+
         try:
             returncode, stdout_bytes, stderr_bytes, overflowed = _run_skill_subprocess(
                 cmd,
