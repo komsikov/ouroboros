@@ -192,6 +192,24 @@
           <span>Чат</span>
         </button>
       </div>
+      <section
+        id="mobile-projects-section"
+        class="mobile-projects-section"
+        aria-label="Проекты"
+        hidden
+      >
+        <button
+          id="mobile-projects-toggle"
+          class="mobile-projects-toggle"
+          type="button"
+          aria-expanded="true"
+          aria-controls="mobile-projects-list"
+        >
+          <span>Проекты</span>
+          <span id="mobile-projects-count" class="mobile-projects-count"></span>
+        </button>
+        <div id="mobile-projects-list" class="mobile-projects-list"></div>
+      </section>
       <div class="mobile-profile-host">
         <button
           class="mobile-profile-navbtn"
@@ -343,6 +361,24 @@
           <img class="nav-icon" src="/static/icons/settings.svg" alt="" />
           <span>Настройки</span>
         </button>
+        <section
+          id="nav-projects-section"
+          class="nav-projects-section"
+          aria-label="Проекты"
+          hidden
+        >
+          <button
+            id="nav-projects-toggle"
+            class="nav-projects-toggle"
+            type="button"
+            aria-expanded="true"
+            aria-controls="nav-projects-list"
+          >
+            <span class="nav-projects-title">Проекты</span>
+            <span id="nav-projects-count" class="nav-projects-count"></span>
+          </button>
+          <div id="nav-projects-list" class="nav-projects-list"></div>
+        </section>
         <div class="nav-section-divider"></div>
         <section
           id="nav-widgets-section"

@@ -27,6 +27,8 @@ const state = {
     activeFilters: { tools: true, llm: true, errors: true, tasks: true, system: true, consciousness: true },
     unreadCount: 0,
     activePage: 'chat',
+    activeChatId: 1,
+    projectChatIds: new Set(),
     settingsActiveSubtab: 'providers',
     dashboardActiveSubtab: 'logs',
     beforePageLeave: null,
@@ -39,6 +41,20 @@ let settingsControls = null;
 let dashboardControls = null;
 let navWidgetsLoaded = false;
 let activeSidebarWidgetKey = '';
+const navState = {
+    activeProjectId: '',
+    projectsExpanded: true,
+};
+const navProjectsSection = document.getElementById('nav-projects-section');
+const navProjectsToggle = document.getElementById('nav-projects-toggle');
+const navProjectsCount = document.getElementById('nav-projects-count');
+const navProjectsList = document.getElementById('nav-projects-list');
+const mobileProjectsSection = document.getElementById('mobile-projects-section');
+const mobileProjectsToggle = document.getElementById('mobile-projects-toggle');
+const mobileProjectsCount = document.getElementById('mobile-projects-count');
+const mobileProjectsList = document.getElementById('mobile-projects-list');
+let knownProjectsJson = '';
+let cachedProjects = [];
 
 function trackDashboardSubtab(tabName) {
     if (tabName === 'logs') trackMetric('dashboard_logs');
@@ -57,19 +73,19 @@ function trackSettingsSubtab(tabName) {
 }
 
 async function showPage(name) {
-    if (state.activePage === name) return;
+    if (state.activePage === name) {
+        syncPrimaryNavState();
+        return;
+    }
     for (const handler of beforePageLeaveHandlers) {
         const canLeave = await handler({ from: state.activePage, to: name });
         if (canLeave === false) return;
     }
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.mobile-profile-navbtn[data-profile-page]').forEach(b => b.classList.remove('active'));
+    if (name !== 'chat' && navState.activeProjectId) {
+        setActiveChatContext(null);
+    }
     document.getElementById(`page-${name}`)?.classList.add('active');
-    document.querySelector(`.nav-btn[data-page="${name}"]`)?.classList.add('active');
-    document.querySelector(`.mobile-profile-navbtn[data-profile-page="${name}"]`)?.classList.add('active');
-    const chatNavBtn = document.querySelector('.mobile-left-navbtn[data-left-page="chat"]');
-    if (chatNavBtn) chatNavBtn.classList.toggle('active', name === 'chat');
     const MOBILE_PAGE_TITLES = { files: 'Файлы', dashboard: 'Дашборд', skills: 'Навыки', settings: 'Настройки' };
     const isSubpage = name in MOBILE_PAGE_TITLES;
     document.body.classList.toggle('mobile-subpage', isSubpage);
@@ -80,6 +96,7 @@ async function showPage(name) {
         document.querySelectorAll('.nav-widget-item.active').forEach((item) => item.classList.remove('active'));
     }
     state.activePage = name;
+    syncPrimaryNavState();
     if (name === 'chat') trackMetric('chat');
     if (name === 'dashboard') trackDashboardSubtab(state.dashboardActiveSubtab || 'logs');
     if (name === 'settings') trackSettingsSubtab(state.settingsActiveSubtab || 'providers');
@@ -88,6 +105,32 @@ async function showPage(name) {
         state.unreadCount = 0;
         updateUnreadBadge();
     }
+}
+
+function syncPrimaryNavState() {
+    document.querySelectorAll('.nav-btn').forEach((button) => {
+        const isActive = !navState.activeProjectId && button.dataset.page === state.activePage;
+        button.classList.toggle('active', isActive);
+    });
+    document.querySelectorAll('.mobile-profile-navbtn[data-profile-page]').forEach((button) => {
+        const isActive = !navState.activeProjectId && button.dataset.profilePage === state.activePage;
+        button.classList.toggle('active', isActive);
+    });
+    const chatNavBtn = document.querySelector('.mobile-left-navbtn[data-left-page="chat"]');
+    if (chatNavBtn) chatNavBtn.classList.toggle('active', state.activePage === 'chat' && !navState.activeProjectId);
+    navProjectsToggle?.classList.toggle('active', !!navState.activeProjectId);
+    mobileProjectsToggle?.classList.toggle('active', !!navState.activeProjectId);
+    const projectsExpanded = !!navState.projectsExpanded;
+    navProjectsToggle?.setAttribute('aria-expanded', projectsExpanded ? 'true' : 'false');
+    mobileProjectsToggle?.setAttribute('aria-expanded', projectsExpanded ? 'true' : 'false');
+    if (navProjectsList) navProjectsList.hidden = !projectsExpanded;
+    if (mobileProjectsList) mobileProjectsList.hidden = !projectsExpanded;
+    document.querySelectorAll('.nav-project-item').forEach((button) => {
+        button.classList.toggle('active', button.dataset.projectId === navState.activeProjectId);
+    });
+    document.querySelectorAll('.mobile-project-item').forEach((button) => {
+        button.classList.toggle('active', button.dataset.projectId === navState.activeProjectId);
+    });
 }
 
 async function openSettingsTab(tabName) {
@@ -121,6 +164,7 @@ function updateUnreadBadge() {
 
 document.querySelectorAll('.nav-btn').forEach(btn => {
     btn.addEventListener('click', () => {
+        if (btn.dataset.page === 'chat') setActiveChatContext(null);
         showPage(btn.dataset.page);
     });
 });
@@ -145,6 +189,84 @@ function initSidebarChrome() {
     } catch {}
     setSidebarCollapsed(collapsed);
     toggle?.addEventListener('click', () => setSidebarCollapsed(!document.body.classList.contains('nav-collapsed')));
+}
+
+function setActiveChatContext(project) {
+    if (project && project.id) {
+        navState.activeProjectId = String(project.id);
+        state.activeChatId = Number(project.chat_id) || 1;
+    } else {
+        navState.activeProjectId = '';
+        state.activeChatId = 1;
+    }
+    syncPrimaryNavState();
+    window.dispatchEvent(new CustomEvent('ouro:chat-context-changed', {
+        detail: {
+            chatId: state.activeChatId,
+            projectId: navState.activeProjectId,
+            projectName: project?.name || '',
+        },
+    }));
+}
+
+function renderProjectsNav(projects = [], projectChatIds = null) {
+    const completeChatIds = Array.isArray(projectChatIds)
+        ? projectChatIds.map((value) => Number(value) || 0)
+        : projects.map((item) => Number(item?.chat_id) || 0);
+    state.projectChatIds = new Set(completeChatIds.filter(Boolean));
+    const rows = projects
+        .filter((item) => item && item.id && item.status !== 'archived')
+        .sort((a, b) => String(b.last_active_at || b.updated_at || b.created_at || '').localeCompare(String(a.last_active_at || a.updated_at || a.created_at || '')));
+    if (navState.activeProjectId && !rows.some((item) => String(item.id) === navState.activeProjectId)) {
+        setActiveChatContext(null);
+    }
+    const nextKnownProjectsJson = JSON.stringify(rows.map((item) => [item.id, item.name, item.status, item.chat_id]));
+    if (nextKnownProjectsJson === knownProjectsJson) {
+        syncPrimaryNavState();
+        return;
+    }
+    knownProjectsJson = nextKnownProjectsJson;
+    cachedProjects = rows;
+    const hasProjects = rows.length > 0;
+    if (navProjectsSection) navProjectsSection.hidden = !hasProjects;
+    if (mobileProjectsSection) mobileProjectsSection.hidden = !hasProjects;
+    if (navProjectsCount) navProjectsCount.textContent = hasProjects ? String(rows.length) : '';
+    if (mobileProjectsCount) mobileProjectsCount.textContent = hasProjects ? String(rows.length) : '';
+    if (navProjectsList) navProjectsList.innerHTML = '';
+    if (mobileProjectsList) mobileProjectsList.innerHTML = '';
+    rows.forEach((project) => {
+        const label = escapeHtmlText(project.name || project.id);
+        const pid = escapeHtmlAttr(project.id);
+        const title = escapeHtmlAttr(project.name || project.id);
+        const activeClass = project.id === navState.activeProjectId ? ' active' : '';
+        if (navProjectsList) {
+            navProjectsList.insertAdjacentHTML('beforeend', `<button class="nav-project-item${activeClass}" type="button" data-project-id="${pid}" title="${title}">${label}</button>`);
+        }
+        if (mobileProjectsList) {
+            mobileProjectsList.insertAdjacentHTML('beforeend', `<button class="mobile-project-item${activeClass}" type="button" data-project-id="${pid}" title="${title}">${label}</button>`);
+        }
+    });
+    syncPrimaryNavState();
+}
+
+function resolveProjectById(projectId) {
+    return cachedProjects.find((item) => String(item.id) === String(projectId)) || null;
+}
+
+async function openProjectChat(projectId) {
+    const project = resolveProjectById(projectId);
+    if (!project) return;
+    setActiveChatContext(project);
+    await showPage('chat');
+}
+
+async function refreshProjectsNav() {
+    try {
+        const resp = await apiFetch('/api/state', { cache: 'no-store' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) return;
+        renderProjectsNav(Array.isArray(data.projects) ? data.projects : [], data.project_chat_ids);
+    } catch {}
 }
 
 function widgetIconSrcForTitle(title = '') {
@@ -200,13 +322,21 @@ document.getElementById('nav-widget-list')?.addEventListener('click', async (eve
 });
 
 initSidebarChrome();
+syncPrimaryNavState();
 refreshSidebarWidgets();
+refreshProjectsNav();
 window.addEventListener('ouro:widgets-updated', refreshSidebarWidgets);
 window.addEventListener('ouro:skill-lifecycle', (event) => {
     const action = event.detail?.action;
     if (['enable', 'disable', 'install', 'uninstall'].includes(action)) {
         refreshSidebarWidgets();
     }
+});
+window.addEventListener('ouro:project-created', async (event) => {
+    knownProjectsJson = '';
+    await refreshProjectsNav();
+    const createdProjectId = event?.detail?.project?.id;
+    if (createdProjectId) openProjectChat(createdProjectId);
 });
 
 const ctx = {
@@ -356,6 +486,13 @@ trackMetric('chat', { once: true });
 }());
 
 ws.connect();
+ws.on('open', refreshProjectsNav);
+ws.on('projects_changed', (msg) => {
+    const cid = Number(msg?.chat_id) || 0;
+    if (cid) state.projectChatIds.add(cid);
+    refreshProjectsNav();
+});
+setInterval(refreshProjectsNav, 20000);
 
 // ---------------------------------------------------------------------------
 // Mobile drawer system
@@ -406,6 +543,7 @@ ws.connect();
     leftDrawer?.addEventListener('click', (e) => {
         const pageBtn = e.target.closest('[data-left-page]');
         if (pageBtn) {
+            if (pageBtn.dataset.leftPage === 'chat') setActiveChatContext(null);
             showPage(pageBtn.dataset.leftPage);
             closeNavDrawer();
             return;
@@ -413,6 +551,12 @@ ws.connect();
         const profilePageBtn = e.target.closest('[data-profile-page]');
         if (profilePageBtn) {
             showPage(profilePageBtn.dataset.profilePage);
+            closeNavDrawer();
+            return;
+        }
+        const projectBtn = e.target.closest('[data-project-id]');
+        if (projectBtn) {
+            openProjectChat(projectBtn.dataset.projectId);
             closeNavDrawer();
             return;
         }
@@ -486,4 +630,22 @@ ws.connect();
     // Re-sync toggle states when mobile drawer opens
     navOpenBtn?.addEventListener('click', syncCommandToggleState);
     window.addEventListener('ouro:page-shown', syncCommandToggleState);
+    navProjectsToggle?.addEventListener('click', () => {
+        navState.projectsExpanded = !navState.projectsExpanded;
+        syncPrimaryNavState();
+    });
+    mobileProjectsToggle?.addEventListener('click', () => {
+        navState.projectsExpanded = !navState.projectsExpanded;
+        syncPrimaryNavState();
+    });
+    navProjectsList?.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-project-id]');
+        if (!button) return;
+        openProjectChat(button.dataset.projectId);
+    });
+    mobileProjectsList?.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-project-id]');
+        if (!button) return;
+        openProjectChat(button.dataset.projectId);
+    });
 }());

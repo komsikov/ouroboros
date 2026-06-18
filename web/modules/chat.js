@@ -19,6 +19,14 @@ const MAX_PENDING_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
+function projectIdFromTask(taskId = '') {
+    const seed = String(taskId || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_.-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    return (seed ? `task-${seed}` : `task-${Date.now().toString(36)}`).slice(0, 64);
+}
+
 function getOrCreateChatSessionId() {
     try {
         const existing = sessionStorage.getItem(CHAT_SESSION_ID_KEY);
@@ -51,6 +59,30 @@ function saveInputHistory(entries) {
 export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab }) {
     const container = document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
+    let currentChatId = Number(state.activeChatId) || 1;
+    let currentProjectId = '';
+
+    function threadStorageKey(base) {
+        return currentChatId === 1 ? base : `${base}:${currentChatId}`;
+    }
+
+    function shouldMirrorToMainThread(msg) {
+        if ((msg?.role || '') === 'user') return false;
+        if (msg?.system_type === 'task_summary' || msg?.system_type === 'project_digest') return true;
+        if (Boolean(msg?.is_progress)) return true;
+        return false;
+    }
+
+    function isMyThread(msg, { mirrorProject = false } = {}) {
+        const cid = Number(msg?.chat_id) || 0;
+        if (!cid) return currentChatId === 1;
+        if (mirrorProject && currentChatId === 1) {
+            const projectIds = state.projectChatIds instanceof Set ? state.projectChatIds : null;
+            if (projectIds && projectIds.has(cid)) return shouldMirrorToMainThread(msg);
+            return true;
+        }
+        return cid === currentChatId;
+    }
 
     const page = document.createElement('div');
     page.id = 'page-chat';
@@ -503,7 +535,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     function persistVisibleHistory() {
         try {
-            sessionStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(persistedHistory.slice(-200)));
+            sessionStorage.setItem(threadStorageKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
         } catch {}
     }
 
@@ -709,6 +741,39 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         applyLiveCardState(summary, resolvedTaskId, ts, dedupeKey);
     }
 
+    async function turnTaskIntoProject(record) {
+        if (!record || record.root?.dataset?.projectCreating === '1') return;
+        const taskId = String(record.groupId || '').trim();
+        if (!taskId) return;
+        const fallbackName = (record.titleEl?.textContent || record.lastHumanHeadline || taskId || 'Новый проект')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 80);
+        const name = window.prompt('Название проекта', fallbackName || 'Новый проект');
+        if (name === null) return;
+        const displayName = String(name || '').trim() || fallbackName || `Проект ${taskId}`;
+        const projectId = projectIdFromTask(taskId);
+        record.root.dataset.projectCreating = '1';
+        if (record.turnProjectBtn) {
+            record.turnProjectBtn.disabled = true;
+            record.turnProjectBtn.textContent = 'Создаём проект...';
+        }
+        try {
+            const payload = await apiClient.projectFromTask(taskId, projectId, displayName);
+            const project = payload.project || { id: projectId, name: displayName, chat_id: 1 };
+            showToast(`Проект создан: ${project.name || project.id}`, 'ok');
+            window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
+            if (record.turnProjectBtn) record.turnProjectBtn.textContent = 'Проект создан';
+        } catch (exc) {
+            showToast(`Не удалось создать проект: ${exc.message || exc}`, 'error');
+            delete record.root.dataset.projectCreating;
+            if (record.turnProjectBtn) {
+                record.turnProjectBtn.disabled = false;
+                record.turnProjectBtn.textContent = 'Сделать проект';
+            }
+        }
+    }
+
     function createLiveCardRecord(groupId = '', options = {}) {
         const normalizedGroupId = groupId || `task-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         const timelineId = `chat-live-timeline-${normalizedGroupId.replace(/[^A-Za-z0-9_-]/g, '-')}`;
@@ -723,6 +788,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         root.dataset.finished = '0';
         root.dataset.expanded = (options.isSubagent && nestedSubagentsExpanded) ? '1' : '0';
+        const projectActionHtml = (currentChatId === 1 && !options.isSubagent)
+            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Сделать проект</button></div>`
+            : '';
         root.innerHTML = `
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
@@ -743,6 +811,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 </div>
                 <div class="chat-live-meta" data-live-meta></div>
             </button>
+            ${projectActionHtml}
             <div class="chat-live-timeline" data-live-timeline id="${escapeHtmlAttr(timelineId)}"></div>
         `;
         const record = {
@@ -756,6 +825,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             metaEl: root.querySelector('[data-live-meta]'),
             toggleEl: root.querySelector('[data-live-toggle]'),
             timelineEl: root.querySelector('[data-live-timeline]'),
+            turnProjectBtn: root.querySelector('[data-turn-into-project]'),
             updates: 0,
             finished: false,
             items: [],
@@ -780,6 +850,11 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             else record.expandedLineKeys.add(lineKey);
             renderLiveCardTimeline(record);
             syncLiveCardLayout(record);
+        });
+        record.turnProjectBtn?.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            turnTaskIntoProject(record);
         });
         liveCardRecords.set(normalizedGroupId, record);
         resetLiveCardRecord(record);
@@ -1633,7 +1708,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         historySyncPromise = (async () => {
             try {
-                const resp = await apiFetch('/api/chat/history?limit=1000', { cache: 'no-store' });
+                const historyUrl = currentChatId === 1
+                    ? '/api/chat/history?limit=1000'
+                    : `/api/chat/history?limit=1000&chat_id=${currentChatId}`;
+                const resp = await apiFetch(historyUrl, { cache: 'no-store' });
                 if (!resp.ok) return false;
                 const data = await resp.json();
                 const messages = Array.isArray(data.messages) ? data.messages : [];
@@ -1833,7 +1911,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         await loadUiPreferences();
         if (await syncHistory({ includeUser: true })) return;
         try {
-            const saved = JSON.parse(sessionStorage.getItem(CHAT_STORAGE_KEY) || '[]');
+            const saved = JSON.parse(sessionStorage.getItem(threadStorageKey(CHAT_STORAGE_KEY)) || '[]');
             for (const msg of saved) {
                 addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
                     systemType: msg.systemType || '',
@@ -1933,6 +2011,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             content: text,
             sender_session_id: chatSessionId,
             force_plan: forcePlan,
+            ...(currentChatId > 1 ? { chat_id: currentChatId } : {}),
+            ...(currentProjectId ? { project_id: currentProjectId } : {}),
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
@@ -2236,11 +2316,13 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         updateUnreadBadge();
     }
 
-    ws.on('typing', () => {
+    ws.on('typing', (msg) => {
+        if (!isMyThread(msg, { mirrorProject: true })) return;
         showTyping();
     });
 
     ws.on('chat', (msg) => {
+        if (!isMyThread(msg, { mirrorProject: true })) return;
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
@@ -2291,6 +2373,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     ws.on('log', (msg) => {
         if (!msg?.data) return;
+        if (!isMyThread(msg.data, { mirrorProject: true })) return;
         updateLiveCardFromLogEvent(msg.data);
     });
 
@@ -2299,6 +2382,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
 
     ws.on('photo', (msg) => {
+        if (!isMyThread(msg, { mirrorProject: true })) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
@@ -2333,6 +2417,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
 
     ws.on('video', (msg) => {
+        if (!isMyThread(msg, { mirrorProject: true })) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
@@ -2396,5 +2481,37 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         hideTyping();
         setStatus('offline', 'Переподключение...');
         syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Подключение...' });
+    });
+
+    window.addEventListener('ouro:chat-context-changed', async (event) => {
+        const nextChatId = Number(event?.detail?.chatId) || 1;
+        const nextProjectId = String(event?.detail?.projectId || '');
+        if (nextChatId === currentChatId && nextProjectId === currentProjectId) return;
+        currentChatId = nextChatId;
+        currentProjectId = nextProjectId;
+        state.activeChatId = currentChatId;
+        pendingAttachments = [];
+        updateAttachmentPreview();
+        for (const record of liveCardRecords.values()) record.root?.remove();
+        liveCardRecords.clear();
+        taskUiStates.clear();
+        retiredTaskIds.clear();
+        pendingUserBubbles.clear();
+        seenMessageKeys.clear();
+        messageKeyOrder.length = 0;
+        persistedHistory.length = 0;
+        activeLiveGroupId = '';
+        historyLoaded = false;
+        inputHistorySeededFromServer = false;
+        historySyncPromise = null;
+        welcomeShown = false;
+        hideTyping();
+        Array.from(messagesDiv.querySelectorAll('.chat-bubble')).forEach((bubble) => {
+            if (bubble.id !== 'typing-indicator') bubble.remove();
+        });
+        await syncHistory({ includeUser: true, fromReconnect: true });
+        if (!Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some((bubble) => bubble.id !== 'typing-indicator')) {
+            ensureWelcomeMessage();
+        }
     });
 }

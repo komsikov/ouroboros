@@ -23,7 +23,7 @@ export function renderPageHeader({
     tabsHtml = '',
     variant = '',
     className = '',
-    showMobileNav = true,
+    showMobileNav = false,
 } = {}) {
     const variantClass = variant ? `app-page-header-${escapeHtml(variant)}` : '';
     const iconHtml = icon ? `<span class="app-page-icon" aria-hidden="true">${icon}</span>` : '';
