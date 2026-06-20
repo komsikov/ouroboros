@@ -7,10 +7,12 @@ import re
 from typing import Any, List
 
 from ouroboros.protected_artifacts import block_reason_for_path
+from ouroboros.tool_access import normalize_root_relative
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for, system_repo_dir_for
 
 
 _OPS = (
+    "relevant_files",
     "symbols",
     "definition",
     "references",
@@ -18,7 +20,7 @@ _OPS = (
     "callees",
     "impact",
     "structural",
-    "relevant_files",
+    "digest",
 )
 _MAX_LIMIT = 200
 
@@ -110,22 +112,38 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
 
     ts_node_type = _query_node_type(query)
 
-    def _tree_sitter_rows(fp: pathlib.Path, rel: str, text: str) -> list[str]:
-        if not ts_node_type:
-            return []
-        language = {
-            ".py": "python", ".js": "javascript", ".jsx": "javascript",
-            ".ts": "typescript", ".tsx": "typescript",
-        }.get(fp.suffix, "")
-        if not language:
-            return []
-        try:
-            from tree_sitter_language_pack import get_parser  # type: ignore
+    # CW11 (v6.34.0): structural is polyglot via the SAME tree-sitter infrastructure as
+    # the symbol inventory — _language (suffix -> language id) + _TS_LANGUAGES (id ->
+    # grammar) + the cached _ts_parser. Python keeps a stdlib-ast fallback; every other
+    # language is tree-sitter ONLY (no literal/text fallback), so a node-type query never
+    # false-matches a comment and never echoes source, and a missing grammar surfaces a
+    # visible structural_unavailable:<lang> marker instead of a silent guess.
+    from ouroboros.code_intelligence import _TS_LANGUAGES, _language, _ts_parser
 
-            parser = get_parser(language)
+    def _file_lang_grammar(fp: pathlib.Path):
+        lid = _language(fp)
+        if lid == "python":
+            return ("python", "python")
+        return (lid, _TS_LANGUAGES.get(lid))
+
+    def _filter_grammar(value: str):
+        """The user's lang filter normalized to a grammar (or 'python'); None => no filter."""
+        v = str(value or "").strip().lower()
+        if v in ("", "any"):
+            return None
+        if v == "python":
+            return "python"
+        return _TS_LANGUAGES.get(v, v)
+
+    def _ts_rows(grammar: str, rel: str, text: str):
+        """tree-sitter node-type matches, or None when the grammar/library is unavailable."""
+        parser = _ts_parser(grammar)
+        if parser is None:
+            return None
+        try:
             tree = parser.parse(text.encode("utf-8"))
         except Exception:
-            return []
+            return None
         found: list[str] = []
         stack = [tree.root_node]
         while stack:
@@ -135,14 +153,24 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
             stack.extend(reversed(list(node.children)))
         return found
 
+    want_grammar = _filter_grammar(lang)
     scope = (repo_root / (path or ".")).resolve(strict=False)
     candidates = [scope] if scope.is_file() else sorted(scope.rglob("*"))
     rows: list[str] = []
-    needle = str(query or "").strip()
+    unavailable_seen: set = set()
+    cap = min(max(1, limit), _MAX_LIMIT)
     for fp in candidates:
-        if len(rows) >= min(max(1, limit), _MAX_LIMIT):
+        if len(rows) >= cap:
             break
-        if not fp.is_file() or fp.suffix not in {".py", ".js", ".jsx", ".ts", ".tsx"}:
+        if not fp.is_file():
+            continue
+        lang_id, grammar = _file_lang_grammar(fp)
+        # Skip non-code files (no grammar, not python) unless the user explicitly filtered
+        # to a language whose grammar happens to be missing (then surface its marker).
+        if grammar is None and lang_id != "python" and want_grammar is None:
+            continue
+        file_grammar = "python" if lang_id == "python" else grammar
+        if want_grammar is not None and file_grammar != want_grammar:
             continue
         try:
             rel = fp.relative_to(repo_root).as_posix()
@@ -150,35 +178,32 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
             continue
         if not _visible_file(ctx, repo_root, rel):
             continue
-        if lang not in {"", "any"} and lang and {
-            ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript"
-        }.get(fp.suffix, "") != lang:
+        if not ts_node_type:
             continue
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        ts_rows = _tree_sitter_rows(fp, rel, text)
-        if ts_rows:
-            rows.extend(ts_rows)
-            continue
-        if fp.suffix == ".py":
+        if lang_id == "python":
+            ts = _ts_rows("python", rel, text)
+            if ts:
+                rows.extend(ts)
+                continue
             try:
                 tree = ast.parse(text)
             except SyntaxError:
                 continue
-            # Minimal structural fallback: if the query names an AST class, match it;
-            # otherwise match exact source lines without storing source in the index.
             for node in ast.walk(tree):
-                if node.__class__.__name__.casefold() == needle.casefold():
+                if node.__class__.__name__.casefold() == ts_node_type.casefold():
                     rows.append(f"{rel}:{int(getattr(node, 'lineno', 0) or 0)} {node.__class__.__name__}")
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if needle and needle in line:
-                rows.append(f"{rel}:{lineno} {line.strip()}")
-                if len(rows) >= min(max(1, limit), _MAX_LIMIT):
-                    break
-    if not rows and lang in {"javascript", "typescript"}:
-        rows.append("note: structural tree-sitter query for JS/TS requires tree-sitter; fallback found no literal matches")
+            continue
+        ts = _ts_rows(grammar, rel, text)
+        if ts is None:
+            if lang_id not in unavailable_seen:
+                unavailable_seen.add(lang_id)
+                rows.append(f"structural_unavailable:{lang_id} (tree-sitter grammar not loaded)")
+        else:
+            rows.extend(ts)
     return rows
 
 
@@ -194,7 +219,7 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
     op = str(op or "").strip()
     if op not in _OPS:
         return f"⚠️ TOOL_ARG_ERROR (query_code): op must be one of {', '.join(_OPS)}."
-    if op != "symbols" and not str(query or "").strip():
+    if op not in ("symbols", "digest") and not str(query or "").strip():
         return f"⚠️ TOOL_ARG_ERROR (query_code): op '{op}' requires query."
     try:
         normalized_root = str(root or "active_workspace").strip() or "active_workspace"
@@ -211,6 +236,9 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             repo_root = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
         else:
             raise ValueError("root must be active_workspace or system_repo")
+        # Accept absolute/redundant-prefix paths inside the root (e.g. '/app/x'
+        # or 'app/x' under a root at /app); _safe_path still confines below.
+        path = normalize_root_relative(repo_root, path)
         scoped_path = _safe_path(repo_root, path)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
@@ -242,6 +270,11 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
                 pass
             inventory = build_code_inventory(repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths)
             inventory.files = [file for file in inventory.files if _visible_file(ctx, repo_root, file.path)]
+            if op == "digest":
+                # Whole-repo map (folded from the former codebase_digest tool):
+                # a compact file/symbol inventory to orient in an unfamiliar repo.
+                from ouroboros.code_intelligence import render_codebase_digest
+                return render_codebase_digest(inventory)
             rows = _inventory_rows(ctx, inventory, repo_root, {
                 "op": op, "query": query, "path": scoped_path, "kind": kind,
                 "depth": depth, "limit": limit, "offset": offset,
@@ -254,11 +287,41 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
     next_offset = offset + limit
     label = query or scoped_path or "."
     if not shown:
-        return f"No results for op `{op}` `{label}`. Hint: check the symbol/path or use search_code for plain text."
+        return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
     header = f"{op} `{label}` — {len(shown)} of {total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
-    return header + "\n\n" + "\n".join(shown)
+    return header + "\n\n" + "\n".join(shown) + _next_step_hint(op)
+
+
+def _empty_hint(op: str, label: str) -> str:
+    """Op-specific recovery hint — do NOT reflexively redirect to search_code."""
+    if op in ("definition", "references", "callers", "callees", "impact"):
+        return (
+            f"Check the exact symbol name (these ops match a defined symbol, not text). "
+            f"Use op=relevant_files query=\"{label}\" to find where to look, or op=symbols to list what's defined."
+        )
+    if op == "symbols":
+        return "Narrow with path= to a file/dir, or use op=relevant_files to locate the area first."
+    if op == "structural":
+        return ("structural needs a node type, not free text — an AST class for Python (FunctionDef/ClassDef) "
+                "or a tree-sitter node for other langs (function_declaration for Go, struct_item for Rust, etc.). "
+                "Add lang=go|rust|... to filter by language.")
+    if op == "relevant_files":
+        return "Rephrase the task in domain words, or use search_code for an exact string you expect in the source."
+    return "Verify the symbol/path; use search_code only for plain-text/regex matches."
+
+
+def _next_step_hint(op: str) -> str:
+    """Suggest the natural follow-up op so results chain instead of dead-ending."""
+    hints = {
+        "relevant_files": "\n\nNext: read_file(...) the top hit, or query_code(op=symbols, path=...) to list its symbols.",
+        "symbols": "\n\nNext: query_code(op=definition/references, query=<name>) on a symbol of interest.",
+        "definition": "\n\nNext: query_code(op=references/callers, query=<name>) to see how it is used.",
+        "callers": "\n\nNext: read_file(...) a caller, or query_code(op=impact, query=<name>) for blast radius.",
+        "callees": "\n\nNext: query_code(op=definition, query=<callee>) to read what it calls.",
+    }
+    return hints.get(op, "")
 
 
 def get_tools() -> List[ToolEntry]:
@@ -266,16 +329,23 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("query_code", {
             "name": "query_code",
             "description": (
-                "Read-only structured code intelligence over the active workspace. "
-                "Use search_code for plain text/regex search. Ops: symbols, definition, "
-                "references, callers, callees, impact, structural, relevant_files. "
-                "Returns compact file:line anchors and signatures/snippets, never full bodies."
+                "Read-only structured code intelligence over the active workspace — prefer this "
+                "over grep/find/sed-as-reader for anything symbol-aware. Start with "
+                "op=relevant_files (task text -> the files to read) when you don't yet know where "
+                "to look; op=digest maps an unfamiliar repo FIRST; then symbols/definition/"
+                "references/callers/callees/impact/structural for precise navigation. Use search_code "
+                "only for plain text/regex. Symbol intelligence (digest/symbols/definition/references/"
+                "callers/callees/impact) is polyglot via tree-sitter (Python/JS/TS/Go/Rust/Java/Ruby/C/"
+                "...); op=structural (node-type queries) is polyglot too — tree-sitter for every supported "
+                "language (Python/JS/TS/Go/Rust/Java/Ruby/C/C++/C#/PHP/Kotlin/Swift/Scala/Lua/Bash), with a "
+                "visible structural_unavailable:<lang> marker when a grammar is missing (Python also has a "
+                "stdlib-ast fallback). Returns compact file:line anchors and signatures/snippets, never full bodies."
             ),
             "parameters": {"type": "object", "properties": {
-                "op": {"type": "string", "enum": list(_OPS), "description": "Query operation."},
-                "query": {"type": "string", "default": "", "description": "Symbol, structural pattern, or task text."},
+                "op": {"type": "string", "enum": list(_OPS), "description": "Operation: relevant_files (where to look), digest (whole-repo map), symbols, definition, references, callers, callees, impact, structural."},
+                "query": {"type": "string", "default": "", "description": "Exact symbol name (definition/references/callers/...), AST node type (structural), or task text (relevant_files). Empty for digest."},
                 "path": {"type": "string", "default": "", "description": "Optional file/dir scope or definition disambiguator."},
-                "lang": {"type": "string", "enum": ["python", "javascript", "typescript", "any"], "default": "any"},
+                "lang": {"type": "string", "enum": ["python", "javascript", "typescript", "go", "rust", "java", "ruby", "c", "cpp", "csharp", "php", "kotlin", "swift", "scala", "lua", "bash", "any"], "default": "any"},
                 "kind": {"type": "string", "enum": ["function", "async_function", "class", "constant", "any"], "default": "any"},
                 "depth": {"type": "integer", "default": 1, "description": "Graph depth for impact."},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace"},

@@ -125,6 +125,24 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   explicit in the plan, docs, tests, and review packet. Silent quality downgrades
   are continuity regressions, not refactors.
 
+### Anti-pattern: tool-choice / discoverability gaps via SYSTEM.md prose (v6.37.0)
+
+Do NOT fix a tool-choice or affordance-discoverability failure (the model didn't
+reach for the right tool) by accreting per-case instructions in `prompts/SYSTEM.md`.
+If the tool's description is already correct and the model still misses it, the fix
+is one of:
+1. a better tool DESCRIPTION at the schema source (tool schemas are always loaded
+   into context, so this reaches the model without prompt growth), or
+2. a STRUCTURAL affordance that makes the intended action available at the point of
+   need (e.g. an in-task tool, a typed contract field).
+
+Growing SYSTEM.md one bullet per incident is a P2 patch-smell — it trains around a
+single failure instead of removing the class, bloats the resident prompt, and
+fragments behavior away from the SSOT (P7). Pattern instance: the cyber-racing task
+ran `mkdir ~/Desktop` instead of creating an Ouroboros project even though
+`promote_chat_to_task(project_name=…)` already described exactly that — the fix was a
+structural `ensure_project_scope` in-task affordance, not a new SYSTEM.md rule.
+
 ### Provider Independence
 
 Ouroboros must remain fully operational when configured with a SINGLE isolated
@@ -288,10 +306,14 @@ Reviewed commits now have an explicit **two-step gate**:
 2. **Unified pre-commit review**: once advisory is fresh, the reviewed commit path
    runs reviewer slots in parallel on the exact staged snapshot:
    - **Triad review** (`ouroboros/tools/review.py` + `ouroboros/triad_review.py`,
-     orchestrated by `ouroboros/tools/parallel_review.py`): at least 2 reviewer
-     slots (as configured in `OUROBOROS_REVIEW_MODELS`; duplicate model ids
-     are valid independent slots) review the staged diff against
-     `docs/CHECKLISTS.md`.
+     orchestrated by `ouroboros/tools/parallel_review.py`): the configured reviewer
+     slots (`OUROBOROS_REVIEW_MODELS`; duplicate model ids are valid independent
+     slots) review the staged diff against `docs/CHECKLISTS.md`. Quorum is adaptive
+     to the configured count via `config.adaptive_quorum` (2-of-N for N≥3, both for
+     N=2; a single configured reviewer is honored as a loud
+     `single_reviewer_no_diversity` degraded mode — the default config ships 3
+     reviewers / 2-of-3). A configured-≥quorum-but-fewer-responded shortfall stays
+     a loud infra quorum failure.
    - **Scope review** (`ouroboros/tools/scope_review.py`): one or more scope slots review
      completeness and cross-module consistency with touched context plus a
      generated repository Atlas (`review_context_atlas.compile_review_context_atlas`).
@@ -319,9 +341,11 @@ The cap is model-aware on two axes: Claude-family scope reviewers tokenize
 code-heavy packs at ~2.5 chars/token (~1.58x the chars/4 estimate), so
 `_effective_scope_input_limit` returns the calibrated
 `_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT` (≈545K estimated tokens) for them, and a
-KNOWN reviewer window from `provider_models.context_window_tokens` replaces the
+KNOWN reviewer window from Capability Evidence (`_scope_reviewer_window` ->
+`ouroboros.capability_evidence`; no static per-model table, v6.33.0) replaces the
 assumed 1M with reserves scaled to the window (`_window_scaled_reserves`) so a
-small-window slot keeps a positive input limit. A KNOWN sub-1M scope reviewer
+small-window slot keeps a positive input limit. The P3 floor is also an explicit
+binary config (`OUROBOROS_SCOPE_REVIEW_FLOOR` = `blocking_1m` default | `advisory`). A KNOWN sub-1M scope reviewer
 has advisory-only verdict authority (its parsed findings cannot block — BIBLE
 P3 floor) and, when the irreducible canonical-docs prompt physically cannot fit
 its window, it routes to the disclosed non-blocking `budget_exceeded` skip —
@@ -450,9 +474,16 @@ Before every commit, verify the following:
 #### Live Subagent Task Constraints
 - Live subagents are scheduled only through the existing `schedule_subagent` tool.
   Its public schema is strict: `objective` and `expected_output` are required;
-  `role`, `context`, `constraints`, `memory_mode`, and `model_lane` are optional.
-  Do not reintroduce public `parent_task_id` or `description` arguments; lineage
-  comes from `ToolContext`.
+  `role`, `context`, `constraints`, `memory_mode`, `model_lane`, and the typed
+  delegation-budget grants `delegation_intent`, `may_mutate`, `may_fan_out`, and
+  `max_children` (v6.37.0 C3.1) are optional. The booleans `may_mutate`/`may_fan_out`
+  are parsed with the strict `normalize_bool` (the string `"false"` is NOT truthy),
+  and the child's budget only ever NARROWS within the parent's
+  (`_narrow_child_delegation_budget`): recursion authority (delegate/fan-out/
+  max-children) is AND-ed with / capped to the parent's, and `may_mutate` is gated
+  by the parent ONLY when the parent is itself a subagent (so a root honors its
+  explicit opt-in while a read-only subagent cannot escalate). Do not reintroduce
+  public `parent_task_id` or `description` arguments; lineage comes from `ToolContext`.
 - Live `memory_mode=shared` is disabled. Keep `forked` and `empty` as the only
   live subagent modes unless a later design adds sanitized shared-context v2.
 - External `/api/tasks` and CLI requests must reject forged
@@ -502,7 +533,9 @@ Before every commit, verify the following:
 - `task_constraint` boolean parsing must be strict; strings such as `"false"`
   are false, never truthy through Python's `bool("false")`.
 - Subagent changes must keep writes, commits, review mutation, runtime control,
-  tool expansion, skills lifecycle, and shell blocked. Nested readonly
+  tool expansion, skills lifecycle, and shell blocked — except bounded task-tree
+  coordination via `tree_note`/`tree_read` (the one permitted local-write path for
+  swarm beacons/shared-frame reads, not state mutation). Nested readonly
   `schedule_subagent` recursion is allowed only within configured depth/cap
   limits; descendants deeper than the first child level are coerced to the light
   lane. Enabled/reviewed extension tools and enabled MCP tools may remain
@@ -625,11 +658,23 @@ scope=...)` — or, when an existing manager owns the Popen call, registered via
 ledger (`data/state/process_ledger.jsonl`) is what lets the orphan reaper find
 children after an abrupt worker/server death; an unledgered process orphans
 invisibly and forever. Scopes: `task` (dies with its task), `session` (dies
-with the server generation), `daemon` (launcher-managed; reaper only prunes).
-The reaper kills strictly by (pid, start_time, cmd_sha256) fingerprint — never
-add command-line-class matching, which would let a dev instance reap a
-packaged instance's processes. `tests/test_process_custody.py` enforces the
-chokepoint with an explicit allowlist for bounded synchronous helpers.
+with the server generation), `daemon` (genuine launcher-managed lifecycles,
+e.g. `server_restart_fallback` — reaper keeps them, only pruning dead entries).
+Skill **companions** also record `daemon` scope but are the documented
+exception: `reap_orphaned_processes` reaps a companion (`purpose
+companion:<skill>:<name>`) when its owning skill is **uninstalled** OR the entry
+is from a **foreign (dead) server generation** (`CompanionSupervisor.start()`
+always re-spawns a fresh pid, so a generation-crossing match is a stale
+duplicate). This is **log-only by default** (`enforce_companion_reap=False`
+emits a `process_would_reap` event instead of killing) and **fail-safe**:
+`live_owner_skills=None` (unknown install set — incl. a momentarily empty skills
+dir, coalesced to `None`) means keep-all, never a mass-kill, and same-session
+companions of installed skills are always kept so the live `CompanionSupervisor`
+stays their sole owner. The reaper kills strictly by (pid, start_time,
+cmd_sha256) fingerprint — never add command-line-class matching, which would let
+a dev instance reap a packaged instance's processes.
+`tests/test_process_custody.py` enforces the chokepoint with an explicit
+allowlist for bounded synchronous helpers.
 
 ## Platform Abstraction Rule
 
@@ -735,7 +780,7 @@ preserves scroll stickiness only; it must not mutate DOM padding.
   grammar: translucent dark background, subtle border, blur, and bounded radius.
   Do not add transparent text-only pills for primary actions.
 - Desktop chat composer controls stay inside the single frosted text-entry
-  surface. On mobile, Consilium and Low/Max move above the textarea so text
+  surface. On mobile, Swarm and Low/Max move above the textarea so text
   width remains usable, while Send stays inside the field.
 - Button and segmented-control labels use `letter-spacing: 0` and stable
   dimensions. If a label does not fit on mobile, shrink the control group or
@@ -875,6 +920,13 @@ The Logs page phase badges now match Chat live card colors.
 JS modules that generate HTML must use CSS class names, not `style=""` attributes.
 This is enforced by reviewer policy — `.style.*` assignments on DOM elements (e.g.
 `element.style.display`, `element.style.color`) will produce a REVIEW_BLOCKED finding.
+**Accepted exception — dynamic CSS custom properties.** Setting a CSS variable for a
+genuinely DYNAMIC value (`root.style.setProperty('--sidebar-width', w + 'px')` for a
+live drag) is the idiomatic CSS-variable theming API, not a static inline style — it
+feeds a stylesheet rule rather than hard-coding a visual property on the element, and
+routing it through a managed `<style>` rule re-parsed each frame would be strictly
+worse. CSS-variable mutation via `setProperty('--x', …)` is therefore allowed; static
+visual properties (`display`/`color`/`width`/…) remain blocked. (v6.34.0, CW10)
 Existing classes (`.stat-card`, `.page-header`, `.app-page-*`, `.app-tab-*`, `.about-*`, `.costs-*`) cover common layouts.
 For new top-level pages, prefer `web/modules/page_header.js` over bespoke header/tab markup.
 Add new classes to `web/style.css` when needed.

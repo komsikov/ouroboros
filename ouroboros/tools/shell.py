@@ -66,8 +66,14 @@ _OUTPUT_DIR_MAX_FILES = 1000
 _OUTPUT_DIR_MAX_BYTES = 50 * 1024 * 1024
 
 def _tracked_subprocess_run(cmd, **kwargs):
-    """subprocess.run replacement with process-tree tracking."""
+    """subprocess.run replacement with process-tree tracking. When capturing TEXT
+    output, decode tolerantly (errors='replace') so binary stdout/stderr (a MIPS
+    interpreter, a DOOM framebuffer, raw bytes) surfaces as readable text instead
+    of raising UnicodeDecodeError and collapsing the whole call into a
+    shell_error."""
     timeout = kwargs.pop("timeout", None)
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("errors", "replace")
     kwargs.update(subprocess_new_group_kwargs())
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     proc = subprocess.Popen(cmd, **kwargs)
@@ -100,8 +106,33 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
-def _resolve_effective_timeout(default_timeout_sec: int, ctx: ToolContext | None = None) -> int:
-    """Resolve effective timeout, capping defaults by task deadline when present."""
+def _resolve_effective_timeout(
+    default_timeout_sec: int,
+    ctx: ToolContext | None = None,
+    override_sec: int | None = None,
+) -> int:
+    """Resolve effective timeout, capping by task deadline when present.
+
+    An explicit per-call ``override_sec`` (from ``run_command``/``run_script``)
+    takes precedence over env/settings/default, but is still clamped toward the
+    remaining task-deadline budget (same 60s floor / 1800s ceiling as the default
+    path); the outer budget loop remains the hard deadline enforcer.
+    """
+    if override_sec is not None:
+        try:
+            ov = int(override_sec)
+        except (TypeError, ValueError):
+            ov = 0
+        if ov > 0:
+            from ouroboros.config import get_per_call_timeout_ceiling_sec
+
+            ceiling = get_per_call_timeout_ceiling_sec()
+            cap = ceiling
+            if ctx is not None:
+                remaining = deadline_remaining_sec(ctx)
+                if remaining > 0:
+                    cap = int(max(60, min(ceiling, remaining * 0.5)))
+            return max(1, min(ov, cap))
     default_setting = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
     raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
     if raw:
@@ -399,6 +430,7 @@ def _register_process_outputs(
         return "", False
     notes: list[str] = []
     failed = False
+    registered = False  # at least one canonical artifact record was actually created
     for raw_item in outputs:
         text = str(raw_item or "").strip()
         source, block_reason = _resolve_declared_output(
@@ -423,8 +455,12 @@ def _register_process_outputs(
         before = (before_outputs or {}).get(str(source), (False, -1, ""))
         after = _fingerprint_output(source)
         if before[0] and before == after:
-            notes.append(f"unchanged output: {text}")
-            failed = True
+            # Present-but-unchanged is NOT a failure (a deterministic re-run, or a
+            # command that re-verifies an existing artifact): note it cosmetically
+            # and skip re-registration. "Did it actually work?" lives on the
+            # objective/review axis, not the tool-execution axis (Bible P5). A
+            # genuinely MISSING declared output above stays a blocking failure.
+            notes.append(f"unchanged output (cosmetic): {text}")
             continue
         if source.is_file():
             try:
@@ -434,6 +470,7 @@ def _register_process_outputs(
                 failed = True
                 continue
             if record:
+                registered = True
                 notes.append(
                     f"registered output {source} -> artifact_store:{record.get('name')} "
                     f"sha256={str(record.get('sha256') or '')[:12]}"
@@ -464,6 +501,7 @@ def _register_process_outputs(
                 failed = True
                 continue
             if records:
+                registered = True
                 names = ", ".join(str(record.get("name") or "") for record in records)
                 notes.append(f"registered directory output {source} -> artifact_store:{names}")
             else:
@@ -474,7 +512,18 @@ def _register_process_outputs(
             failed = True
     if not notes:
         return "", False
-    prefix = "⚠️ ARTIFACT_OUTPUT_ERROR" if failed else "ARTIFACT_OUTPUTS"
+    # Distinguish a CANONICAL artifact registration from a cosmetic-only note (e.g.
+    # an unchanged declared output): the downstream artifact_registered detector
+    # (outcomes.py / loop_tool_execution.py) keys on the exact "ARTIFACT_OUTPUTS"
+    # marker, so a cosmetic note must NOT borrow it — else an unchanged output reads
+    # as a real registration / false recovery signal. "ARTIFACT_OUTPUT_NOTE" does
+    # not contain the "ARTIFACT_OUTPUTS" substring, so it is correctly ignored.
+    if failed:
+        prefix = "⚠️ ARTIFACT_OUTPUT_ERROR"
+    elif registered:
+        prefix = "ARTIFACT_OUTPUTS"
+    else:
+        prefix = "ARTIFACT_OUTPUT_NOTE"
     return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed
 
 
@@ -692,6 +741,19 @@ _SHELL_BUILTINS = frozenset([
 ])
 
 _SHELL_OPERATORS = frozenset(["&&", "||", "|", ";", ">", ">>", "<", "<<"])
+# A redirect GLUED into a single argv element ("2>/dev/null", "2>&1", ">out.log",
+# "&>x") — the standalone-operator set above misses these. Anchored at the element
+# START so a '>' inside a sed/awk/grep expression ("s/a>b/c/g") is NOT flagged.
+# Output redirects keep a permissive glued tail. Input redirects are restricted to
+# UNAMBIGUOUS shapes — heredoc/herestring ("<<EOF", "<<<s"), an fd-prefixed input
+# ("0<f", "2<&1"), or a bare standalone "<" — because a plain "<word" element is
+# indistinguishable from a legitimate literal angle-bracket arg (grep "<div>",
+# "<stdin>"), and false-flagging those is worse than missing a rare glued "<file"
+# input redirect. Pipes/control operators are deliberately NOT matched (a glued
+# '|' is valid regex alternation, grep "a|b").
+_GLUED_REDIRECT_RE = re.compile(
+    r'^(?:(?:\d+>>?|>>?&?\d*|\d*>&\d*|&>>?)(?:\S.*)?|\d+<\S*|<<\S*|<)$'
+)
 _SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
 _SENSITIVE_OUTPUT_NAMES = frozenset({".env", ".env.local", "credentials.json", "secrets.json", "token.json"})
@@ -829,7 +891,16 @@ def _mentioned_user_file_outputs_without_declaration(ctx: ToolContext, cmd: List
     return mentioned
 
 
-def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None = None) -> str:
+def _run_shell(
+    ctx: ToolContext,
+    cmd,
+    cwd: str = "",
+    outputs: List[str] | None = None,
+    timeout_sec: int | None = None,
+    timeout: int | None = None,
+) -> str:
+    # Per-call timeout override (canonical timeout_sec; timeout accepted as alias).
+    _timeout_override = timeout_sec if timeout_sec is not None else timeout
     if isinstance(cmd, str):
         # Recover common stringified argv mistakes before failing.
         recovered = None
@@ -850,6 +921,17 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         if recovered is None:
             stripped = cmd.lstrip()
             is_posix_test_cmd = stripped.startswith("[ ") and stripped.rstrip().endswith(" ]")
+            # A shell brace group `{ ...; }` starts with "{ " (brace + space, the
+            # reserved word) — distinct from a JSON object `{"k":...}`. It is valid
+            # shell, not a malformed list, so don't emit the misleading JSON error;
+            # point at sh -c instead (run_command runs argv directly, no shell).
+            is_brace_group = stripped.startswith("{ ") and stripped.rstrip().endswith("}")
+            if is_brace_group:
+                return (
+                    '⚠️ SHELL_CMD_ERROR: `{ ...; }` is a shell brace group, which run_command '
+                    'cannot execute directly (it runs argv without a shell). Wrap it in a shell:\n'
+                    '  run_command(cmd=["sh", "-c", "{ cmd1; cmd2; }"])'
+                )
             if stripped[:1] in ("[", "{") and not is_posix_test_cmd:
                 return (
                     '⚠️ SHELL_ARG_ERROR: `cmd` looks like a JSON/Python list literal '
@@ -923,6 +1005,19 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
             '(2) For pipes/chaining: ["sh", "-c", "cmd1 && cmd2"]'
         )
 
+    # A redirect glued into one argv element (e.g. "2>/dev/null", "2>&1") slips
+    # past the standalone-operator set above and reaches the program as a literal
+    # arg — the program then dies cryptically ("find: 2>/dev/null: unknown
+    # primary"). Surface the same actionable hint before subprocess runs.
+    for arg in cmd:
+        if _GLUED_REDIRECT_RE.match(arg):
+            return (
+                f'⚠️ SHELL_CMD_ERROR: Shell redirection "{arg}" found in cmd array. '
+                'Subprocess does not interpret shell syntax, so it reaches the '
+                'program as a literal argument. '
+                'Use ["sh", "-c", "your command with redirects"] for redirection.'
+            )
+
     active_repo_dir = active_repo_dir_for(ctx)
     active_root = pathlib.Path(active_repo_dir).resolve(strict=False)
     try:
@@ -951,7 +1046,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         changed_paths=set(before_changed or []),
     )
 
-    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx)
+    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=_timeout_override)
     bootstrap_process_path()
     try:
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
@@ -1044,7 +1139,7 @@ def _load_project_context(repo_dir: pathlib.Path) -> str:
         fpath = repo_dir / relpath
         if fpath.is_file():
             try:
-                content = fpath.read_text(encoding="utf-8")
+                content = fpath.read_text(encoding="utf-8", errors="replace")
                 parts.append(f"## {label}\n\n{content}")
             except Exception:
                 pass
@@ -1427,6 +1522,8 @@ def _run_script(
     args: List[str] | None = None,
     cwd: str = "",
     outputs: List[str] | None = None,
+    timeout_sec: int | None = None,
+    timeout: int | None = None,
 ) -> str:
     """Write a task-scoped temporary script and run it as a foreground command."""
     interp = str(interpreter or "python3").strip()
@@ -1489,7 +1586,7 @@ def _run_script(
     ):
         effective_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
     try:
-        result = _run_shell(ctx, argv, cwd=effective_cwd, outputs=outputs)
+        result = _run_shell(ctx, argv, cwd=effective_cwd, outputs=outputs, timeout_sec=timeout_sec, timeout=timeout)
     finally:
         if workspace_backed_script:
             try:
@@ -1512,7 +1609,9 @@ def get_tools() -> List[ToolEntry]:
                 "Every result header echoes the resolved cwd. "
                 "cmd MUST be an array of strings, never a single shell-style "
                 "string. Use cwd= for working directory; cd is rejected. "
-                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]."
+                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]. "
+                "Prefer the dedicated tools where one fits: read_file (not cat/head/sed-as-reader), "
+                "search_code/query_code (not grep/find-as-search), write_file/edit_text (not sed/echo-redirect)."
             ),
             "parameters": {"type": "object", "properties": {
                 "cmd": {
@@ -1541,6 +1640,17 @@ def get_tools() -> List[ToolEntry]:
 	                    "default": [],
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
 	                },
+	                "timeout_sec": {
+	                    "type": "integer",
+	                    "description": (
+	                        "Optional per-call timeout in seconds for long builds/tests (alias: timeout). "
+	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
+	                    ),
+	                },
+	                "timeout": {
+	                    "type": "integer",
+	                    "description": "Alias for timeout_sec (per-call timeout in seconds).",
+	                },
 	            }, "required": ["cmd"]},
         }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
         ToolEntry("claude_code_edit", {
@@ -1567,8 +1677,8 @@ def get_tools() -> List[ToolEntry]:
 	                },
                 "budget": {"type": "number", "default": 5.0},
                 "validate": {"type": "boolean", "default": False},
-                "bucket": {"type": "string", "default": ""},
-                "skill_name": {"type": "string", "default": ""},
+                "bucket": {"type": "string", "default": "", "description": "Skill payload bucket — set ONLY for skill_payload edits; leave empty otherwise."},
+                "skill_name": {"type": "string", "default": "", "description": "Skill slug — set ONLY for skill_payload edits; leave empty otherwise."},
                 "outputs": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1594,6 +1704,17 @@ def get_tools() -> List[ToolEntry]:
 	                    "items": {"type": "string"},
 	                    "default": [],
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
+	                },
+	                "timeout_sec": {
+	                    "type": "integer",
+	                    "description": (
+	                        "Optional per-call timeout in seconds for long scripts (alias: timeout). "
+	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
+	                    ),
+	                },
+	                "timeout": {
+	                    "type": "integer",
+	                    "description": "Alias for timeout_sec (per-call timeout in seconds).",
 	                },
 	            }, "required": ["script"]},
         }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),

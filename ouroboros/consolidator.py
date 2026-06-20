@@ -467,6 +467,9 @@ The oldest {compress_count} blocks need compression.
 Rules:
 1. Identify insights, patterns, lessons, and architectural decisions worth
    preserving long-term. Output them as knowledge_entries with topic + content.
+   Each "topic" must be a short kebab-case slug (lowercase letters/digits/hyphens,
+   e.g. "api-gotchas"), not a sentence — a topic with spaces or punctuation is
+   rejected and the entry is dropped.
 2. Compress the old blocks into a SINGLE shorter summary block. Keep active
    tasks, unresolved questions, admin instructions still in force. Remove
    stale/completed items and routine status updates.
@@ -480,7 +483,7 @@ Identity context: {identity_text if identity_text else "(not available)"}
 {old_content}
 
 Respond with JSON only (no fences):
-{{"knowledge_entries": [{{"topic": "name", "content": "text"}}], "compressed_block": "single compressed block text"}}
+{{"knowledge_entries": [{{"topic": "kebab-case-slug", "content": "text"}}], "compressed_block": "single compressed block text"}}
 """
 
     try:
@@ -540,14 +543,21 @@ Respond with JSON only (no fences):
 
 
 def _write_knowledge_entries(knowledge_dir: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
+    # Validate topics through the ONE knowledge-topic validator (P7/C9.4) instead of
+    # a private char-filter that silently munged names into a different file than
+    # the knowledge tool would. An invalid topic is skipped + logged, never coerced.
+    from ouroboros.tools.knowledge import _sanitize_topic
+
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     for entry in entries:
         topic = entry.get("topic", "").strip()
         kb_content = entry.get("content", "").strip()
         if not topic or not kb_content:
             continue
-        safe_topic = "".join(c for c in topic if c.isalnum() or c in "-_").lower()
-        if not safe_topic:
+        try:
+            safe_topic = _sanitize_topic(topic)
+        except ValueError:
+            log.debug("consolidator: skipping invalid knowledge topic %r", topic)
             continue
         kb_path = knowledge_dir / f"{safe_topic}.md"
         existing = read_text(kb_path) if kb_path.exists() else ""

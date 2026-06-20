@@ -238,6 +238,12 @@ class LLMClient:
     # Missing capabilities mean "unknown": keep kwargs instead of stripping them.
     _SUPPORTED_PARAMS_CACHE: Dict[str, set] = {}
     _SUPPORTED_PARAMS_FETCHED: bool = False
+    # Did the one-shot /models fetch actually reach OpenRouter (HTTP 200 + parse)?
+    # Distinguishes a provider OUTAGE from a route with no metadata, so Capability
+    # Evidence can mark STATUS_FAILED (transient) vs STATUS_UNPROBEABLE (v6.33.0 P4).
+    _CAPABILITIES_FETCH_OK: bool = False
+    # OpenRouter-reported context window per model id (provider_metadata evidence).
+    _CONTEXT_LENGTH_CACHE: Dict[str, int] = {}
     _REJECTED_PARAMS_CACHE: Dict[str, Set[str]] = {}
 
     def __init__(
@@ -262,11 +268,16 @@ class LLMClient:
     def _fetch_openrouter_capabilities(cls) -> None:
         """Populate _SUPPORTED_PARAMS_CACHE once from OpenRouter /models."""
         cls._SUPPORTED_PARAMS_FETCHED = True
+        cls._CAPABILITIES_FETCH_OK = False  # set True only on a clean 200 + parse
         try:
             import requests
+            # 5s, not 15s: this fetch is on the synchronous capability-probe path
+            # behind the max-context-mode gate (settings save / max toggle). A slow
+            # probe must fail-closed quickly (-> window unknown -> max blocked with
+            # the owner-ack escape), never hang the save (v6.33.0 WS4 timing budget).
             resp = requests.get(
                 "https://openrouter.ai/api/v1/models",
-                timeout=15,
+                timeout=5,
             )
             if resp.status_code != 200:
                 log.debug(
@@ -281,6 +292,10 @@ class LLMClient:
                 sp = m.get("supported_parameters")
                 if mid and isinstance(sp, list) and sp:
                     cls._SUPPORTED_PARAMS_CACHE[mid] = set(sp)
+                # Context window (provider_metadata Capability Evidence source).
+                cl = m.get("context_length")
+                if mid and isinstance(cl, (int, float)) and cl > 0:
+                    cls._CONTEXT_LENGTH_CACHE[mid] = int(cl)
                 # Vision overlay for supports_vision(): authoritative
                 # input_modalities from the same /models payload.
                 arch = m.get("architecture")
@@ -288,8 +303,17 @@ class LLMClient:
                     modalities = arch.get("input_modalities")
                     if isinstance(modalities, list) and modalities:
                         update_vision_overlay(mid, "image" in modalities)
+            cls._CAPABILITIES_FETCH_OK = True  # reached the provider and parsed it
         except Exception:
             log.debug("Failed to fetch OpenRouter model capabilities", exc_info=True)
+
+    @classmethod
+    def metadata_fetch_attempted_and_failed(cls) -> bool:
+        """True when the one-shot OpenRouter /models fetch RAN but did not succeed
+        (non-200 or transport error) — i.e. the provider was unreachable, distinct
+        from 'not fetched yet'. Capability Evidence uses this to record STATUS_FAILED
+        (a transient outage) instead of STATUS_UNPROBEABLE (no metadata source)."""
+        return bool(cls._SUPPORTED_PARAMS_FETCHED and not cls._CAPABILITIES_FETCH_OK)
 
     @classmethod
     def _get_supported_parameters(cls, model_id: str) -> Optional[set]:
@@ -297,6 +321,26 @@ class LLMClient:
         if not cls._SUPPORTED_PARAMS_FETCHED:
             cls._fetch_openrouter_capabilities()
         return cls._SUPPORTED_PARAMS_CACHE.get(model_id)
+
+    @classmethod
+    def openrouter_context_length(cls, model_id: str, *, allow_fetch: bool = True) -> int:
+        """OpenRouter-reported context window (tokens) for a model id, else 0.
+
+        provider_metadata Capability Evidence source. A successful /models fetch is
+        cached and not repeated; pass allow_fetch=False to read only the existing
+        cache (so a hot path never triggers a blocking /models call). On the
+        capability-probe path (allow_fetch=True) a RE-fetch is allowed when the
+        last fetch FAILED or the requested model is absent from the cache — so a
+        transient outage isn't poisoned one-shot and a model picked while the
+        provider is unreachable is correctly seen as a transport failure (and
+        surfaced as a no-connection error), not silently 'unprobeable' (v6.33.0)."""
+        mid = str(model_id or "")
+        needs_fetch = (not cls._SUPPORTED_PARAMS_FETCHED) or (
+            allow_fetch and (not cls._CAPABILITIES_FETCH_OK or mid not in cls._CONTEXT_LENGTH_CACHE)
+        )
+        if allow_fetch and needs_fetch:
+            cls._fetch_openrouter_capabilities()
+        return int(cls._CONTEXT_LENGTH_CACHE.get(mid, 0) or 0)
 
     @staticmethod
     def _parameter_rejection_error(exc: BaseException) -> bool:
@@ -657,16 +701,56 @@ class LLMClient:
                             block.pop(key, None)
         return cleaned
 
-    @staticmethod
-    def _strip_openrouter_roundtrip_metadata(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Strip OpenRouter reasoning round-trip fields for providers that reject extra message keys."""
+    # Provider-private reasoning CONTENT blocks (Anthropic/Gemini-via-OpenRouter
+    # shape: content:[{type:"thinking"|"reasoning", signature:...}]) carry a
+    # signature that only the PRODUCING upstream family can validate. Replaying
+    # them to another family is the source of the 400 "Invalid `signature` in
+    # `thinking` block" fallback death.
+    _REASONING_CONTENT_BLOCK_TYPES = frozenset({"thinking", "reasoning", "redacted_thinking"})
+
+    @classmethod
+    def _strip_openrouter_roundtrip_metadata(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Strip provider-private reasoning round-trip artifacts that a DIFFERENT
+        upstream family rejects: assistant-level ``reasoning``/``reasoning_details``/
+        ``response_id`` keys AND ``thinking``/``reasoning`` CONTENT blocks (plus any
+        stray ``signature`` on other blocks). Returns a deep copy; the canonical
+        transcript is untouched."""
         cleaned = copy.deepcopy(messages)
         for msg in cleaned:
-            if msg.get("role") != "assistant":
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
             msg.pop("reasoning", None)
             msg.pop("reasoning_details", None)
             msg.pop("response_id", None)
+            content = msg.get("content")
+            if isinstance(content, list):
+                kept: List[Any] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        btype = str(block.get("type") or "").strip().lower()
+                        if btype in cls._REASONING_CONTENT_BLOCK_TYPES:
+                            continue
+                        block.pop("signature", None)
+                    kept.append(block)
+                msg["content"] = kept
+        return cleaned
+
+    @staticmethod
+    def _replace_image_blocks_with_placeholder(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Replace image content-blocks with an explicit text placeholder for a
+        model that has NO native vision — a raw ``image_url`` sent to a blind model
+        is silently ignored or 404s. Mirrors the local llama.cpp and GigaChat lanes.
+        Returns a deep copy; the canonical transcript is untouched."""
+        cleaned = copy.deepcopy(messages)
+        for msg in cleaned:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for idx, block in enumerate(content):
+                if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
+                    caption = str(block.get("_caption") or "").strip()
+                    suffix = f" — {caption}" if caption else ""
+                    content[idx] = {"type": "text", "text": f"[image omitted: model has no vision{suffix}]"}
         return cleaned
 
     @staticmethod
@@ -734,27 +818,58 @@ class LLMClient:
                 return True
         return False
 
-    @staticmethod
-    def _is_openrouter_signature_error(exc: Exception) -> bool:
-        """Provider 400s caused by replaying roundtrip reasoning metadata.
+    @classmethod
+    def _has_replayed_reasoning_metadata(cls, messages: List[Dict[str, Any]]) -> bool:
+        """True if the transcript carries provider-private reasoning artifacts that
+        a DIFFERENT upstream family cannot validate: assistant ``reasoning``/
+        ``reasoning_details``/``response_id`` keys, or ``thinking``/``reasoning``
+        CONTENT blocks (or a stray ``signature`` on a content block). Broader than
+        ``_has_openrouter_reasoning_details`` (which only sees the top-level
+        ``reasoning_details`` field)."""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("reasoning") or msg.get("reasoning_details") or msg.get("response_id"):
+                return True
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = str(block.get("type") or "").strip().lower()
+                    if btype in cls._REASONING_CONTENT_BLOCK_TYPES or block.get("signature"):
+                        return True
+        return False
 
-        Two known shapes: Gemini-style "thought signature" rejections and
-        gpt-5-style "encrypted reasoning item" rejections (long transcripts
-        replay `reasoning`/`reasoning_details`/`response_id` items the
-        provider can no longer decrypt). Both recover by stripping the
-        roundtrip metadata and retrying the SAME model once.
-        """
-        text = str(exc).lower()
-        return any(
-            marker in text
-            for marker in (
-                "thought signature",
-                "encrypted reasoning",
-                "encrypted content for item",  # observed gpt-5 shape: "...for item rs_..."
-                "reasoning item",
-                "reasoning_details",
-            )
-        )
+    @staticmethod
+    def _model_family(model: Any) -> str:
+        """The upstream provider FAMILY of a model id — the part before the first
+        '/' (``z-ai/glm-5.2`` -> ``z-ai``; ``anthropic/claude-…`` -> ``anthropic``).
+        This is the boundary that matters for reasoning-signature validity: GLM and
+        Claude both transit OpenRouter, so ``provider=='openrouter'`` is too coarse —
+        the FAMILY produces (and alone can validate) a thinking-block signature."""
+        norm = (normalize_model_identity(str(model or "")) or str(model or "")).strip().lower().lstrip("~")
+        if "/" in norm:
+            return norm.split("/", 1)[0]
+        return norm
+
+    @staticmethod
+    def _is_http_status(exc: Exception, code: int) -> bool:
+        """Structural HTTP-status check on a provider exception (``status_code``
+        attribute; falls back to the OpenAI-SDK ``Error code: NNN`` message shape).
+        Used instead of error-string matching so the recovery covers every provider
+        phrasing of the same status class."""
+        sc = getattr(exc, "status_code", None)
+        if sc is not None:
+            try:
+                return int(sc) == int(code)
+            except (TypeError, ValueError):
+                pass
+        # No status_code attr (non-SDK exceptions): match the code only as a
+        # STATUS token — leading, or after error/status/http labels — not any bare
+        # number, so a token count or id with "400" in it can't false-trigger.
+        text = str(exc).strip().lower()
+        return bool(re.search(rf"(?:^|error code:?\s*|status(?:[ _]code)?:?\s*|http[\s:]*){int(code)}\b", text))
 
     def _openrouter_signature_retry_kwargs(
         self,
@@ -762,16 +877,39 @@ class LLMClient:
         kwargs: Dict[str, Any],
         exc: Exception,
     ) -> Optional[Dict[str, Any]]:
+        """Structural recovery for provider 400s caused by replaying reasoning
+        metadata: when the request CARRIED replayed reasoning artifacts AND the
+        provider returned 400, strip the artifacts and retry the SAME model once.
+        The trigger is structural (request shape + 400 status), NOT an error-string
+        allowlist — so every provider phrasing of this failure class is covered.
+        ``_reroute_same_model_kwargs`` returns None when no reasoning was present,
+        so a genuine (non-reasoning) 400 still propagates unchanged."""
         if not target.get("supports_openrouter_extensions"):
             return None
-        if not self._is_openrouter_signature_error(exc):
+        if not self._is_http_status(exc, 400):
+            return None
+        return self._reroute_same_model_kwargs(target, kwargs)
+
+    def _reroute_same_model_kwargs(
+        self,
+        target: Dict[str, Any],
+        kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Same-model reroute: strip replayed reasoning metadata and drop the
+        provider pin (``allow_fallbacks=false``, set only to preserve reasoning
+        continuity) so OpenRouter can route to a HEALTHY endpoint of the SAME
+        model. Shared by the 400 signature-rejection path and the transient
+        200-body provider-error path. Returns None when no replayed reasoning is
+        present (nothing to strip / no continuity pin to drop — default routing can
+        already fall back across endpoints). NEVER switches model — only endpoint."""
+        if not target.get("supports_openrouter_extensions"):
             return None
         messages = kwargs.get("messages")
-        if not isinstance(messages, list) or not self._has_openrouter_reasoning_details(messages):
+        if not isinstance(messages, list) or not self._has_replayed_reasoning_metadata(messages):
             return None
         retry_kwargs = copy.deepcopy(kwargs)
         retry_kwargs["messages"] = self._strip_openrouter_roundtrip_metadata(messages)
-        if not self._has_openrouter_reasoning_details(retry_kwargs["messages"]):
+        if not self._has_replayed_reasoning_metadata(retry_kwargs["messages"]):
             extra_body = retry_kwargs.get("extra_body")
             provider = extra_body.get("provider") if isinstance(extra_body, dict) else None
             if isinstance(provider, dict):
@@ -781,6 +919,91 @@ class LLMClient:
                 if not extra_body:
                     retry_kwargs.pop("extra_body", None)
         return retry_kwargs
+
+    @classmethod
+    def sanitize_reasoning_on_model_switch(
+        cls,
+        messages: List[Dict[str, Any]],
+        from_model: Any,
+        to_model: Any,
+    ) -> List[Dict[str, Any]]:
+        """SSOT for cross-family model switches (cross-model fallback, switch_model,
+        per-task model override): when the TARGET model belongs to a DIFFERENT
+        provider family than the SOURCE, strip provider-private reasoning artifacts
+        the target cannot validate — this is what kills the GLM->Claude fallback
+        with a 400 ``Invalid `signature` in `thinking` block``. Same family ->
+        return ``messages`` unchanged (preserve reasoning continuity). On a switch
+        returns a sanitized COPY; the canonical transcript is never mutated."""
+        if cls._model_family(from_model) == cls._model_family(to_model):
+            return messages
+        return cls._strip_openrouter_roundtrip_metadata(messages)
+
+    @staticmethod
+    def _provider_body_error(resp_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """An OpenAI-compatible HTTP 200 whose body carries a top-level ``error``
+        object instead of a usable completion. OpenRouter passes upstream
+        provider errors and its own 429/5xx through the body with status 200; the
+        OpenAI SDK builds these leniently, keeping ``error`` and ``choices=None``.
+        Returns the error dict, else None (a real completion wins over a
+        non-fatal error field)."""
+        if not isinstance(resp_dict, dict):
+            return None
+        err = resp_dict.get("error")
+        if not isinstance(err, dict):
+            return None
+        choices = resp_dict.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            msg = first.get("message") if isinstance(first, dict) else None
+            if isinstance(msg, dict) and (msg.get("content") or msg.get("tool_calls")):
+                return None
+        return err
+
+    @staticmethod
+    def _is_transient_body_error(err: Dict[str, Any]) -> bool:
+        """Transient body-error = worth a same-model reroute/retry (rate limit,
+        overload, upstream 5xx/timeout). Permanent client errors
+        (auth/quota/bad-request) are not — they must surface unchanged."""
+        try:
+            code = int(err.get("code"))
+        except (TypeError, ValueError):
+            code = 0
+        if code in (408, 409, 425, 429, 500, 502, 503, 504, 522, 524, 529):
+            return True
+        text = str(err.get("message") or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "rate limit", "too many requests", "overloaded", "temporarily",
+                "timeout", "timed out", "unavailable", "try again", "capacity",
+            )
+        )
+
+    def _reroute_kwargs_for_body_error(
+        self,
+        resp: Any,
+        kwargs: Dict[str, Any],
+        target: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """If an HTTP-200 response actually carries a TRANSIENT provider
+        body-error, return same-model reroute kwargs (provider unpinned,
+        reasoning continuity dropped); None when not applicable."""
+        try:
+            resp_dict = resp.model_dump()
+        except Exception:
+            return None
+        err = self._provider_body_error(resp_dict)
+        if not err or not self._is_transient_body_error(err):
+            return None
+        reroute = self._reroute_same_model_kwargs(target, kwargs)
+        if reroute is None:
+            return None
+        log.warning(
+            "OpenRouter same-model reroute after transient provider body-error "
+            "(code=%s); reasoning_continuity_dropped",
+            err.get("code"),
+        )
+        return reroute
 
     @classmethod
     def _prompt_cache_ttl_from_payload(cls, *payload_parts: Any) -> Optional[str]:
@@ -1988,6 +2211,16 @@ class LLMClient:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
+        # Blind-model image placeholder applies to BOTH the direct (OpenAI/OpenAI-
+        # compatible/Cloud.ru) and OpenRouter lanes (C2.3): a model with no native
+        # vision gets an explicit "[image omitted]" placeholder instead of raw image
+        # blocks it would 404/ignore. Done BEFORE the provider-branch split so the
+        # direct branch (which returns early below) is covered too — mirrors the
+        # local/GigaChat lanes; the VLM tool lane already routes vision to a capable
+        # slot. supports_vision() is a no-op for vision-capable models.
+        from ouroboros.provider_models import supports_vision
+        if not supports_vision(resolved_model):
+            messages = self._replace_image_blocks_with_placeholder(messages)
         # OpenAI reasoning models (gpt-5*, o-series) reject legacy max_tokens
         # with a deterministic 400 — they require max_completion_tokens.
         openai_reasoning_model = provider == "openai" and resolved_model.startswith(
@@ -2097,6 +2330,19 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
+        # An HTTP-200 that carried a provider body-error (OpenRouter passes
+        # 429/5xx through the body) reaches here only when a same-model reroute
+        # was unavailable or also errored. Surface it as a typed marker so the
+        # caller classifies it as a real rate_limit/provider_transient instead of
+        # a blank finish_reason=null "incomplete response".
+        _body_err = self._provider_body_error(resp_dict)
+        if _body_err:
+            usage["provider_error"] = {
+                "code": _body_err.get("code"),
+                "message": str(_body_err.get("message") or "")[:300],
+                "kind": "rate_limit" if self._is_transient_body_error(_body_err) and str(_body_err.get("code")) == "429"
+                else ("provider_transient" if self._is_transient_body_error(_body_err) else "provider_error"),
+            }
         choices = resp_dict.get("choices") or [{}]
         msg = dict((choices[0] if choices else {}).get("message") or {})
         if resp_dict.get("id") and "response_id" not in msg:
@@ -2156,6 +2402,64 @@ class LLMClient:
 
         return msg, usage
 
+    @staticmethod
+    def extract_display_reasoning(msg: Dict[str, Any]) -> str:
+        """Provider-agnostic, SHAPE-based reader for human-readable reasoning to NARRATE in an
+        otherwise-empty tool-round bubble. Reads only the readable forms a provider may already
+        leave on the normalized message — flat ``reasoning`` (OpenRouter / some OpenAI-compatible),
+        structured ``reasoning_details`` of readable types, or ``content`` thinking/thought blocks
+        (Anthropic ``thinking`` / Gemini ``part.thought``) — and SKIPS opaque/encrypted payloads
+        (``reasoning.encrypted``, ``redacted_thinking``, signature/data-only blocks), which carry no
+        display text and must round-trip byte-for-byte. DISPLAY-ONLY: the caller keeps the result in
+        a local variable and never appends it to the transcript nor sends it to a provider — the raw
+        fields it reads are already on the message and handled by the outbound scrubbers."""
+        if not isinstance(msg, dict):
+            return ""
+        parts: List[str] = []
+
+        flat = msg.get("reasoning")
+        if isinstance(flat, str) and flat.strip():
+            parts.append(flat.strip())
+
+        details = msg.get("reasoning_details")
+        if isinstance(details, list):
+            for d in details:
+                if not isinstance(d, dict):
+                    continue
+                if str(d.get("type") or "") in ("reasoning.text", "reasoning.summary"):
+                    txt = d.get("text") or d.get("summary")
+                    if isinstance(txt, str) and txt.strip():
+                        parts.append(txt.strip())
+                # reasoning.encrypted / signature / data-only payloads are opaque -> skipped.
+
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = str(block.get("type") or "")
+                if btype == "thinking":
+                    txt = block.get("thinking")
+                elif btype == "reasoning":
+                    txt = block.get("text") or block.get("reasoning")
+                elif block.get("thought") is True:  # Gemini part.thought == true
+                    txt = block.get("text")
+                else:
+                    continue  # text / tool_use / redacted_thinking / encrypted -> not display text
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+
+        # De-dup across the whole set (order-preserving): a provider often carries the SAME
+        # readable rollup in both flat ``reasoning`` and a ``reasoning.summary`` detail (verified
+        # against live gpt-5.5), so a consecutive-only check would still double it.
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for p in parts:
+            if p not in seen:
+                seen.add(p)
+                deduped.append(p)
+        return "\n".join(deduped).strip()
+
     def _create_chat_completion_with_retries(
         self,
         create_fn: Any,
@@ -2164,7 +2468,7 @@ class LLMClient:
     ) -> Any:
         usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
         try:
-            return create_fn(**kwargs)
+            resp = create_fn(**kwargs)
         except Exception as exc:
             retry_kwargs = self._retry_without_optional_sampling(kwargs, usage_model, exc)
             if retry_kwargs is not None:
@@ -2179,6 +2483,16 @@ class LLMClient:
             if stripped_kwargs is None:
                 raise
             return create_fn(**stripped_kwargs)
+        # HTTP-200 success can still carry a transient provider body-error
+        # (OpenRouter passes 429/5xx through the body); reroute once to a healthy
+        # endpoint of the SAME model while request kwargs are still mutable.
+        reroute_kwargs = self._reroute_kwargs_for_body_error(resp, kwargs, target)
+        if reroute_kwargs is not None:
+            try:
+                return create_fn(**reroute_kwargs)
+            except Exception:
+                return resp
+        return resp
 
     async def _create_chat_completion_with_retries_async(
         self,
@@ -2188,7 +2502,7 @@ class LLMClient:
     ) -> Any:
         usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
         try:
-            return await create_fn(**kwargs)
+            resp = await create_fn(**kwargs)
         except Exception as exc:
             retry_kwargs = self._retry_without_optional_sampling(kwargs, usage_model, exc)
             if retry_kwargs is not None:
@@ -2203,6 +2517,16 @@ class LLMClient:
             if stripped_kwargs is None:
                 raise
             return await create_fn(**stripped_kwargs)
+        # HTTP-200 success can still carry a transient provider body-error
+        # (OpenRouter passes 429/5xx through the body); reroute once to a healthy
+        # endpoint of the SAME model while request kwargs are still mutable.
+        reroute_kwargs = self._reroute_kwargs_for_body_error(resp, kwargs, target)
+        if reroute_kwargs is not None:
+            try:
+                return await create_fn(**reroute_kwargs)
+            except Exception:
+                return resp
+        return resp
 
     def _chat_remote(
         self,

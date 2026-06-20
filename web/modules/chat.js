@@ -3,7 +3,6 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
-import { trackMetric } from './analytics.js';
 import {
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -14,18 +13,9 @@ import {
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const CHAT_SESSION_ID_KEY = 'ouro_chat_session_id';
-const PLAN_PREFIX = 'Please do multi-model planning (plan_task tool) and web-search before answering or starting this task:\n\n';
 const MAX_PENDING_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
-
-function projectIdFromTask(taskId = '') {
-    const seed = String(taskId || '')
-        .toLowerCase()
-        .replace(/[^a-z0-9_.-]+/g, '-')
-        .replace(/^-+|-+$/g, '');
-    return (seed ? `task-${seed}` : `task-${Date.now().toString(36)}`).slice(0, 64);
-}
 
 function getOrCreateChatSessionId() {
     try {
@@ -39,6 +29,14 @@ function getOrCreateChatSessionId() {
     } catch {
         return `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
+}
+
+function projectIdFromTask(taskId = '') {
+    const seed = String(taskId || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_.-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    return (seed ? `task-${seed}` : `task-${Date.now().toString(36)}`).slice(0, 64);
 }
 
 function loadInputHistory() {
@@ -56,115 +54,110 @@ function saveInputHistory(entries) {
     } catch {}
 }
 
-export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab }) {
-    const container = document.getElementById('content');
+export function initChat(ctx) {
+    // Back-compat main-chat entry: one full-page instance bound to chat 1.
+    return createChatInstance(ctx);
+}
+
+export function createChatInstance({
+    ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
+    chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
+    asPanel = false, title = 'Chat',
+}) {
+    const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
-    let currentChatId = Number(state.activeChatId) || 1;
-    let currentProjectId = '';
-
-    function threadStorageKey(base) {
-        return currentChatId === 1 ? base : `${base}:${currentChatId}`;
-    }
-
-    function shouldMirrorToMainThread(msg) {
-        if ((msg?.role || '') === 'user') return false;
-        if (msg?.system_type === 'task_summary' || msg?.system_type === 'project_digest') return true;
-        if (Boolean(msg?.is_progress)) return true;
-        return false;
-    }
-
-    function isMyThread(msg, { mirrorProject = false } = {}) {
-        const cid = Number(msg?.chat_id) || 0;
-        if (!cid) return currentChatId === 1;
-        if (mirrorProject && currentChatId === 1) {
-            const projectIds = state.projectChatIds instanceof Set ? state.projectChatIds : null;
-            if (projectIds && projectIds.has(cid)) return shouldMirrorToMainThread(msg);
-            return true;
-        }
-        return cid === currentChatId;
-    }
+    const isMain = chatId === 1;
+    // Per-thread storage so a project thread never bleeds into the main chat.
+    const storeKey = (base) => (isMain ? base : `${base}:${chatId}`);
 
     const page = document.createElement('div');
-    page.id = 'page-chat';
-    page.className = 'page active';
-    page.innerHTML = `
-        ${renderPageHeader({
-            title: 'Чат',
+    page.id = asPanel ? `panel-${idPrefix}` : 'page-chat';
+    page.className = asPanel ? 'chat-instance-panel' : 'page active';
+    // A project panel reuses the lean `.project-panel-bar` (title + close) from
+    // index.html, so it renders a minimal status-only header — NOT the overlay
+    // page header (that would duplicate the title and drag in the GLOBAL
+    // Evolve/Restart/Panic/budget chrome, which belongs to the one agent, not a
+    // single project thread). The main chat keeps the full overlay header.
+    const headerHtml = asPanel
+        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
+        : renderPageHeader({
+            title: title,
             icon: PAGE_ICONS.chat,
             variant: 'overlay',
             className: 'chat-page-header',
             actionsHtml: `
-                <div class="chat-action-menu" id="chat-action-menu">
-                    <span id="chat-status" class="status-badge offline">Подключение...</span>
-                    <button class="chat-action-trigger" id="chat-action-trigger" type="button" title="Действия чата" aria-label="Действия чата" aria-expanded="false" aria-haspopup="menu">
-                        <img class="chat-action-trigger-icon" src="/static/icons/settings-cog.svg" alt="">
-                    </button>
-                    <div class="chat-header-actions chat-action-dropdown" id="chat-header-actions" role="menu">
-                        <button class="chat-header-btn" type="button" data-chat-command="evolve" role="menuitem" title="Переключить режим эволюции"><span class="chat-action-switch" aria-hidden="true"></span><span>Эволюция</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="review" role="menuitem" title="Запустить ревью сейчас"><span class="chat-action-switch" aria-hidden="true"></span><span>Ревью кода</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="bg" role="menuitem" title="Переключить фоновое сознание"><span class="chat-action-switch" aria-hidden="true"></span><span>Фоновое сознание</span></button>
-                        <button class="chat-header-btn" type="button" data-chat-command="restart" role="menuitem" title="Перезапустить агента"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/restart.svg" alt=""></span><span>Перезапустить чат</span></button>
-                        <button class="chat-header-btn danger" type="button" data-chat-command="panic" role="menuitem" title="Остановить всех воркеров"><span class="chat-action-icon" aria-hidden="true"><img src="/static/icons/power.svg" alt=""></span><span>Экстренное отключение</span></button>
-                    </div>
+                <div class="chat-header-actions" id="chat-header-actions">
+                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
+                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
+                    <details class="chat-header-more">
+                        <summary class="chat-header-btn" title="More agent controls">More</summary>
+                        <div class="chat-header-menu">
+                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
+                        </div>
+                    </details>
                 </div>
+                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
+                    <span class="chat-budget-text" id="chat-budget-text">$0 / $0</span>
+                    <div class="chat-budget-bar">
+                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
+                    </div>
+                </button>
+                <span id="chat-status" class="status-badge offline">Connecting...</span>
             `,
-        })}
+        });
+    page.innerHTML = `
+        ${headerHtml}
         <div id="chat-messages"></div>
         <div id="chat-input-area">
             <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Консилиум: разовый мозговой штурм/план несколькими субагентами (plan_task + веб-поиск) для следующего сообщения. Автоматически снимается после отправки.">Consilium</button>
-                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Режим размера контекста" title="Режим контекста (настройка владельца). Low — около 200K / локальные модели; Max — полный. Применяется к следующей задаче.">
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: arm a one-shot deep plan + multi-subagent fan-out (plan_task + web search, then delegate) for your next message. Auto-disarms after sending.">Swarm</button>
+                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Applies on the next task.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
                         </div>
                     </div>
                 </div>
-                <button class="chat-attach-btn" id="chat-attach" type="button" title="Прикрепить файл">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                    <span class="chat-attach-label">Прикрепить</span>
-                </button>
-                <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                <textarea id="chat-input" placeholder="Сообщение Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-                <div class="chat-send-group">
-                    <button class="chat-send-inline" id="chat-send" title="Отправить сообщение">Отправить</button>
-                    <button class="chat-send-chevron" id="chat-send-chevron" type="button" title="Другие варианты отправки" aria-label="Другие варианты отправки">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                <div class="chat-text-row">
+                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
-                    <div class="chat-send-dropdown" id="chat-send-dropdown" role="menu">
-                        <button class="chat-send-dropdown-item" id="chat-dropdown-send" role="menuitem">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                            Отправить
-                        </button>
-                        <button class="chat-send-dropdown-item" id="chat-dropdown-plan" role="menuitem">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/></svg>
-                            Планировать
-                        </button>
+                    <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
+                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                    <div class="chat-send-group">
+                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     </div>
                 </div>
             </div>
         </div>
     `;
+    if (idPrefix !== 'chat') {
+        // Instance-namespaced ids + mirror classes so the shared #chat-* CSS
+        // (extended with .chat-* twins) keeps styling secondary instances.
+        page.querySelectorAll('[id]').forEach((el) => {
+            if (el.id.startsWith('chat-')) {
+                el.classList.add(el.id);
+                el.id = idPrefix + '-' + el.id.slice(5);
+            }
+        });
+    }
     container.appendChild(page);
 
-    const messagesDiv = document.getElementById('chat-messages');
-    const input = document.getElementById('chat-input');
-    const inputArea = document.getElementById('chat-input-area');
-    const sendBtn = document.getElementById('chat-send');
-    const chevronBtn = document.getElementById('chat-send-chevron');
-    const sendDropdown = document.getElementById('chat-send-dropdown');
-    const dropdownSend = document.getElementById('chat-dropdown-send');
-    const dropdownPlan = document.getElementById('chat-dropdown-plan');
-    const statusBadge = document.getElementById('chat-status');
-    const actionMenu = document.getElementById('chat-action-menu');
-    const actionTrigger = document.getElementById('chat-action-trigger');
-    const headerActions = document.getElementById('chat-header-actions');
-    const budgetPill = document.getElementById('chat-budget-pill');
-    const attachBtn = document.getElementById('chat-attach');
-    const fileInput = document.getElementById('chat-file-input');
-    const attachmentPreview = document.getElementById('chat-attachment-preview');
+    const byId = (suffix) => page.querySelector(`[id="${idPrefix}-${suffix}"]`);
+    const messagesDiv = byId('messages');
+    const input = byId('input');
+    const inputArea = byId('input-area');
+    const sendBtn = byId('send');
+    const statusBadge = byId('status');
+    const headerActions = byId('header-actions');
+    const budgetPill = byId('budget-pill');
+    const attachBtn = byId('attach');
+    const fileInput = byId('file-input');
+    const attachmentPreview = byId('attachment-preview');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
@@ -182,7 +175,6 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         return items.reduce((total, item) => total + Number(item.file?.size || 0), 0);
     }
 
-    // Общий стейджер для скрепки/вставки; загрузка происходит только при отправке.
     function updateAttachmentPreview() {
         if (!pendingAttachments.length) {
             attachmentPreview.classList.remove('visible');
@@ -195,7 +187,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <span class="attach-badge" data-attachment-id="${escapeHtmlAttr(item.id)}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
                 <span class="attach-name" title="${escapeHtmlAttr(item.display_name)}">${escapeHtml(item.display_name)}</span>
-                <button class="attach-remove" type="button" title="Убрать" aria-label="Убрать вложение ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
+                <button class="attach-remove" type="button" title="Remove" aria-label="Remove attachment ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
             </span>
         `).join('');
         requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
@@ -214,22 +206,22 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const incoming = Array.from(files || []).filter(Boolean);
         if (!incoming.length) return;
         if (attachmentsUploading) {
-            showToast('Дождитесь завершения текущей загрузки, прежде чем менять вложения.', 'error');
+            showToast('Wait for the current upload to finish before changing attachments.', 'error');
             return;
         }
         if (pendingAttachments.length + incoming.length > MAX_PENDING_ATTACHMENTS) {
-            showToast(`Можно прикрепить не более ${MAX_PENDING_ATTACHMENTS} файлов к сообщению.`, 'error');
+            showToast(`Attach up to ${MAX_PENDING_ATTACHMENTS} files per message.`, 'error');
             return;
         }
         const oversized = incoming.find((file) => Number(file.size || 0) > MAX_ATTACHMENT_FILE_BYTES);
         if (oversized) {
-            showToast(`Каждое вложение должно быть не больше ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} МБ.`, 'error');
+            showToast(`Each attachment must be ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} MB or smaller.`, 'error');
             return;
         }
         const incomingBytes = incoming.reduce((total, file) => total + Number(file.size || 0), 0);
         if (pendingAttachmentBytes() + incomingBytes > MAX_PENDING_ATTACHMENT_BYTES) {
             const limitMb = Math.round(MAX_PENDING_ATTACHMENT_BYTES / (1024 * 1024));
-            showToast(`Суммарный размер вложений в сообщении ограничен ${limitMb} МБ.`, 'error');
+            showToast(`Attachments are limited to ${limitMb} MB total per message.`, 'error');
             return;
         }
         pendingAttachments = pendingAttachments.concat(incoming.map((file) => ({
@@ -353,6 +345,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     const taskUiStates = new Map();
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
+    // The owner's last main-chat request, handed to the next live card it spawns so a
+    // "turn into project" conversion can name the project from it (P1).
+    let _pendingCardObjective = '';
     let activeLiveGroupId = '';
     let historySyncTimer = null;
     let pendingReconnectSync = false;  // Set when a fromReconnect sync arrives while one is already in-flight.
@@ -385,8 +380,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function reconnectBannerText(reason = '') {
-        if (reason === 'sha-change') return '♻️ Перезапущен';
-        if (reason) return '♻️ Соединение установлено';
+        if (reason === 'sha-change') return '♻️ Restart complete';
+        if (reason) return '♻️ Reconnected';
         return '';
     }
 
@@ -427,15 +422,15 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             const now = new Date();
             const pad = n => String(n).padStart(2, '0');
             const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-            const months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
             const todayStr = now.toDateString();
             const yesterday = new Date(now);
             yesterday.setDate(now.getDate() - 1);
             let short;
             if (d.toDateString() === todayStr) short = hhmm;
-            else if (d.toDateString() === yesterday.toDateString()) short = `Вчера, ${hhmm}`;
+            else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
             else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
-            const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} в ${hhmm}`;
+            const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
             return { short, full };
         } catch {
             return null;
@@ -448,21 +443,21 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             if (opts.senderSessionId && opts.senderSessionId !== chatSessionId) {
                 return `WebUI (${opts.senderSessionId.slice(0, 8)})`;
             }
-            return opts.senderLabel || 'Вы';
+            return opts.senderLabel || 'You';
         }
         if (role === 'system') {
-            if (systemType === 'task_summary') return '📋 Сводка задачи';
-            if (systemType === 'skill_review') return '📋 Ревью навыка';
-            return '📋 Система';
+            if (systemType === 'task_summary') return '📋 Task Summary';
+            if (systemType === 'skill_review') return '📋 Skill Review';
+            return '📋 System';
         }
-        if (isProgress) return '💬 Мысль';
+        if (isProgress) return '💬 Thought';
         return 'Ouroboros';
     }
 
     function summarizeSkillReviewMessage(text) {
         const raw = String(text || '');
         const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        const headline = lines[0] || 'Проверка навыка';
+        const headline = lines[0] || 'Skill review';
         const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
         const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
         const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
@@ -484,7 +479,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     <span class="skill-review-summary-main">${summary.headline}</span>
                     <span class="skill-review-summary-side">
                         <span class="skill-review-meta">${summary.meta}</span>
-                        <span class="skill-review-toggle-label">Показать ревью</span>
+                        <span class="skill-review-toggle-label">Show review</span>
                     </span>
                 </button>
                 <div class="skill-review-full" data-skill-review-full hidden>${renderMarkdown(text)}</div>
@@ -509,7 +504,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 if (data?.bg_consciousness_state?.detail) button.title = data.bg_consciousness_state.detail;
             }
         });
-        const ctxBtn = document.getElementById('chat-context-mode');
+        // Evolve/Consciousness now live inside the More menu; surface a small dot
+        // on the More summary so an active mode stays visible without opening it.
+        const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
+        if (moreSummary) {
+            const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
+            moreSummary.classList.toggle('has-active', anyActive);
+        }
+        const ctxBtn = byId('context-mode');
         if (ctxBtn && typeof data?.context_mode === 'string') {
             ctxBtn.dataset.contextMode = data.context_mode === 'low' ? 'low' : 'max';
         }
@@ -518,8 +520,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const budgetLabel = typeof data?.budget_text === 'string'
             ? data.budget_text
             : `${formatUsdWhole(spent)} / ${formatUsdWhole(limit)}`;
-        const budgetText = document.getElementById('chat-budget-text');
-        const budgetFill = document.getElementById('chat-budget-bar-fill');
+        const budgetText = byId('budget-text');
+        const budgetFill = byId('budget-bar-fill');
         if (budgetText) budgetText.textContent = budgetLabel;
         if (budgetFill) budgetFill.style.width = `${Math.min(100, (spent / limit) * 100)}%`;
     }
@@ -535,49 +537,30 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     function persistVisibleHistory() {
         try {
-            sessionStorage.setItem(threadStorageKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
+            sessionStorage.setItem(storeKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
         } catch {}
     }
 
     const NEAR_BOTTOM_THRESHOLD_PX = 160;
-    const REATTACH_STICKY_THRESHOLD_PX = 48;
-    let shouldAutoStickToBottom = true;
-    let lastMessagesScrollTop = 0;
-    let suppressStickyDetection = false;
 
     function isNearBottom(threshold = NEAR_BOTTOM_THRESHOLD_PX) {
         const remaining = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
         return remaining <= threshold;
     }
 
-    function setProgrammaticScrollTop(nextScrollTop) {
-        suppressStickyDetection = true;
-        messagesDiv.scrollTop = nextScrollTop;
-        requestAnimationFrame(() => {
-            suppressStickyDetection = false;
-            lastMessagesScrollTop = messagesDiv.scrollTop;
-        });
-    }
-
-    function setStickyByUserScroll() {
-        if (suppressStickyDetection) return;
-        const current = messagesDiv.scrollTop;
-        if (current < lastMessagesScrollTop - 2) shouldAutoStickToBottom = false;
-        else if (isNearBottom(REATTACH_STICKY_THRESHOLD_PX)) shouldAutoStickToBottom = true;
-        lastMessagesScrollTop = current;
-    }
-
     function insertMessageNode(node, options = {}) {
         if (!node) return;
-        const shouldStick = Boolean(options.forceStick) || (shouldAutoStickToBottom && isNearBottom());
+        const shouldStick = Boolean(options.forceStick) || isNearBottom();
         if (node.parentNode === messagesDiv) {
-            if (shouldStick) setProgrammaticScrollTop(messagesDiv.scrollHeight);
+            if (shouldStick) messagesDiv.scrollTop = messagesDiv.scrollHeight;
             return;
         }
-        const typing = document.getElementById('typing-indicator');
+        // Scope to THIS instance's column — a global id lookup would resolve to
+        // the first panel's typing node and misplace project-thread messages.
+        const typing = messagesDiv.querySelector('.typing-bubble');
         if (typing && typing.parentNode === messagesDiv) messagesDiv.insertBefore(node, typing);
         else messagesDiv.appendChild(node);
-        if (shouldStick) setProgrammaticScrollTop(messagesDiv.scrollHeight);
+        if (shouldStick) messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
     function isBackgroundTaskId(taskId = '') {
@@ -742,36 +725,98 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     async function turnTaskIntoProject(record) {
-        if (!record || record.root?.dataset?.projectCreating === '1') return;
+        if (!record || record.root?.dataset?.projectCreating === '1' || record.root?.dataset?.projectCreated === '1') return;
         const taskId = String(record.groupId || '').trim();
-        if (!taskId) return;
-        const fallbackName = (record.titleEl?.textContent || record.lastHumanHeadline || taskId || 'Новый проект')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 80);
-        const name = window.prompt('Название проекта', fallbackName || 'Новый проект');
-        if (name === null) return;
-        const displayName = String(name || '').trim() || fallbackName || `Проект ${taskId}`;
         const projectId = projectIdFromTask(taskId);
         record.root.dataset.projectCreating = '1';
-        if (record.turnProjectBtn) {
-            record.turnProjectBtn.disabled = true;
-            record.turnProjectBtn.textContent = 'Создаём проект...';
-        }
+        const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
+        if (actions) actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
         try {
-            const payload = await apiClient.projectFromTask(taskId, projectId, displayName);
-            const project = payload.project || { id: projectId, name: displayName, chat_id: 1 };
-            showToast(`Проект создан: ${project.name || project.id}`, 'ok');
+            // One-click convert (owner P1): no name prompt, no extra LLM call.
+            // The SERVER derives the project name (gateway/projects.py
+            // _derive_project_name: title -> objective -> queue snapshot). We also
+            // hand it the owner's original request as a fallback hint so a still
+            // in-progress DIRECT chat task — which has no server-side title/objective
+            // yet — is named from what the owner asked, not "New project".
+            const payload = await apiClient.projectFromTask(taskId, projectId, '', record.objectiveHint || '');
+            const project = payload.project || { id: projectId, name: projectId };
+            showToast(`Project created: ${project.name || project.id}`, 'ok');
             window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
-            if (record.turnProjectBtn) record.turnProjectBtn.textContent = 'Проект создан';
+            markCardConverted(record, project);
         } catch (exc) {
-            showToast(`Не удалось создать проект: ${exc.message || exc}`, 'error');
+            showToast(`Project creation failed: ${exc.message || exc}`, 'error');
             delete record.root.dataset.projectCreating;
-            if (record.turnProjectBtn) {
-                record.turnProjectBtn.disabled = false;
-                record.turnProjectBtn.textContent = 'Сделать проект';
+            if (actions) {
+                actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
+                record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
+                // Re-wire the click handler — innerHTML replaced the original node,
+                // so without this the restored button would be dead after a
+                // transient failure (T5).
+                record.turnProjectBtn?.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    turnTaskIntoProject(record);
+                });
             }
         }
+    }
+
+    // One-way conversion (P3): the WHOLE card becomes a calm "project identity"
+    // chip. The live task is now owned by the project panel (it's bound there),
+    // so the main chat is freed — the card stops being a busy red task and
+    // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
+    function markCardConverted(record, project) {
+        delete record.root.dataset.projectCreating;
+        record.root.dataset.projectCreated = '1';
+        record.root.dataset.projectId = project.id || '';
+        const name = String(project.name || project.id || 'Project').trim();
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'chat-live-project-card-btn';
+        const icon = document.createElement('span');
+        icon.className = 'chat-live-project-icon';
+        icon.setAttribute('aria-hidden', 'true');
+        icon.textContent = '📁';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'chat-live-project-name';
+        nameEl.textContent = name;  // textContent — no HTML injection from a project name
+        const status = document.createElement('span');
+        status.className = 'chat-live-project-status';
+        status.textContent = 'running in background ↗';
+        chip.append(icon, nameEl, status);
+        chip.addEventListener('click', () => {
+            window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } }));
+        });
+        // Atomic detach-and-reparent (C4.5): replaceChildren swaps the whole live
+        // timeline (subagent cards, working bubble) for the chip in one paint — no
+        // innerHTML reparse, no torn intermediate state. The task tree re-homes to
+        // the project thread on the backend (lineage classification + the owner
+        // request mirrored into the project chat), so the main chat keeps only this
+        // calm pointer; the project panel re-renders the full tree from history.
+        record.root.replaceChildren(chip);
+        record.turnProjectBtn = null;
+        // The task now lives in the project panel, so this card must stop counting
+        // as a foreground ACTIVE task in the main chat — otherwise isForegroundLiveCard
+        // keeps suppressing the typing indicator / status-badge clear until the
+        // background task ends. Mark it finished; the converted-card guards in
+        // applyLiveCardState/finishLiveCard then ignore any late terminal frame.
+        // (The detached element refs are LEFT intact — nulling them made other
+        // terminal paths like finishLiveCard throw on a post-conversion frame.)
+        record.finished = true;
+        // Recolor on the next frame so the 250ms fuchsia fade actually animates
+        // (the class can't be added in the same paint as the content swap).
+        requestAnimationFrame(() => record.root.classList.add('is-project'));
+        signalChatFreed();  // subtle "this chat is free again" composer cue
+    }
+
+    // A brief composer brighten when a task leaves the main chat for a project —
+    // a calm "you're free to start something else" signal (P3). Self-clearing.
+    let _chatFreedTimer = null;
+    function signalChatFreed() {
+        const row = page.querySelector('.chat-text-row');
+        if (!row) return;
+        row.classList.add('chat-freed');
+        if (_chatFreedTimer) clearTimeout(_chatFreedTimer);
+        _chatFreedTimer = setTimeout(() => row.classList.remove('chat-freed'), 900);
     }
 
     function createLiveCardRecord(groupId = '', options = {}) {
@@ -788,22 +833,26 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         root.dataset.finished = '0';
         root.dataset.expanded = (options.isSubagent && nestedSubagentsExpanded) ? '1' : '0';
-        const projectActionHtml = (currentChatId === 1 && !options.isSubagent)
-            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Сделать проект</button></div>`
+        // No "Turn into project" for: subagent cards, non-main panels, or a task that
+        // is ALREADY bound to a project (a project-chat follow-up) — see task_bindings
+        // from /api/state, surfaced on window.__ouroTaskBindings (P2).
+        const alreadyBound = !!(window.__ouroTaskBindings || {})[normalizedGroupId];
+        const projectActionHtml = (isMain && !options.isSubagent && !alreadyBound)
+            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button></div>`
             : '';
         root.innerHTML = `
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
-                        <span class="chat-live-phase working" data-live-phase>Работает</span>
+                        <span class="chat-live-phase working" data-live-phase>Working</span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
                         </div>
-                        <span class="chat-live-title" data-live-title>Ожидание работы</span>
+                        <span class="chat-live-title" data-live-title>Waiting for work</span>
                     </div>
                     <div class="chat-live-summary-side">
-                        <span class="chat-live-count" data-live-count hidden>2 заметки</span>
-                        <span class="chat-live-toggle" data-live-toggle>Показать детали</span>
+                        <span class="chat-live-count" data-live-count hidden>2 notes</span>
+                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
@@ -824,8 +873,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             countEl: root.querySelector('[data-live-count]'),
             metaEl: root.querySelector('[data-live-meta]'),
             toggleEl: root.querySelector('[data-live-toggle]'),
-            timelineEl: root.querySelector('[data-live-timeline]'),
             turnProjectBtn: root.querySelector('[data-turn-into-project]'),
+            timelineEl: root.querySelector('[data-live-timeline]'),
             updates: 0,
             finished: false,
             items: [],
@@ -837,9 +886,18 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             subagentsEl: null,
             // Hidden-page layout sync is deferred until page/visibility returns.
             _needsLayoutSync: false,
+            // The owner's request that spawned this card (main, non-subagent only),
+            // used to name a project on "turn into project" when the server has no
+            // title/objective yet (P1, direct-chat conversion). One-shot handoff.
+            objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
         };
+        if (isMain && !options.isSubagent) _pendingCardObjective = '';
         record.summaryButtonEl?.addEventListener('click', () => {
             setLiveCardExpanded(record, record.root.dataset.expanded !== '1');
+        });
+        record.turnProjectBtn?.addEventListener('click', (event) => {
+            event.stopPropagation();
+            turnTaskIntoProject(record);
         });
         record.timelineEl?.addEventListener('click', (event) => {
             const button = event.target.closest('[data-live-line-toggle]');
@@ -850,11 +908,6 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             else record.expandedLineKeys.add(lineKey);
             renderLiveCardTimeline(record);
             syncLiveCardLayout(record);
-        });
-        record.turnProjectBtn?.addEventListener('click', (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            turnTaskIntoProject(record);
         });
         liveCardRecords.set(normalizedGroupId, record);
         resetLiveCardRecord(record);
@@ -919,12 +972,12 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         record.items = [];
         record.lastHumanHeadline = '';
         record.expandedLineKeys.clear();
-        record.titleEl.textContent = 'Работает...';
+        record.titleEl.textContent = 'Working...';
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Работает';
+        record.phaseEl.textContent = 'Working';
         record.phaseEl.className = 'chat-live-phase working';
         record.countEl.hidden = true;
-        record.countEl.textContent = '0 заметок';
+        record.countEl.textContent = '0 notes';
         record.metaEl.innerHTML = '';
         record.timelineEl.innerHTML = '';
         record.root.dataset.finished = '0';
@@ -953,23 +1006,18 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function formatLiveCardPhaseLabel(phase) {
-        if (phase === 'thinking') return 'Думает';
-        if (phase === 'working') return 'Работает';
-        if (phase === 'done') return 'Готово';
-        if (phase === 'warn') return 'Внимание';
-        if (phase === 'error' || phase === 'timeout') return 'Ошибка';
-        if (!phase) return 'Работает';
+        if (phase === 'thinking') return 'Thinking';
+        if (phase === 'working') return 'Working';
+        if (phase === 'done') return 'Done';
+        if (phase === 'warn') return 'Notice';
+        if (phase === 'error' || phase === 'timeout' || phase === 'lifecycle_error') return 'Issue';
+        if (!phase) return 'Working';
         return phase.charAt(0).toUpperCase() + phase.slice(1);
     }
 
     function setLiveCardExpanded(record, expanded) {
         if (!record?.root) return;
         record.root.dataset.expanded = expanded ? '1' : '0';
-        // Re-apply timeline visibility explicitly so viewport switches
-        // (mobile -> desktop and back) cannot leave stale display state.
-        if (record.timelineEl) {
-            record.timelineEl.style.display = expanded ? 'flex' : 'none';
-        }
         syncLiveCardToggle(record);
         if (record.root.isConnected) {
             requestAnimationFrame(() => syncLiveCardLayout(record));
@@ -986,7 +1034,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function syncLiveCardToggle(record) {
         if (!record?.toggleEl) return;
         const expanded = record.root.dataset.expanded === '1';
-        record.toggleEl.textContent = expanded ? 'Скрыть детали' : 'Показать детали';
+        record.toggleEl.textContent = expanded ? 'Hide details' : 'Show details';
         record.summaryButtonEl?.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     }
 
@@ -997,18 +1045,23 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function updateLiveCardCount(record) {
         if (!record?.countEl) return;
         const bits = [];
-        const n = record.items.length;
-        if (n >= 2) bits.push(`${n} ${n === 1 ? 'заметка' : (n < 5 ? 'заметки' : 'заметок')}`);
+        if (record.items.length >= 2) bits.push(`${record.items.length} notes`);
         const children = directSubagentCount(record);
-        if (children) bits.push(`${children} ${children === 1 ? 'дочерний' : 'дочерних'}`);
+        if (children) bits.push(`${children} ${children === 1 ? 'child' : 'children'}`);
         record.countEl.hidden = bits.length === 0;
         record.countEl.textContent = bits.join(' · ');
     }
 
     function syncLiveCardLayout(record) {
         if (!record?.root) return;
-        // Hidden SPA/browser tabs report zero geometry; defer to avoid collapsed cards.
-        if (!record.root.closest('.page.active') || document.hidden) {
+        // Hidden SPA/browser tabs report zero geometry; defer to avoid collapsed
+        // cards. Generalized to panel instances: any visible host counts.
+        const activePage = record.root.closest('.page.active');
+        const panelHost = record.root.closest('.chat-instance-panel');
+        // A panel counts as visible only when it is actually shown (not a
+        // hidden/display:none secondary instance) — zero geometry otherwise.
+        const visibleHost = activePage || (panelHost && panelHost.offsetParent !== null);
+        if (!visibleHost || document.hidden) {
             record._needsLayoutSync = true;
             return;
         }
@@ -1021,21 +1074,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
     }
 
-    // Re-sync cards after SPA return or browser tab visibility restore.
+    // Re-sync cards after SPA return or browser tab visibility restore, then put
+    // the thread back where the user left it (P7) instead of at the very top.
     window.addEventListener('ouro:page-shown', (event) => {
         if (event?.detail?.page !== 'chat') return;
         for (const record of liveCardRecords.values()) {
             if (record?.root?.isConnected) syncLiveCardLayout(record);
         }
-    });
-    window.addEventListener('resize', () => {
-        if (state.activePage !== 'chat') return;
-        for (const record of liveCardRecords.values()) {
-            if (!record?.root?.isConnected) continue;
-            const expanded = record.root.dataset.expanded === '1';
-            if (record.timelineEl) record.timelineEl.style.display = expanded ? 'flex' : 'none';
-            syncLiveCardLayout(record);
-        }
+        restoreScrollPosition();  // no-op for hidden panel instances
     });
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) return;
@@ -1067,7 +1113,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
                 >
                     <span class="chat-live-line-head">${headContent}</span>
-                    <span class="chat-live-line-expand-label">${expanded ? 'Свернуть' : 'Развернуть'}</span>
+                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : 'Expand'}</span>
                 </button>
             `
             : `<div class="chat-live-line-head">${headContent}</div>`;
@@ -1133,6 +1179,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function applyLiveCardState(summary, groupId, ts, dedupeKey = '', { suppressDomInsert = false } = {}) {
         const nextGroupId = groupId || activeLiveGroupId || 'active';
         const record = getLiveCardRecord(nextGroupId);
+        // A converted card is now a terminal project chip — its task is owned by the
+        // project panel. Ignore ALL further frames (incl. terminal) so they neither
+        // overwrite the chip nor dereference the nulled element refs (P3).
+        if (record.root?.dataset?.projectCreated === '1') return;
         const nextPhase = summary.phase || '';
         if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
             return;
@@ -1181,9 +1231,12 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         let patchIndex = -1;
         if (shouldRenderLine) {
             const lastIdx = record.items.length - 1;
-            const existingIdx = inPlaceByKey
-                ? record.items.findIndex((it) => it.dedupeKey === syntheticKey)
-                : (lastIdx >= 0 && record.items[lastIdx].dedupeKey === syntheticKey ? lastIdx : -1);
+            // Full-array dedup (Variant A): match the incoming line's key ANYWHERE in
+            // the card, not only against the last item. Otherwise a background
+            // syncHistory(rebuildAll=false) re-feeds historical progress lines whose
+            // key != the last item, and each gets re-appended → the "Notes" count
+            // grows without bound on every sync/reconnect.
+            const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
             if (existingIdx !== -1 && inPlaceByKey) {
                 const it = record.items[existingIdx];
                 it.phase = summary.phase || it.phase;
@@ -1194,13 +1247,21 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 it.ts = ts || it.ts;
                 patchIndex = existingIdx;
                 timelineUpdate = 'patch-at';
-            } else if (existingIdx !== -1) {
+            } else if (existingIdx === lastIdx && existingIdx !== -1) {
+                // Consecutive live duplicate of the most recent line → coalesce count.
                 const it = record.items[existingIdx];
                 it.count += 1;
                 it.ts = ts || it.ts;
                 it.fullHeadline = summary.fullHeadline || it.fullHeadline || it.headline;
                 it.fullBody = summary.fullBody || it.fullBody || it.body;
                 timelineUpdate = 'patch-last';
+            } else if (existingIdx !== -1) {
+                // Already rendered earlier in this card (e.g. a historical progress line
+                // re-fed by a background sync). Do NOT re-append (the unbounded "Notes"
+                // growth) and do NOT bump its count — just keep its timestamp fresh.
+                const it = record.items[existingIdx];
+                it.ts = ts || it.ts;
+                timelineUpdate = 'duplicate-skip';
             } else {
                 const lineKey = `line-${Date.now()}-${Math.random().toString(16).slice(2)}`;
                 record.items.push({
@@ -1219,9 +1280,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         updateLiveCardCount(record);
         record.metaEl.innerHTML = [
-            nextGroupId === 'bg-consciousness' ? 'Фоновое мышление' : '',
+            nextGroupId === 'bg-consciousness' ? 'Background thinking' : '',
             ...(Array.isArray(summary.meta) ? summary.meta : []),
-            ts ? `Последнее ${ts}` : '',
+            ts ? `Latest ${ts}` : '',
         ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join('');
         // Incremental updates; full rebuilds stay limited to toggles.
         const lastItem = record.items[record.items.length - 1];
@@ -1246,14 +1307,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             }
             syncLiveCardToggle(record);
             if (drivesComposerStatus) {
-                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Внимание' : 'Онлайн');
+                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Attention' : 'Online');
             }
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
-                setStatus('thinking', 'Работает...');
-            } else if (!hasActiveLiveCard() && statusBadge && ['Работает...', 'Working...', 'Thinking...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Онлайн');
+                setStatus('thinking', 'Working...');
+            } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
+                setStatus('online', 'Online');
             }
         }
     }
@@ -1263,6 +1324,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             ? liveCardRecords.get(groupId)
             : (activeLiveGroupId ? liveCardRecords.get(activeLiveGroupId) : null);
         if (!record) return;
+        // A converted card is a terminal project chip now — ignore late terminal
+        // frames so they neither overwrite the chip nor touch its element refs (T4).
+        if (record.root?.dataset?.projectCreated === '1') return;
         const wasFinished = record.finished;
         record.finished = true;
         record.root.dataset.finished = '1';
@@ -1280,7 +1344,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
         if (!hasActiveLiveCard()) {
             setStatus(activePhase === 'error' || activePhase === 'timeout' ? 'error' : 'online',
-                      activePhase === 'error' || activePhase === 'timeout' ? 'Внимание' : 'Онлайн');
+                      activePhase === 'error' || activePhase === 'timeout' ? 'Attention' : 'Online');
         }
     }
 
@@ -1305,10 +1369,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const severity = messageOutcomeSeverity(msg || {});
         const failedResult = severity === 'error';
         const doneHeadline = failedResult && reasonCode
-            ? `Готово: ${reasonCode}`
+            ? `Done: ${reasonCode}`
             : (severity === 'warn'
-                ? (reasonCode ? `Завершено с предупреждениями: ${reasonCode}` : 'Завершено с предупреждениями')
-                : ((record && record.lastHumanHeadline) || 'Готово'));
+                ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
+                : ((record && record.lastHumanHeadline) || 'Done'));
         applyLiveCardState(
             {
                 phase: severity === 'warn' ? 'warn' : (failedResult ? 'error' : 'done'),
@@ -1514,6 +1578,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             lifecycle === 'rejected_duplicate'
             || execution === 'degraded'
             || objective === 'degraded'
+            || Boolean(axes.objective?.warning)
         ) {
             return 'warn';
         }
@@ -1654,7 +1719,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 : renderMarkdown(text));
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const pendingHtml = pending ? `<div class="msg-pending">В очереди до переподключения</div>` : '';
+        const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
             <div class="message">${rendered}</div>
@@ -1672,7 +1737,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                 disclosure.dataset.expanded = expanded ? '0' : '1';
                 full.hidden = expanded;
                 skillReviewToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-                if (label) label.textContent = expanded ? 'Показать ревью' : 'Скрыть ревью';
+                if (label) label.textContent = expanded ? 'Show review' : 'Hide review';
                 requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
             });
         }
@@ -1691,13 +1756,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function ensureWelcomeMessage() {
+        if (!isMain) return;
         if (welcomeShown) return;
         const hasRealBubbles = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some(
             bubble => !bubble.classList.contains('typing-bubble')
         );
         if (hasRealBubbles) return;
         welcomeShown = true;
-        addMessage('Ouroboros пробудился', 'assistant', false, null, false, { ephemeral: true });
+        addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
     }
 
     async function syncHistory({ includeUser = false, fromReconnect = false } = {}) {
@@ -1708,10 +1774,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
         historySyncPromise = (async () => {
             try {
-                const historyUrl = currentChatId === 1
-                    ? '/api/chat/history?limit=1000'
-                    : `/api/chat/history?limit=1000&chat_id=${currentChatId}`;
-                const resp = await apiFetch(historyUrl, { cache: 'no-store' });
+                const resp = await apiFetch(`/api/chat/history?limit=1000${isMain ? '' : `&chat_id=${chatId}`}`, { cache: 'no-store' });
                 if (!resp.ok) return false;
                 const data = await resp.json();
                 const messages = Array.isArray(data.messages) ? data.messages : [];
@@ -1734,10 +1797,31 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     // state so the rebuild below cannot produce duplicates even if
                     // stale bubbles lingered in the DOM. Keep the typing indicator.
                     for (const bubble of Array.from(messagesDiv.querySelectorAll('.chat-bubble'))) {
-                        if (bubble.id !== 'typing-indicator') bubble.remove();
+                        if (!bubble.classList.contains('typing-bubble')) bubble.remove();
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
+                    // Subagent lineage + terminal state live only in memory. Clear and
+                    // rebuild them from durable history BEFORE the card passes, so a
+                    // finished child card finalizes regardless of replay order or which
+                    // event carried the terminal signal (a subagent 'completed' event OR
+                    // a server task_terminal_status). Otherwise finished children stick
+                    // on "working" and get revived by parent heartbeats on reload.
+                    subagentChildParents.clear();
+                    subagentTerminalChildren.clear();
+                    for (const msg of messages) {
+                        if (String(msg.delegation_role || '').toLowerCase() !== 'subagent') continue;
+                        const parentId = String(msg.parent_task_id || '').trim();
+                        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
+                        if (!parentId || !childId || parentId === childId) continue;
+                        if (!subagentChildParents.has(childId)) {
+                            subagentChildParents.set(childId, { parentId, role: String(msg.subagent_role || '').trim() });
+                        }
+                        const ev = String(msg.subagent_event || '').toLowerCase();
+                        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {
+                            subagentTerminalChildren.add(childId);
+                        }
+                    }
                 }
 
                 // Two passes ensure cards exist before finishLiveCard() marks them done.
@@ -1860,7 +1944,6 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     for (const msg of messages) {
                         if (msg.role !== 'user') continue;
                         let text = (msg.text || '').trim();
-                        if (text.startsWith(PLAN_PREFIX)) text = text.slice(PLAN_PREFIX.length).trimStart();
                         if (text) serverTexts.push(text);
                     }
                     const combined = [...serverTexts, ...inputHistory];
@@ -1911,7 +1994,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         await loadUiPreferences();
         if (await syncHistory({ includeUser: true })) return;
         try {
-            const saved = JSON.parse(sessionStorage.getItem(threadStorageKey(CHAT_STORAGE_KEY)) || '[]');
+            const saved = JSON.parse(sessionStorage.getItem(storeKey(CHAT_STORAGE_KEY)) || '[]');
             for (const msg of saved) {
                 addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
                     systemType: msg.systemType || '',
@@ -1936,7 +2019,11 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     function resizeChatInput({ preserveStickiness = false } = {}) {
-        input.style.removeProperty('height');
+        const caretAtEnd = input.selectionEnd >= input.value.length - 1;
+        const previousScrollTop = input.scrollTop;
+        input.style.height = 'auto';
+        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+        input.scrollTop = caretAtEnd ? input.scrollHeight : previousScrollTop;
         updateMessagesPadding({ preserveStickiness });
     }
 
@@ -1960,22 +2047,28 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     async function sendMessage(planMode = false) {
         if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
         let text = input.value.trim();
+        // The owner's pure typed request (before attachment lines) — captured so a
+        // live card spawned by this message can name a project from it on a "turn
+        // into project" conversion even before the task records its objective (P1,
+        // direct-chat case: the server has no title/objective/queue source yet).
+        const objectiveText = text;
         const hasAttachments = pendingAttachments.length > 0;
         let uploadedAttachments = [];
+        let attachmentMeta = [];
         if (!text && !pendingAttachments.length) return;
         if (pendingAttachments.length) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
-                showToast('Нельзя прикрепить файл оффлайн. Переподключитесь и попробуйте снова.', 'error');
+                showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
                 return;
             }
             const staged = [...pendingAttachments];
             const uploaded = [];
             setAttachmentUploadState(true);
-            setSendBusy(true, staged.length > 1 ? 'Загрузка файлов' : 'Загрузка');
+            setSendBusy(true, staged.length > 1 ? 'Uploading files' : 'Uploading');
             try {
                 for (const stagedItem of staged) {
-                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение прервано во время загрузки. Переподключитесь и попробуйте снова.');
+                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed during upload. Reconnect and try again.');
                     const formData = new FormData();
                     formData.append('file', stagedItem.file);
                     const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
@@ -1987,18 +2080,27 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                         filename: data.filename || '',
                         path: data.path || '',
                         display_name: data.display_name || stagedItem.display_name,
+                        mime: data.mime || stagedItem.file?.type || '',
                     });
                 }
-                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение прервано после загрузки. Переподключитесь и попробуйте снова.');
+                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed after upload. Reconnect and try again.');
                 uploadedAttachments = uploaded;
                 const attachmentLines = uploaded
-                    .map((item) => `[Прикреплён файл: ${item.display_name} сохранён в ${item.path}]`)
+                    .map((item) => `[Attached file: ${item.display_name} saved to ${item.path}]`)
                     .join('\n');
                 text += (text ? '\n\n' : '') + attachmentLines;
+                // Structured attachment metadata rides the WS frame so the
+                // gateway can hand image uploads to the model as NATIVE image
+                // blocks (vision models) instead of only a path label.
+                attachmentMeta = uploaded.map((item) => ({
+                    filename: item.filename,
+                    display_name: item.display_name,
+                    mime: item.mime || '',
+                }));
             } catch (e) {
                 await cleanupUploadedAttachments(uploaded);
-                showToast('Ошибка загрузки: ' + e.message, 'error');
-                return;  // вложения и превью остаются — пользователь может повторить
+                showToast('Upload error: ' + e.message, 'error');
+                return;  // pending attachments and preview remain so the user can retry
             } finally {
                 setAttachmentUploadState(false);
                 setSendBusy(false);
@@ -2011,16 +2113,19 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             content: text,
             sender_session_id: chatSessionId,
             force_plan: forcePlan,
-            ...(currentChatId > 1 ? { chat_id: currentChatId } : {}),
-            ...(currentProjectId ? { project_id: currentProjectId } : {}),
+            ...(isMain ? {} : { chat_id: chatId }),
+            ...(projectId ? { project_id: projectId } : {}),
+            ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
-            showToast('Соединение потеряно до отправки. Переподключитесь и попробуйте снова.', 'error');
+            showToast('Connection lost before send. Reconnect and try again.', 'error');
             return;
         }
-        // One-shot: disarm Consilium now that the message is sent.
-        if (planMode) setConsilium(false);
+        // One-shot: disarm Swarm now that the message is sent.
+        if (planMode) setSwarm(false);
+        // Hand the objective to the NEXT main-chat live card this message spawns.
+        if (isMain && objectiveText) _pendingCardObjective = objectiveText;
         if (hasAttachments) {
             pendingAttachments = [];
             updateAttachmentPreview();
@@ -2039,44 +2144,35 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     // Send mode lives on DOM so CSS and click/Enter share one source.
-    const sendGroup = document.querySelector('.chat-send-group');
+    const sendGroup = page.querySelector('.chat-send-group');
 
-    // Consilium is a one-shot arm: the next send goes through plan_task multi-model
+    // Swarm is a one-shot arm: the next send goes through plan_task multi-model
     // brainstorm/planning, then the pill auto-disarms so it never sticks.
-    const consiliumBtn = document.getElementById('chat-consilium');
-    function consiliumArmed() {
-        return consiliumBtn?.dataset.armed === 'true';
+    const swarmBtn = byId('swarm');
+    function swarmArmed() {
+        return swarmBtn?.dataset.armed === 'true';
     }
-    function setConsilium(armed) {
-        if (consiliumBtn) consiliumBtn.dataset.armed = armed ? 'true' : 'false';
-    }
-
-    function setSendMode(mode) {
-        sendGroup.dataset.sendMode = mode;
-        sendBtn.textContent = mode === 'plan' ? 'Планировать' : 'Отправить';
-        sendBtn.title = mode === 'plan' ? 'Отправить с префиксом планирования' : 'Отправить сообщение';
-        // Mark the active item in the dropdown for visual feedback.
-        dropdownSend.dataset.modeActive = mode === 'send' ? 'true' : 'false';
-        dropdownPlan.dataset.modeActive = mode === 'plan' ? 'true' : 'false';
+    function setSwarm(armed) {
+        if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
-        if (chevronBtn) chevronBtn.disabled = busy;
         if (busy) {
-            sendBtn.textContent = label || 'Отправка';
-            sendBtn.title = label || 'Отправка';
+            sendBtn.textContent = label || 'Sending';
+            sendBtn.title = label || 'Sending';
         } else {
-            setSendMode(sendGroup.dataset.sendMode || 'send');
+            sendBtn.textContent = 'Send';
+            sendBtn.title = 'Send message';
         }
     }
 
-    consiliumBtn?.addEventListener('click', () => setConsilium(!consiliumArmed()));
+    swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
 
     // Context-mode quick toggle (owner-only; applies on the next task). Posts to
     // the owner endpoint and reflects the current value from /api/state.
-    const contextModeBtn = document.getElementById('chat-context-mode');
+    const contextModeBtn = byId('context-mode');
     contextModeBtn?.addEventListener('click', async (event) => {
         const seg = event.target.closest('.chat-seg');
         if (!seg || contextModeBtn.dataset.disabled === 'true') return;
@@ -2084,20 +2180,50 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const current = contextModeBtn.dataset.contextMode === 'low' ? 'low' : 'max';
         if (next === current) return;
         contextModeBtn.dataset.disabled = 'true';
+        const postMode = (mode) => apiFetch('/api/owner/context-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode }),
+        });
         try {
-            const resp = await apiFetch('/api/owner/context-mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: next }),
-            });
+            let resp = await postMode(next);
+            if (!resp.ok) {
+                let payload = {};
+                try { payload = await resp.json(); } catch {}
+                // Max context mode needs the active model's 1M-token window confirmed.
+                // Offer a plain, model-scoped confirmation (kept until the model changes).
+                const ack = payload?.needs_ack;
+                if (next === 'max' && ack && ack.model) {
+                    const ok = window.confirm(
+                        `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
+                        `Confirm that this model supports a 1,000,000-token context window?\n` +
+                        `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
+                        `  base_url: ${ack.base_url || '(default)'}\n\n` +
+                        `This applies only to this exact model/provider and is removed if you change it.`
+                    );
+                    if (ok) {
+                        const ackResp = await apiFetch('/api/owner/capability-ack', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                provider: ack.provider, model: ack.model,
+                                base_url: ack.base_url, window_tokens: 1000000,
+                                note: 'owner-confirmed via context-mode toggle',
+                            }),
+                        });
+                        if (ackResp.ok) {
+                            resp = await postMode(next);  // retry with the confirmation in place
+                        } else {
+                            showToast('Could not save the confirmation.', 'error');
+                        }
+                    }
+                }
+            }
             if (resp.ok) {
                 contextModeBtn.dataset.contextMode = next;
             } else {
                 let message = 'Could not change context mode.';
-                try {
-                    const payload = await resp.json();
-                    if (payload?.error) message = payload.error;
-                } catch {}
+                try { const p = await resp.json(); if (p?.error) message = p.error; } catch {}
                 showToast(message, 'error');
             }
         } catch (e) {
@@ -2109,51 +2235,12 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         }
     });
 
-    // Send-mode dropdown (new composer design): pick Send vs Plan; the choice
-    // persists on the send group. Plan is also triggered when Consilium is armed.
-    setSendMode('send');
-    function planModeRequested() {
-        return consiliumArmed() || sendGroup.dataset.sendMode === 'plan';
-    }
-    function openSendDropdown() {
-        sendDropdown.classList.add('open');
-        chevronBtn.classList.add('active');
-    }
-    function closeSendDropdown() {
-        sendDropdown.classList.remove('open');
-        chevronBtn.classList.remove('active');
-    }
-    chevronBtn?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (sendDropdown.classList.contains('open')) {
-            closeSendDropdown();
-        } else {
-            openSendDropdown();
-        }
-    });
-    dropdownSend?.addEventListener('click', () => {
-        setSendMode('send');
-        closeSendDropdown();
-    });
-    dropdownPlan?.addEventListener('click', () => {
-        setSendMode('plan');
-        closeSendDropdown();
-    });
-    document.addEventListener('click', (e) => {
-        if (sendDropdown && !sendDropdown.contains(e.target) && e.target !== chevronBtn) {
-            closeSendDropdown();
-        }
-    });
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeSendDropdown();
-    });
-
     // Arrow wrappers avoid MouseEvent leaking into sendMessage(planMode).
-    sendBtn.addEventListener('click', () => sendMessage(planModeRequested()));
+    sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            sendMessage(planModeRequested());
+            sendMessage(swarmArmed());
             return;
         }
         if (e.key === 'ArrowUp' && !e.shiftKey) {
@@ -2164,14 +2251,41 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
     // Dynamic CSS reserve keeps the absolute composer from covering messages.
     function scrollToBottom() {
-        shouldAutoStickToBottom = true;
-        setProgrammaticScrollTop(messagesDiv.scrollHeight);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
     function scrollToBottomAfterLayout() {
         requestAnimationFrame(() => {
             scrollToBottom();
             requestAnimationFrame(scrollToBottom);
+        });
+    }
+
+    // P7 — per-instance scroll memory. Switching tabs/opening a project panel used
+    // to drop this thread back to the very top (the browser zeroes a hidden
+    // column's scrollTop, and toggling .page display can reset it too). We
+    // remember where the user was and restore it on show: pinned to the latest
+    // message in the common case, or the exact spot they'd scrolled back to.
+    let _savedScrollTop = 0;
+    let _savedStick = true;  // a fresh thread starts pinned to the newest message
+    const isInstanceVisible = () =>
+        Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
+    messagesDiv?.addEventListener('scroll', () => {
+        // Ignore the spurious scrollTop=0 a browser emits while the column is
+        // hidden — that would erase the real position we want to restore.
+        if (!isInstanceVisible()) return;
+        _savedScrollTop = messagesDiv.scrollTop;
+        _savedStick = isNearBottom();
+    }, { passive: true });
+
+    function restoreScrollPosition() {
+        if (!isInstanceVisible()) return;  // hidden column has no geometry yet
+        requestAnimationFrame(() => {
+            if (_savedStick) scrollToBottom();          // keep them at the latest message
+            else messagesDiv.scrollTop = _savedScrollTop;  // or exactly where they were
+            // A second frame settles late card-layout height changes, but only
+            // re-pins when sticky so a restored mid-history spot isn't overridden.
+            requestAnimationFrame(() => { if (_savedStick) scrollToBottom(); });
         });
     }
 
@@ -2202,86 +2316,78 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     }
 
     installChatResizeObservers();
-    messagesDiv.addEventListener('scroll', setStickyByUserScroll, { passive: true });
 
     input.addEventListener('input', () => {
         if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
         resizeChatInput({ preserveStickiness: false });
     });
 
-    function closeActionMenu() {
-        actionMenu?.classList.remove('open');
-        actionTrigger?.setAttribute('aria-expanded', 'false');
-    }
-
-    actionTrigger?.addEventListener('click', (event) => {
-        event.stopPropagation();
-        const isOpen = actionMenu?.classList.contains('open');
-        if (isOpen) closeActionMenu();
-        else {
-            actionMenu?.classList.add('open');
-            actionTrigger.setAttribute('aria-expanded', 'true');
-        }
-    });
-
     headerActions?.addEventListener('click', (event) => {
         const button = event.target.closest('[data-chat-command]');
         if (!button) return;
+        button.closest('details')?.removeAttribute('open');
         const command = button.dataset.chatCommand;
         if (command === 'evolve') {
             const next = !button.classList.contains('on');
             button.classList.toggle('on', next);
             ws.send({ type: 'command', cmd: `/evolve ${next ? 'start' : 'stop'}` });
-            closeActionMenu();
             return;
         }
         if (command === 'bg') {
             const next = !button.classList.contains('on');
             button.classList.toggle('on', next);
             ws.send({ type: 'command', cmd: `/bg ${next ? 'start' : 'stop'}` });
-            closeActionMenu();
             return;
         }
         if (command === 'review') {
             ws.send({ type: 'command', cmd: '/review' });
-            closeActionMenu();
             return;
         }
         if (command === 'restart') {
-            trackMetric('restart');
             ws.send({ type: 'command', cmd: '/restart' });
-            closeActionMenu();
             return;
         }
-        if (command === 'panic' && confirm('Немедленно остановить всех воркеров?')) {
-            trackMetric('panic');
+        if (command === 'panic' && confirm('Kill all workers immediately?')) {
             ws.send({ type: 'command', cmd: '/panic' });
         }
-        closeActionMenu();
     });
 
-    document.addEventListener('click', (event) => {
-        if (actionMenu && !actionMenu.contains(event.target)) closeActionMenu();
-    });
-    document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') closeActionMenu();
-    });
+    // The More menu is a native <details> (no auto-dismiss): collapse it when a
+    // click/tap lands outside it, or on Escape, so it never stays stuck open.
+    if (!asPanel) {
+        const collapseHeaderMenus = (predicate) => {
+            page.querySelectorAll('details.chat-header-more[open]').forEach((details) => {
+                if (predicate(details)) details.removeAttribute('open');
+            });
+        };
+        document.addEventListener('click', (event) => {
+            collapseHeaderMenus((details) => !details.contains(event.target));
+        });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') collapseHeaderMenus(() => true);
+        });
+    }
 
     budgetPill?.addEventListener('click', () => {
         if (typeof openDashboardTab === 'function') openDashboardTab('costs');
         else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
     });
-    budgetPill?.addEventListener('keydown', (event) => {
-        if (event.key !== 'Enter' && event.key !== ' ') return;
-        event.preventDefault();
-        budgetPill.click();
-    });
 
-    refreshHeaderControlState(true);
-    setInterval(refreshHeaderControlState, 3000);
+    if (asPanel) {
+        // The panel has no global controls/budget to poll; seed the status from
+        // the live socket so a late-created panel never gets stuck on
+        // "Connecting…" (the one-shot WS `open` already fired before it existed;
+        // future reconnects still update it via the shared `open` handler).
+        if (ws.isConnected?.()) setStatus('online', 'Online');
+    } else {
+        refreshHeaderControlState(true);
+        setInterval(refreshHeaderControlState, 3000);
+    }
 
     const typingEl = document.createElement('div');
-    typingEl.id = 'typing-indicator';
+    // Per-instance id (main stays 'typing-indicator'; panels get a unique id) so
+    // multiple open chat columns never collide on a duplicate DOM id.
+    typingEl.id = idPrefix === 'chat' ? 'typing-indicator' : `${idPrefix}-typing-indicator`;
     typingEl.className = 'chat-bubble assistant typing-bubble';
     typingEl.style.display = 'none';
     typingEl.innerHTML = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
@@ -2294,9 +2400,9 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function showTyping() {
         if (!hasActiveLiveCard()) {
             typingEl.style.display = '';
-            if (shouldAutoStickToBottom && isNearBottom()) scrollToBottom();
+            if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
-        setStatus('thinking', 'Думает...');
+        setStatus('thinking', 'Thinking...');
     }
 
     function hideTypingIndicatorOnly() {
@@ -2305,21 +2411,46 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     function hideTyping() {
         hideTypingIndicatorOnly();
-        if (statusBadge && ['Думает...', 'Работает...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Онлайн');
+        if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
+            setStatus('online', 'Online');
         }
     }
 
     function incrementUnreadIfNeeded() {
+        if (!isMain) return;  // the global unread badge tracks the main chat
         if (state.activePage === 'chat') return;
         state.unreadCount++;
         updateUnreadBadge();
     }
 
     ws.on('typing', (msg) => {
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
         showTyping();
     });
+
+    // One socket, client-side fan-out: project instances take only their own
+    // thread. The MAIN instance keeps ordinary non-project traffic AND mirrors
+    // project progress/digests/logs as the "штаб", but never raw project chat
+    // user/assistant messages.
+    const isProjectMirrorFrame = (msg) => {
+        if (!msg) return false;
+        if (msg.type === 'log') return true;
+        if (msg.is_progress) return true;
+        if (msg.system_type === 'task_summary' || msg.system_type === 'project_digest') return true;
+        return false;
+    };
+
+    const isMyThread = (msg, { mirrorProject = false } = {}) => {
+        const cid = Number(msg?.chat_id ?? 1);
+        if (isMain) {
+            const projectIds = state.projectChatIds instanceof Set ? state.projectChatIds : null;
+            if (projectIds && projectIds.has(cid)) {
+                return mirrorProject && isProjectMirrorFrame(msg);
+            }
+            return true;
+        }
+        return cid === chatId;
+    };
 
     ws.on('chat', (msg) => {
         if (!isMyThread(msg, { mirrorProject: true })) return;
@@ -2373,7 +2504,12 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     ws.on('log', (msg) => {
         if (!msg?.data) return;
-        if (!isMyThread(msg.data, { mirrorProject: true })) return;
+        // Log frames now carry the task's chat_id (backend stamps it), so the
+        // per-thread fan-out routes the full live card to its own column: a
+        // project panel builds/animates/finalizes ITS card, while the main
+        // chat mirrors project progress as штаб. Legacy frames without chat_id
+        // default to the main chat.
+        if (!isMyThread(msg, { mirrorProject: true })) return;
         updateLiveCardFromLogEvent(msg.data);
     });
 
@@ -2382,7 +2518,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
 
     ws.on('photo', (msg) => {
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        if (!isMyThread(msg)) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
@@ -2417,7 +2553,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     });
 
     ws.on('video', (msg) => {
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        if (!isMyThread(msg)) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
@@ -2450,11 +2586,11 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     let wsHasConnectedOnce = false;
 
     ws.on('open', () => {
-        setStatus('online', 'Онлайн');
+        setStatus('online', 'Online');
         refreshHeaderControlState(true);
         const reconnectBanner =
             pendingReconnectBannerText
-            || (wsHasConnectedOnce ? '♻️ Соединение установлено' : '');
+            || (wsHasConnectedOnce ? '♻️ Reconnected' : '');
         const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
         pendingReconnectBannerText = '';
         const isReconnect = wsHasConnectedOnce;
@@ -2479,39 +2615,19 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     ws.on('close', () => {
         hideTyping();
-        setStatus('offline', 'Переподключение...');
-        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Подключение...' });
+        setStatus('offline', 'Reconnecting...');
+        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Connecting...' });
     });
 
-    window.addEventListener('ouro:chat-context-changed', async (event) => {
-        const nextChatId = Number(event?.detail?.chatId) || 1;
-        const nextProjectId = String(event?.detail?.projectId || '');
-        if (nextChatId === currentChatId && nextProjectId === currentProjectId) return;
-        currentChatId = nextChatId;
-        currentProjectId = nextProjectId;
-        state.activeChatId = currentChatId;
-        pendingAttachments = [];
-        updateAttachmentPreview();
-        for (const record of liveCardRecords.values()) record.root?.remove();
-        liveCardRecords.clear();
-        taskUiStates.clear();
-        retiredTaskIds.clear();
-        pendingUserBubbles.clear();
-        seenMessageKeys.clear();
-        messageKeyOrder.length = 0;
-        persistedHistory.length = 0;
-        activeLiveGroupId = '';
-        historyLoaded = false;
-        inputHistorySeededFromServer = false;
-        historySyncPromise = null;
-        welcomeShown = false;
-        hideTyping();
-        Array.from(messagesDiv.querySelectorAll('.chat-bubble')).forEach((bubble) => {
-            if (bubble.id !== 'typing-indicator') bubble.remove();
-        });
-        await syncHistory({ includeUser: true, fromReconnect: true });
-        if (!Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some((bubble) => bubble.id !== 'typing-indicator')) {
-            ensureWelcomeMessage();
-        }
-    });
+    return {
+        page,
+        chatId,
+        projectId,
+        // Called by app.js when this instance's panel is (re)shown so a project
+        // thread restores its scroll position instead of jumping to the top (P7).
+        restoreScrollPosition,
+        destroy() {
+            try { page.remove(); } catch {}
+        },
+    };
 }

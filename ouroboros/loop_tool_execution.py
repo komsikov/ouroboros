@@ -80,11 +80,18 @@ _REVIEWED_MUTATIVE_HARD_CEILING = 1800
 
 
 def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
-    """Emit a live log through the registry context queue."""
+    """Emit a live log through the registry context queue. Lineage (parent/root task
+    ids) is merged in so a SUBAGENT's live log routes to its root project thread
+    (C4.4) — only the root is bound, so without lineage the child's log stays in main."""
     event_queue = getattr(getattr(tools, "_ctx", None), "event_queue", None)
+    enriched = dict(payload)
+    meta = _tool_task_metadata(tools)
+    for key in ("parent_task_id", "root_task_id"):
+        if meta.get(key) and not enriched.get(key):
+            enriched[key] = meta.get(key)
     emit_log_event(
         event_queue,
-        {"ts": utc_now_iso(), **payload},
+        {"ts": utc_now_iso(), **enriched},
         log_label="tool live",
     )
 
@@ -140,8 +147,39 @@ def _with_correlation(payload: Dict[str, Any], correlation: Dict[str, Any], *, t
     return out
 
 
-def _get_tool_timeout(tools: ToolRegistry, tool_name: str) -> int:
-    """Return max(settings/env timeout, per-tool minimum)."""
+_PER_CALL_TIMEOUT_TOOLS = ("run_command", "run_script")
+# Structural ordering margin: the outer cap sits this far above the requested
+# per-call timeout so the handler's own (cleanly-messaged) subprocess timeout
+# fires first, before the outer thread-kill. Not a wait duration — a race margin.
+_PER_CALL_TIMEOUT_OUTER_MARGIN_SEC = 30
+
+
+def _tc_args(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort parse of a tool call's JSON arguments (for timeout resolution)."""
+    try:
+        raw = (tc.get("function") or {}).get("arguments")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return {}
+
+
+def _get_tool_timeout(
+    tools: ToolRegistry, tool_name: str, tool_args: Optional[Dict[str, Any]] = None
+) -> int:
+    """Return max(settings/env timeout, per-tool minimum).
+
+    For ``run_command``/``run_script`` a per-call ``timeout_sec`` (or its
+    ``timeout`` alias) raises this OUTER tool-execution cap so the handler's own
+    deadline-clamped subprocess timeout fires first — otherwise a legitimately
+    long ``run_command(timeout_sec=900)`` would be cut off at the static 360s
+    entry cap before the inner timeout matters. A +30s margin lets the inner
+    (cleanly-messaged) timeout win over the outer thread-kill.
+    """
     settings_val = 0
     try:
         settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
@@ -157,7 +195,18 @@ def _get_tool_timeout(tools: ToolRegistry, tool_name: str) -> int:
             except ValueError:
                 pass
     per_tool = tools.get_timeout(tool_name)
-    return max(settings_val, per_tool) if settings_val > 0 else per_tool
+    base = max(settings_val, per_tool) if settings_val > 0 else per_tool
+    if tool_name in _PER_CALL_TIMEOUT_TOOLS and isinstance(tool_args, dict):
+        raw = tool_args.get("timeout_sec", tool_args.get("timeout"))
+        try:
+            override = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            override = 0
+        if override > 0:
+            from ouroboros.config import get_per_call_timeout_ceiling_sec
+
+            return min(max(base, override), get_per_call_timeout_ceiling_sec()) + _PER_CALL_TIMEOUT_OUTER_MARGIN_SEC
+    return base
 
 
 def _path_is_cognitive_artifact(tool_name: str, tool_args: Optional[Dict[str, Any]]) -> bool:
@@ -300,7 +349,7 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     # late ARTIFACT_OUTPUTS marker (e.g. a stopped service after a long log tail).
     if not is_error and "ARTIFACT_OUTPUTS" in text:
         meta["artifact_registered"] = True
-    # Same full-result capture for the Consilium force-plan gate: the review
+    # Same full-result capture for the swarm force-plan gate: the review
     # aggregate marker sits at the END of a long plan_task result, far past the
     # 700-char trace preview the gate used to substring-match against.
     if fn_name == "plan_task" and not is_error and "## Plan Review Results" in text and "AGGREGATE:" in text:
@@ -825,7 +874,7 @@ def handle_tool_calls(
     if not can_parallel:
         results = [
             _execute_with_timeout(tools, tc, drive_logs,
-                                  _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip()), task_id,
+                                  _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip(), _tc_args(tc)), task_id,
                                   stateful_executor, otel_ctx)
             for tc in tool_calls
         ]
@@ -836,7 +885,7 @@ def handle_tool_calls(
             future_to_index = {
                 executor.submit(
                     _execute_with_timeout, tools, tc, drive_logs,
-                    _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip()), task_id,
+                    _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip(), _tc_args(tc)), task_id,
                     stateful_executor, otel_ctx,
                 ): idx
                 for idx, tc in enumerate(tool_calls)
@@ -908,8 +957,18 @@ def process_tool_results(
             **(exec_result.get("result_meta") or {}),
         })
         if fn_name == "task_acceptance_review" and not is_error:
+            raw = str(exec_result.get("result") or "")
+            # The auto self-call leads with a compact improvement capsule and wraps
+            # the full ReviewRunResult JSON in <full_review>...</full_review> (M5).
+            # Extract that block so the FULL record still lands in review_runs even
+            # when the visible result is not pure JSON — otherwise an auto review
+            # that produced a capsule would record nothing and leave the objective
+            # unevaluated exactly when the feedback matters most.
+            payload = raw
+            if "<full_review>" in raw and "</full_review>" in raw:
+                payload = raw.split("<full_review>", 1)[1].rsplit("</full_review>", 1)[0].strip()
             try:
-                parsed = json.loads(str(exec_result.get("result") or ""))
+                parsed = json.loads(payload)
                 if isinstance(parsed, dict):
                     llm_trace.setdefault("review_runs", []).append(parsed)
             except Exception:

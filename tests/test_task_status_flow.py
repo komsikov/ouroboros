@@ -1192,7 +1192,7 @@ def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_cont
 
 def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from ouroboros.task_results import STATUS_FAILED, STATUS_SCHEDULED
+    from ouroboros.task_results import STATUS_SCHEDULED
 
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
@@ -1254,9 +1254,16 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
         FakeCtx(),
     )
 
-    failed = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
-    assert failed["status"] == STATUS_FAILED
-    assert "no chat target" in failed["result"]
+    # B1 (v6.33.0): a headless subagent with no chat target is no longer
+    # rejected — it is enqueued and runs (the live "🗓️ Scheduled" notification is
+    # skipped because chat_id is 0). Restores headless/CLI multi-agent.
+    assert len(enqueued) == 2
+    assert enqueued[1]["id"] == "headless2"
+    scheduled2 = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
+    assert scheduled2["status"] == STATUS_SCHEDULED
+    # No chat notification was emitted for the chat-less subagent.
+    assert all(s[0] != 0 for s in sent)
+    assert len(sent) == 1
 
 
 def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, monkeypatch):
@@ -1734,7 +1741,14 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
     monkeypatch.setattr(queue_module, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
-    worker = SimpleNamespace(busy_task_id="childtimeout", proc=FakeProc())
+    # Activity model: a "timed out" task is one with no real progress for the idle
+    # window AND no progressing subtree (heartbeat alone is not progress). Variant A:
+    # run the heavy teardown reaper synchronously (no daemon) for a deterministic test.
+    monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
+    monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
+    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    worker = SimpleNamespace(busy_task_id="childtimeout", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
     child_drive = tmp_path / "child-drive"
@@ -1752,13 +1766,18 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
             "child_drive_root": str(child_drive),
             "_attempt": 1,
         },
-        "started_at": time.time() - 10,
-        "last_heartbeat_at": time.time() - 10,
+        # idle for ~1000s, far beyond the monkeypatched idle window max(1, 1+120)=121s,
+        # with no progressing subtree -> activity-based stop.
+        "started_at": time.time() - 1000,
+        "last_heartbeat_at": time.time() - 1000,
         "worker_id": 9,
         "attempt": 1,
     }
 
     queue_module.enforce_task_timeouts()
+    # Drain the off-loop reaper synchronously (kill/archive/respawn).
+    while not queue_module._reap_queue.empty():
+        queue_module._reap_timed_out_task(queue_module._reap_queue.get_nowait())
 
     assert queue_module.PENDING
     retried = queue_module.PENDING[0]
@@ -1798,7 +1817,11 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
     monkeypatch.setattr(queue_module, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
-    worker = SimpleNamespace(busy_task_id="deadline1", proc=FakeProc())
+    monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
+    monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
+    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    worker = SimpleNamespace(busy_task_id="deadline1", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
 
@@ -1810,13 +1833,18 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
             "deadline_at": "2000-01-01T00:00:00Z",
             "_attempt": 1,
         },
-        "started_at": time.time() - 10,
-        "last_heartbeat_at": time.time() - 10,
+        # Past deadline AND idle (no progress for ~1000s): the deadline is gated through
+        # idle/subtree-liveness, so an expired-but-idle task is stopped without retry.
+        "started_at": time.time() - 1000,
+        "last_heartbeat_at": time.time() - 1000,
         "worker_id": 9,
         "attempt": 1,
     }
 
     queue_module.enforce_task_timeouts()
+    # Variant A: the terminal write + retry decision now happen in the off-loop reaper.
+    while not queue_module._reap_queue.empty():
+        queue_module._reap_timed_out_task(queue_module._reap_queue.get_nowait())
 
     assert queue_module.PENDING == []
     result = load_task_result(tmp_path, "deadline1")

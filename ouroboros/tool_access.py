@@ -24,6 +24,7 @@ from ouroboros.utils import safe_relpath
 ToolProfile = Literal[
     "self_modification",
     "workspace_task",
+    "external_workspace_task",
     "acting_subagent",
     "skill_repair",
     "local_readonly_subagent",
@@ -114,6 +115,22 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         "task_drive": {"read", "list", "write", "edit", "shell", "service"},
         "artifact_store": {"read", "list", "write", "shell", "service"},
     },
+    # Top-level EXTERNAL-workspace task (ctx.workspace_mode == "external"). Same
+    # authority as workspace_task PLUS read/list/search/shell on user_files so the
+    # agent can inspect host scratch and run commands there (a repo under /tmp, a
+    # /build tree, sibling checkouts). NO write/edit/vcs on user_files: structured
+    # edits go through active_workspace / task_drive; this is read+inspect+run.
+    # The user_files PATH guards (is_external_workspace + user_files_path_block_reason)
+    # still confine it to non-runtime, non-credential paths. Kept distinct from
+    # workspace_task so non-external workspace modes and self_worktree/genesis
+    # acting surfaces never inherit the host-scratch reach.
+    "external_workspace_task": {
+        "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "service"},
+        "runtime_data": {"read", "list"},
+        "task_drive": {"read", "list", "write", "edit", "shell", "service"},
+        "artifact_store": {"read", "list", "write", "shell", "service"},
+        "user_files": {"read", "list", "search", "shell"},
+    },
     # Mutative (acting) subagents write only inside their isolated active
     # workspace (self_worktree / external_workspace / genesis). No vcs-commit /
     # review here; the parent integrates and commits. self_worktree additionally
@@ -150,6 +167,25 @@ def _is_subagent_ctx(ctx: Any) -> bool:
     return False
 
 
+def is_external_workspace(ctx: Any) -> bool:
+    """True for an EXTERNAL-workspace top-level task (not the system repo).
+
+    External-workspace tasks operate on a pre-existing working tree somewhere on
+    the host (container scratch, a repo cloned under ``/tmp`` or ``/build``,
+    etc.). They legitimately read, run commands, and use git OUTSIDE the user
+    home, while the Ouroboros runtime (system repo + data drive) and
+    credential-like files stay protected by the per-path guards. ``self_worktree``
+    and ``genesis`` are acting-subagent SURFACES (``acting_subagent`` profile),
+    never this profile, so they keep full home/runtime confinement.
+    """
+    try:
+        if not bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
+            return False
+    except Exception:
+        return False
+    return str(getattr(ctx, "workspace_mode", "") or "").strip().lower() == "external"
+
+
 def active_tool_profile(ctx: Any) -> ToolProfile:
     constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     mode = str(getattr(constraint, "mode", "") or "").strip()
@@ -171,6 +207,10 @@ def active_tool_profile(ctx: Any) -> ToolProfile:
     if _is_subagent_ctx(ctx):
         return "local_readonly_subagent"
     if bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
+        # External workspaces additionally reach host scratch via user_files;
+        # other workspace modes keep the tighter workspace_task envelope.
+        if is_external_workspace(ctx):
+            return "external_workspace_task"
         return "workspace_task"
     if bool(getattr(ctx, "is_direct_chat", False)):
         return "operator_control"
@@ -206,6 +246,52 @@ def path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def normalize_root_relative(root: pathlib.Path, path: str) -> str:
+    """Map a model-supplied path to a root-relative string when it redundantly
+    encodes the root, so structural/read tools accept the paths an agent
+    naturally writes: an absolute path inside the active root (e.g. ``/app/foo``
+    under a workspace rooted at ``/app``) and a single redundant root-basename
+    prefix (``app/foo``). Returns a RELATIVE string only — it never widens
+    access: callers still apply ``safe_relpath`` + a ``relative_to`` confinement
+    check, so a genuine escape is still rejected downstream.
+
+    - absolute & inside root  -> stripped to relative
+    - absolute & outside root -> returned unchanged (caller's check rejects it)
+    - redundant root-basename prefix, existence-guarded -> stripped
+    - otherwise -> unchanged
+    """
+
+    text = str(path or "").strip().replace("\\", "/")
+    if not text or text in (".", "./"):
+        return text
+    try:
+        root_resolved = pathlib.Path(root).resolve(strict=False)
+    except (OSError, ValueError):
+        return text
+    # (A) absolute path that already points inside the root.
+    if is_absolute_path_text(text):
+        try:
+            return pathlib.Path(text).resolve(strict=False).relative_to(root_resolved).as_posix()
+        except (OSError, ValueError):
+            return text  # outside root -> let the caller's confinement reject it
+    # (B) redundant root-basename prefix ('app' or 'app/x' when root basename is
+    # 'app'). Strip it UNLESS the root contains a real same-named subdir (then
+    # 'app/x' is ambiguously a genuine nested path and is kept). Gating on the
+    # absence of that subdir — not on the target existing — lets NEW write/create
+    # targets ('app/new.py' -> 'new.py') normalize too, while a real 'app/'
+    # subdir is never mis-stripped. Only ever shortens toward root (no escape).
+    base = root_resolved.name
+    if base and (text == base or text.startswith(base + "/")):
+        try:
+            if not (root_resolved / base).is_dir():
+                return text[len(base):].lstrip("/") or "."
+        except (ValueError, OSError):
+            # `..`/traversal or stat error: leave unchanged so the caller's
+            # confinement produces the canonical (not a generic) error.
+            return text
+    return text
 
 
 def _path_is_relative_to_casefold(path: pathlib.Path, root: pathlib.Path) -> bool:
@@ -335,30 +421,74 @@ def user_files_path_block_reason(
 
     resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
     home = pathlib.Path.home().resolve(strict=False)
-    if not path_is_relative_to(resolved, home) and not _path_is_relative_to_casefold(resolved, home):
+    outside_home = not path_is_relative_to(resolved, home) and not _path_is_relative_to_casefold(resolved, home)
+    # External-workspace tasks may reach host scratch outside home (/tmp, /build,
+    # sibling checkouts). The runtime-overlap and credential guards BELOW still
+    # run on the full path, so the Ouroboros repo/data drive and secret-like
+    # files stay protected even when home confinement is lifted.
+    if outside_home and not is_external_workspace(ctx):
         return f"path is outside user home {home}"
 
+    # The Ouroboros runtime/control surface is the system repo PLUS every data
+    # drive the task touches: the parent drive (ctx.drive_root) and any child /
+    # budget drive carried in task_metadata. External-workspace mode lifts home
+    # confinement, so these must be enumerated explicitly here — otherwise a
+    # child-drive control path (e.g. <child_drive>/memory) would slip through.
+    protected_values: list[Any] = [
+        getattr(ctx, "drive_root", None),
+        getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", None),
+    ]
+    meta = getattr(ctx, "task_metadata", {})
+    if isinstance(meta, dict):
+        for key in ("drive_root", "child_drive_root", "headless_child_drive_root", "budget_drive_root"):
+            if meta.get(key):
+                protected_values.append(meta.get(key))
     protected_roots: list[pathlib.Path] = []
-    for value in (getattr(ctx, "drive_root", None), getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", None)):
+    hard_protected_roots: list[pathlib.Path] = []  # the data/repo/budget drives THEMSELVES
+    for value in protected_values:
         try:
             root = pathlib.Path(value).resolve(strict=False)
         except (OSError, TypeError, ValueError):
             continue
         protected_roots.append(root)
+        hard_protected_roots.append(root)
         parent = root.parent.resolve(strict=False)
         if root.name in {"repo", "data"} and path_is_relative_to(parent, home):
+            # The workspace PARENT is a SOFT boundary (keeps user_files out of ~/Ouroboros at large);
+            # it is deliberately NOT a hard root, so the Deliverables sibling under it stays allowed.
             protected_roots.append(parent)
-    for protected in protected_roots:
-        overlaps_protected = path_is_relative_to(resolved, protected) or _path_is_relative_to_casefold(resolved, protected)
-        contains_protected = path_is_relative_to(protected, resolved) or _path_is_relative_to_casefold(protected, resolved)
-        if overlaps_protected or (
-            not allow_protected_descendants and contains_protected
+    # The configured Deliverables container is an INTENDED user-output root, allowed past the
+    # workspace-overlap guard — but ONLY when it is a genuine sibling: a misconfigured
+    # OUROBOROS_DELIVERABLES_ROOT that overlaps or contains a HARD data/repo/budget drive must NOT
+    # open a bypass. The outside-home, credential, and hidden-name checks still apply regardless.
+    in_deliverables = False
+    try:
+        from ouroboros.config import get_deliverables_root
+
+        _deliverables = pathlib.Path(get_deliverables_root()).expanduser().resolve(strict=False)
+        _deliverables_safe = not any(
+            path_is_relative_to(_deliverables, pr) or _path_is_relative_to_casefold(_deliverables, pr)
+            or path_is_relative_to(pr, _deliverables) or _path_is_relative_to_casefold(pr, _deliverables)
+            for pr in hard_protected_roots
+        )
+        if _deliverables_safe and (
+            path_is_relative_to(resolved, _deliverables) or _path_is_relative_to_casefold(resolved, _deliverables)
         ):
-            return (
-                "path overlaps the Ouroboros repo/runtime workspace; use "
-                "root=active_workspace, root=task_drive, root=artifact_store, "
-                "or root=skill_payload instead"
-            )
+            in_deliverables = True
+    except Exception:
+        in_deliverables = False
+    if not in_deliverables:
+        for protected in protected_roots:
+            overlaps_protected = path_is_relative_to(resolved, protected) or _path_is_relative_to_casefold(resolved, protected)
+            contains_protected = path_is_relative_to(protected, resolved) or _path_is_relative_to_casefold(protected, resolved)
+            if overlaps_protected or (
+                not allow_protected_descendants and contains_protected
+            ):
+                return (
+                    "path overlaps the Ouroboros repo/runtime workspace; use "
+                    "root=active_workspace, root=task_drive, root=artifact_store, "
+                    "or root=skill_payload instead"
+                )
 
     try:
         parts = resolved.relative_to(home).parts
@@ -401,7 +531,24 @@ def resolve_user_file_path(
     elif raw_text.startswith("~"):
         candidate = raw.resolve(strict=False)
     else:
-        candidate = (home / safe_relpath(raw_text)).resolve(strict=False)
+        # safe_relpath has already normalized any Windows backslash to a POSIX '/', so the
+        # directory test below is separator-correct on every platform.
+        rel = safe_relpath(raw_text)
+        home_candidate = home / rel
+        if "/" in rel.strip("/") or home_candidate.exists():
+            # An explicit placement (a path WITH a directory — Desktop/..., Downloads/..., a subdir)
+            # OR a bare name that ALREADY EXISTS under home (an existing file or directory such as
+            # `Desktop`) is honored under the owner home exactly as given. This keeps read/list/search
+            # of existing user files and directory names home-relative — only a genuinely NEW unnamed
+            # output is containerized.
+            candidate = home_candidate.resolve(strict=False)
+        else:
+            # A bare name with no directory that does NOT already exist under home is an unnamed NEW
+            # deliverable: route it into the visible Deliverables container instead of cluttering the
+            # home root (a later read of the same bare name resolves there too, staying consistent).
+            from ouroboros.config import get_deliverables_root
+
+            candidate = (pathlib.Path(get_deliverables_root()).expanduser() / rel).resolve(strict=False)
     reason = user_files_path_block_reason(
         ctx,
         candidate,
@@ -471,6 +618,23 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
                     continue
             return ensure_process_cwd(label, candidate), label, allowed
 
+    # External-workspace tasks may run commands FROM host scratch (a repo under
+    # /tmp, a /build tree, a sibling checkout). Accept an absolute cwd that clears
+    # the user_files PATH guard (non-runtime, non-credential), scoped to THAT
+    # exact path — never the filesystem root — so the workspace write-guard
+    # allowlist (which reuses this returned root list) is not widened beyond the
+    # chosen working directory.
+    if is_external_workspace(ctx) and decide_tool_access(
+        profile=profile, root="user_files", operation=operation
+    ).allow:
+        for candidate in candidates:
+            if not candidate.is_absolute():
+                continue
+            if user_files_path_block_reason(ctx, candidate):
+                continue
+            scoped_allowed = [*allowed, ("user_files", candidate)]
+            return ensure_process_cwd("user_files", candidate), "user_files", scoped_allowed
+
     raise ValueError("cwd is outside allowed roots")
 
 
@@ -527,6 +691,16 @@ def resolve_resource_path(
         return resolve_user_file_path(ctx, path)
     base = resource_root_path(ctx, root, bucket=bucket, skill_name=skill_name)
     resolved_base = pathlib.Path(base).resolve(strict=False)
+    # Redundant-root-basename / absolute-inside-root normalization is applied ONLY
+    # for the repo roots, where the dispatch boundary (registry) already normalizes
+    # args['path'] so guard and operation share the SAME target. Non-repo roots
+    # (runtime_data, deliverables, skill_payload, ...) resolve the RAW path in their
+    # own handlers (e.g. _data_read via _normalize_data_read_path, which strips only
+    # the full drive-root prefix, NOT a bare basename), so normalizing here would
+    # desync the guard from the operation — keep those raw (matches the approved T2
+    # dispatch-only scope).
+    if root in ("active_workspace", "system_repo"):
+        path = normalize_root_relative(resolved_base, path)
     resolved = (resolved_base / safe_relpath(path or ".")).resolve(strict=False)
     try:
         resolved.relative_to(resolved_base)

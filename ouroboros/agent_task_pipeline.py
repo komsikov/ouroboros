@@ -17,8 +17,10 @@ from ouroboros.task_results import (
 )
 from ouroboros.artifacts import collect_task_artifact_records, merge_artifact_records
 from ouroboros.outcomes import (
+    EXECUTION_BEST_EFFORT,
     EXECUTION_FAILED,
     EXECUTION_INFRA_FAILED,
+    EXECUTION_OK,
     artifact_bundle_from_result,
     build_verification_ledger,
     derive_loop_outcome,
@@ -290,6 +292,13 @@ def emit_task_results(
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
     reason_code = str(loop_outcome.get("reason_code") or "")
+    # CW3 (v6.34.0): a short same-route "turn=decision" turn (ephemeral, run while the
+    # main agent is busy) DELIVERS its inline answer but must not leave a durable TASK
+    # RECORD \u2014 no task_result file, no task_eval ledger row. The cognitive-memory writes
+    # (reflection/consolidation/letters-home) are already gated further below; this
+    # closes the remaining durable task-record writes. The answer + card resolution
+    # (send_message/task_done) and budget metrics still flow so the reply is visible.
+    _ephemeral = bool(task.get("_ephemeral_turn"))
     pending_events.append({
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
@@ -301,22 +310,23 @@ def emit_task_results(
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
                         if isinstance(tc, dict) and tc.get("is_error"))
-    try:
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
-            "task_id": task.get("id"), "task_type": task.get("type"),
-            "outcome_axes": outcome_axes,
-            "reason_code": reason_code,
-            "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
-            "review_trigger": str(loop_outcome.get("review_trigger") or ""),
-            "duration_sec": duration_sec,
-            "tool_calls": n_tool_calls,
-            "tool_errors": n_tool_errors,
-            "response_len": len(text),
-        })
-    except Exception:
-        log.warning("Failed to log task eval event", exc_info=True)
-        pass
+    if not _ephemeral:
+        try:
+            append_jsonl(drive_logs / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
+                "task_id": task.get("id"), "task_type": task.get("type"),
+                "outcome_axes": outcome_axes,
+                "reason_code": reason_code,
+                "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
+                "review_trigger": str(loop_outcome.get("review_trigger") or ""),
+                "duration_sec": duration_sec,
+                "tool_calls": n_tool_calls,
+                "tool_errors": n_tool_errors,
+                "response_len": len(text),
+            })
+        except Exception:
+            log.warning("Failed to log task eval event", exc_info=True)
+            pass
 
     pending_events.append({
         "type": "task_metrics",
@@ -344,13 +354,21 @@ def emit_task_results(
     except Exception:
         log.debug("Failed to collect review evidence", exc_info=True)
 
-    _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence)
-    stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    if not _ephemeral:
+        _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence)
+        stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    else:
+        # No durable task_result file for a transient decision turn; the card still
+        # resolves via task_done below (with empty artifact/review status).
+        stored_result = {}
     artifact_bundle = stored_result.get("artifact_bundle") if isinstance(stored_result.get("artifact_bundle"), dict) else {}
     pending_events.append({
         "type": "task_done",
         "task_id": task.get("id"),
         "task_type": task.get("type"),
+        # CW3: tells the supervisor's task_done handler to NOT synthesize a durable
+        # missing-result task_result for a transient decision turn (which has none).
+        "_ephemeral": _ephemeral,
         # Carry the thread so the terminal card finalizes in its project panel
         # (per-thread fan-out), not just the main chat.
         "chat_id": int(task.get("chat_id") or 0),
@@ -385,8 +403,15 @@ def emit_task_results(
         post_usage = dict(usage or {})
         post_usage["outcome_axes"] = outcome_axes
         post_usage["reason_code"] = reason_code
-        _run_chat_consolidation(env, memory, llm, task, drive_logs)
-        _run_scratchpad_consolidation(env, memory, llm)
+        # Ephemeral same-route turns (the "turn=decision" anti-freeze path while the
+        # main agent is busy) are PROHIBITED from ALL durable memory: not only
+        # reflection/evolution (below) but chat/scratchpad consolidation and project
+        # letters-home too — the locked main path owns those (v6.33.0 WS10
+        # idempotency contract; claudexor B5). ``_ephemeral`` is computed once near
+        # the top of this function (it also gates the durable task-record writes).
+        if not _ephemeral:
+            _run_chat_consolidation(env, memory, llm, task, drive_logs)
+            _run_scratchpad_consolidation(env, memory, llm)
         from ouroboros.project_facts import resolve_project_id
 
         _project_scoped = bool(resolve_project_id(task))
@@ -398,7 +423,7 @@ def emit_task_results(
         # observation and stall the global chat lock). Only real pooled project
         # tasks get the letters-home + blocking treatment.
         _is_direct_chat = bool(task.get("_is_direct_chat"))
-        _project_task = _project_scoped and not _is_direct_chat
+        _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
         if _project_task:
             # Letters home (v6.32.0): record the cycle in the project's own
             # journal and emit a concise completion digest for consciousness
@@ -423,7 +448,11 @@ def emit_task_results(
 
                 append_journal_milestone(
                     _pid,
-                    "done" if _exec_status in ("success", "best_effort") else "blocked",
+                    # Compare against the canonical execution-axis constants, not raw
+                    # "success"/"best_effort" — the axis value for a clean finish is
+                    # EXECUTION_OK ("ok"), so the old literal never matched and every
+                    # successful task was journaled as "blocked" (C9.1 seed bug).
+                    "done" if _exec_status in (EXECUTION_OK, EXECUTION_BEST_EFFORT) else "blocked",
                     f"Task finished ({_exec_status}): {_objective}",
                     task_id=str(task.get("id") or ""),
                 )
@@ -441,16 +470,20 @@ def emit_task_results(
                 })
             except Exception:
                 log.debug("project digest emission failed", exc_info=True)
-        # LLM-heavy memory work stays off the reply critical path.
-        reflection_entry = _run_post_task_processing_async(
-            env, task, post_usage, llm_trace, review_evidence, drive_logs,
-            blocking=(
-                str(task.get("type") or "") == "evolution"
-                or bool(str(task.get("workspace_root") or "").strip())
-                or bool(str(task.get("workspace_mode") or "").strip())
-                or _project_task
-            ),
-        )
+        # LLM-heavy memory work stays off the reply critical path; ephemeral turns
+        # skip reflection/evolution too (see the idempotency note above).
+        if _ephemeral:
+            reflection_entry = None
+        else:
+            reflection_entry = _run_post_task_processing_async(
+                env, task, post_usage, llm_trace, review_evidence, drive_logs,
+                blocking=(
+                    str(task.get("type") or "") == "evolution"
+                    or bool(str(task.get("workspace_root") or "").strip())
+                    or bool(str(task.get("workspace_mode") or "").strip())
+                    or _project_task
+                ),
+            )
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         # Leak guard (Phase 3b / red-team R3.1): a project-scoped task must NEVER
         # write its learnings to the canonical parent drive — project facts live
@@ -568,6 +601,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             role=task.get("role"),
             description=task.get("description"),
             objective=task.get("objective") or task.get("description"),
+            title=task.get("title"),
             expected_output=task.get("expected_output"),
             constraints=task.get("constraints"),
             context=task.get("context"),

@@ -33,6 +33,15 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
+# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
+# (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
+# the model can self-pace; it is not a stop gate. 0 disables.
+PACING_INTERVAL_DEFAULT_SEC = 600
+# Supervisor-loop liveness deadline (WS3, v6.34.0): a dedicated watchdog thread
+# flags the main supervisor loop as STALLED if it has not ticked within this many
+# seconds (it normally ticks every ~0.5s). Far above any healthy tick so it only
+# fires on a real wedge (a blocking step starving new-message intake). 0 disables.
+SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
 
 def _guard_live_settings_write() -> None:
@@ -93,6 +102,7 @@ SETTINGS_DEFAULTS = {
     # outside repo/ and data/). genesis projects are durable and never GC'd.
     "OUROBOROS_SUBAGENT_WORKTREE_ROOT": "",
     "OUROBOROS_SUBAGENT_PROJECTS_ROOT": "",
+    "OUROBOROS_DELIVERABLES_ROOT": "",
     # Unified age-based GC retention (days) for ALL disposable runtime artifacts:
     # subagent worktrees, headless/direct task drives, and leftover service logs.
     # Single owner-facing knob (math SSOT in ouroboros/retention.py); deprecated
@@ -112,8 +122,20 @@ SETTINGS_DEFAULTS = {
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
     "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
+    # NOTE: OUROBOROS_HARD_TIMEOUT_SEC no longer terminates tasks — the flat wall-clock
+    # kill was replaced by the activity model below (idle + subtree-liveness, abs ceiling).
+    # It survives only as a soft-warning/status display input; runtime is governed by
+    # OUROBOROS_TASK_IDLE_TIMEOUT_SEC and OUROBOROS_TASK_ABS_CEILING_SEC.
     "OUROBOROS_HARD_TIMEOUT_SEC": 1800,
+    # Activity-based liveness (replaces flat wall-clock as the primary stop):
+    # idle window = no real progress AND no progressing subtree; abs ceiling = the
+    # unconditional per-task backstop (budget/cost stays a separate hard axis).
+    "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
+    "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
+    "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
+    "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
+    "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
@@ -169,6 +191,10 @@ SETTINGS_DEFAULTS = {
     # import-seam + contracts full; the rest manifest-only). Does NOT claim full
     # coverage and does NOT replace the >=1M blocking scope floor.
     "OUROBOROS_SCOPE_REVIEW_DEGRADED": "false",
+    # P3 scope-reviewer capability floor: blocking_1m (default; the reviewer is the
+    # >=1M blocking gate) | advisory (sub-1M reviewer, supplementary only — can
+    # never satisfy a required blocking scope gate). See get_scope_review_floor.
+    "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     "OUROBOROS_TASK_REVIEW_MODE": "auto",
     # Reasoning effort per task type: none | low | medium | high
     "OUROBOROS_EFFORT_TASK": "medium",
@@ -178,6 +204,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
     "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
     "OUROBOROS_RETURN_REASONING": True,
+    "OUROBOROS_REASONING_SUMMARY": "auto",
     "GITHUB_TOKEN": "",
     "GITHUB_REPO": "",
     # Local model (llama-cpp-python server)
@@ -404,6 +431,16 @@ def direct_provider_review_models_fallback(provider: str) -> list[str]:
     )
 
 
+def adaptive_quorum(n_slots: int) -> int:
+    """Reviewer-quorum SSOT for an ARBITRARY configured slot count, reused by
+    triad/scope/plan/skill/acceptance review. A single configured reviewer needs
+    1 (a loud single_reviewer_no_diversity degraded mode), 2 need both, 3+ keep
+    the classic 2-of-N majority. This honors an explicit small reviewer config
+    (Bible P3 stays loud); it is DISTINCT from "configured >= quorum but fewer
+    responded", which remains a loud infra quorum FAILURE at the call site."""
+    return 2 if n_slots >= 3 else max(1, n_slots)
+
+
 def get_review_models() -> list[str]:
     """Return the configured pre-commit review model list."""
     default_str = SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]
@@ -420,8 +457,12 @@ def get_review_models() -> list[str]:
         return models
 
     migrated = [migrate_model_value(provider, model) for model in models]
-    if not migrated or len(migrated) < 2 or any(not model.startswith(provider_prefix) for model in migrated):
-        # Duplicate model IDs are valid stochastic reviewer slots.
+    if not migrated or any(not model.startswith(provider_prefix) for model in migrated):
+        # Auto-expand to the [main]*N stochastic fallback ONLY when nothing
+        # usable is configured (empty, or foreign models in an exclusive
+        # direct-provider setup). An explicit provider-matching list — including
+        # a single model — is honored exactly (duplicates are valid stochastic
+        # slots, at the owner's discretion).
         return direct_provider_review_models_fallback(provider)
     return migrated
 
@@ -475,6 +516,45 @@ def get_max_workers() -> int:
     except (TypeError, ValueError):
         parsed = int(SETTINGS_DEFAULTS["OUROBOROS_MAX_WORKERS"])
     return max(1, parsed)
+
+
+def get_task_idle_timeout_sec() -> int:
+    """Idle window before a task is eligible for an activity-based stop: it has made
+    no REAL progress (its own last_progress_at) AND has no progressing subtree for
+    this long. The periodic 30s process heartbeat is liveness, NOT progress."""
+    raw = os.environ.get(
+        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"]
+    )
+    try:
+        return max(60, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"])
+
+
+def get_task_abs_ceiling_sec() -> int:
+    """Absolute wall-clock backstop per task, independent of activity — the only hard
+    time axis (budget/cost is the other, separate hard axis). A productively-waiting
+    orchestrator survives to this ceiling instead of a flat 1800s wall-clock kill."""
+    raw = os.environ.get(
+        "OUROBOROS_TASK_ABS_CEILING_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"]
+    )
+    try:
+        return max(300, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"])
+
+
+def get_per_call_timeout_ceiling_sec() -> int:
+    """SSOT ceiling for an explicit per-call run_command/run_script timeout_sec
+    (and the outer tool-execution cap that accommodates it)."""
+    raw = os.environ.get(
+        "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC",
+        SETTINGS_DEFAULTS["OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"],
+    )
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"])
 
 
 def get_plan_task_swarm_timeout_sec() -> float:
@@ -643,6 +723,18 @@ def get_subagent_projects_root() -> str:
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
+
+
+def get_deliverables_root() -> str:
+    """Visible container for UNNAMED user deliverables: a bare filename (no directory) lands here
+    instead of cluttering the home root. Sibling of the genesis projects root under ~/Ouroboros,
+    outside data/, and never GC-pruned. An explicit placement (Desktop/..., Downloads/..., or any
+    path WITH a directory) is always honored as given. Override with OUROBOROS_DELIVERABLES_ROOT."""
+    raw = str(
+        os.environ.get("OUROBOROS_DELIVERABLES_ROOT", "")
+        or SETTINGS_DEFAULTS.get("OUROBOROS_DELIVERABLES_ROOT", "")
+    ).strip()
+    return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "Deliverables"))
 
 
 def get_task_review_mode() -> str:
@@ -1082,6 +1174,49 @@ def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
     return max(0, min(parsed, 300))
 
 
+def get_scope_review_floor(settings: Optional[dict] = None) -> str:
+    """P3 scope-reviewer capability floor: 'blocking_1m' (default) or 'advisory'.
+
+    blocking_1m: the scope reviewer is treated as the >=1M blocking gate (the
+    default gpt-5.5 reviewer IS 1M). advisory: a sub-1M reviewer may run, but its
+    scope output is SUPPLEMENTARY ONLY and can NEVER satisfy a required blocking
+    constitutional/release scope gate. Binary by design — no chunked tier."""
+    raw = os.environ.get("OUROBOROS_SCOPE_REVIEW_FLOOR")
+    if raw is None and isinstance(settings, dict):
+        raw = settings.get("OUROBOROS_SCOPE_REVIEW_FLOOR")
+    if raw is None:
+        try:
+            raw = load_settings().get("OUROBOROS_SCOPE_REVIEW_FLOOR")
+        except Exception:
+            raw = None
+    value = str(raw or "blocking_1m").strip().lower()
+    return "advisory" if value == "advisory" else "blocking_1m"
+
+
+def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
+    """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
+    raw = os.environ.get("OUROBOROS_PACING_INTERVAL_SEC")
+    if raw is None and isinstance(settings, dict):
+        raw = settings.get("OUROBOROS_PACING_INTERVAL_SEC")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = int(PACING_INTERVAL_DEFAULT_SEC)
+    return max(0, parsed)
+
+
+def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
+    """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
+    raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
+    if raw is None and isinstance(settings, dict):
+        raw = settings.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = int(SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC)
+    return max(0, parsed)
+
+
 def apply_settings_to_env(settings: dict) -> None:
     """Push settings into environment variables for supervisor modules."""
     settings = apply_fixed_infra_model_policy(settings)
@@ -1102,7 +1237,9 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
-        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
+        "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC",
         "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
         "OUROBOROS_WEBSEARCH_MODEL",
@@ -1113,7 +1250,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS",
         "OUROBOROS_RESTART_DRAIN_MAX_SEC",
         "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
-        "OUROBOROS_SCOPE_REVIEW_DEGRADED",
+        "OUROBOROS_SCOPE_REVIEW_DEGRADED", "OUROBOROS_SCOPE_REVIEW_FLOOR",
         "OUROBOROS_TASK_REVIEW_MODE",
         # Unified disposable-artifact GC retention (replaces per-subsystem keys).
         "OUROBOROS_GC_RETENTION_DAYS",
@@ -1123,6 +1260,7 @@ def apply_settings_to_env(settings: dict) -> None:
         # Acting (mutative) subagents: owner toggle + worktree/projects roots.
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT",
         "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
+        "OUROBOROS_DELIVERABLES_ROOT",
         # ClawHub marketplace registry URL.
         "OUROBOROS_CLAWHUB_REGISTRY_URL",
         "MCP_ENABLED", "MCP_TOOL_TIMEOUT_SEC",
@@ -1131,6 +1269,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
         "OUROBOROS_EFFORT_CONSCIOUSNESS",
         "OUROBOROS_RETURN_REASONING",
+        "OUROBOROS_REASONING_SUMMARY",
         "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME",
         "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH",
         "LOCAL_MODEL_CHAT_FORMAT",

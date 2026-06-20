@@ -12,11 +12,18 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from ouroboros.config import apply_settings_to_env, get_max_subagent_depth, load_settings, save_settings
 from ouroboros.headless import prepare_task_drive, task_state_dir
-from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
+from ouroboros.contracts.task_contract import (
+    build_task_contract,
+    normalize_allowed_resources,
+)
+from ouroboros.tools.control_delegation import (
+    _ensure_project_scope,
+    child_budget_for_schedule,
+)
 from ouroboros.outcomes import normalize_outcome_axes, public_task_result
 from ouroboros.task_results import (
     STATUS_COMPLETED,
@@ -280,6 +287,8 @@ def _promote_chat_to_task(
     expected_output: str = "",
     project_id: str = "",
     workspace_root: str = "",
+    title: str = "",
+    project_name: str = "",
 ) -> str:
     """Route real work out of the conversation lane into a supervised pooled task.
 
@@ -288,12 +297,23 @@ def _promote_chat_to_task(
     pooled task with a live card. The decision is the model's own structural
     tool call (BIBLE P5 — no keyword routing). Follow-up owner messages reach
     the running task through its owner-mailbox.
+
+    ``title`` is a short human name the model coins for the card AT CREATION
+    (no extra request, owner P1) — reused as the project name if this task is
+    later turned into a project. ``project_name`` makes this an LLM-first
+    "create a named project and work there" call: the project is created NOW
+    with that display name and the task runs inside it (v6.33.0).
     """
     goal = str(objective or "").strip()
     if not goal:
         return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
-    from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
+    from ouroboros.project_facts import (
+        explicit_project_id_ok,
+        project_id_from_display_name,
+        sanitize_project_id,
+    )
 
+    display_name = str(project_name or "").strip()
     pid = ""
     if str(project_id or "").strip():
         if not explicit_project_id_ok(project_id):
@@ -302,6 +322,12 @@ def _promote_chat_to_task(
                 "filesystem-clean; use lowercase alphanumeric/_/-/. (<=64 chars)"
             )
         pid = sanitize_project_id(project_id)
+    elif display_name:
+        # LLM-first "create a NAMED project and work there": derive a filesystem
+        # id from the display name. A non-ASCII name (e.g. a Cyrillic "динозавры")
+        # falls back to a deterministic hash id so the project is still created —
+        # the human-readable name rides project_name on the registry.
+        pid = project_id_from_display_name(display_name)
     else:
         # No explicit arg: inherit the CURRENT project scope so a project-chat
         # task that promotes follow-up work stays in its own project (the model
@@ -318,17 +344,137 @@ def _promote_chat_to_task(
         "objective": goal,
         "expected_output": str(expected_output or "").strip(),
         "project_id": pid,
+        "project_name": display_name,
+        "title": str(title or "").strip()[:80],
         "workspace_root": str(workspace_root or "").strip(),
         "chat_id": current_chat_id,
         "ts": utc_now_iso(),
     }
     mode = _emit_control_event(ctx, evt)
-    scope_note = f" in project '{pid}'" if pid else ""
+    if display_name:
+        scope_note = f" in new project '{display_name}'"
+    elif pid:
+        scope_note = f" in project '{pid}'"
+    else:
+        scope_note = ""
     return (
         f"OK: promoted to supervised task {tid}{scope_note} ({mode}). The conversation "
         "lane stays free; the owner sees a live task card and can steer the running "
         "task from chat (messages are delivered to its mailbox). Use wait_task/"
         "get_task_result to follow up if the result is needed in this conversation."
+    )
+
+
+def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
+    """Enumerate the owner's projects (id, name, recency) so the one mind can
+    decide whether a main-chat message belongs to an existing project."""
+    try:
+        from ouroboros.projects_registry import projects_summary
+        rows = projects_summary(Path(ctx.drive_root), limit=max(1, min(int(limit or 50), 200)))
+    except Exception as exc:
+        return f"⚠️ PROJECTS_ERROR: {type(exc).__name__}: {exc}"
+    if not rows:
+        return "No projects yet. Create one by promoting work with a fresh project_id, or just answer/spawn a task."
+    lines = []
+    for p in rows:
+        pid = str(p.get("id") or "")
+        name = str(p.get("name") or pid)
+        last = str(p.get("last_active_at") or p.get("created_at") or "")
+        active = " · running" if p.get("has_thread_activity") else ""
+        lines.append(f"- {pid} — {name}{active}{(' · last ' + last) if last else ''}")
+    return "Projects (route a related main-chat message with route_to_project):\n" + "\n".join(lines)
+
+
+def _route_to_project(ctx: ToolContext, project_id: str, message: str, reason: str = "") -> str:
+    """Route a main-chat message to an EXISTING project so the work continues in
+    that project's context (its memory/journal/thread), keeping the main chat free.
+
+    LLM-first: the model decides WHEN to route (its judgment is the gate, never a
+    keyword rule); this verb just delivers the decision and returns a visible
+    receipt. Exactly one owner-visible outcome per call (the routed project turn).
+    """
+    from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
+    from ouroboros.projects_registry import get_project
+
+    msg = str(message or "").strip()
+    if not msg:
+        return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
+    if not str(project_id or "").strip() or not explicit_project_id_ok(project_id):
+        return (
+            f"⚠️ TOOL_ARG_ERROR (route_to_project): project_id {project_id!r} is not filesystem-clean. "
+            "Call list_projects to see valid ids."
+        )
+    pid = sanitize_project_id(project_id)
+    proj = get_project(Path(ctx.drive_root), pid)
+    if not proj:
+        return (
+            f"⚠️ ROUTE_TARGET_NOT_FOUND: no project '{pid}'. Use list_projects to see existing projects, "
+            "answer inline, or promote_chat_to_task(project_id=…) to start project-scoped work."
+        )
+    try:
+        current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
+    except (TypeError, ValueError):
+        current_chat_id = 0
+    tid = uuid.uuid4().hex[:8]
+    objective = msg if not str(reason or "").strip() else f"{msg}\n\n(routing reason: {str(reason).strip()})"
+    evt: Dict[str, Any] = {
+        "type": "promote_chat_to_task",
+        "task_id": tid,
+        "objective": objective,
+        "project_id": pid,
+        "chat_id": current_chat_id,
+        "routed_from_main": True,
+        "ts": utc_now_iso(),
+    }
+    mode = _emit_control_event(ctx, evt)
+    name = str(proj.get("name") or pid)
+    return (
+        f"✉️ Routed to project '{name}' ({pid}) as task {tid} ({mode}). I'll continue there; "
+        "this chat stays free for you. Follow-ups you send reach the project task's mailbox."
+    )
+
+
+def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
+    """Deliver a follow-up/steering message to a task already RUNNING in this chat
+    — the agent's OWN choice of target among ``current_chat.running_tasks``.
+
+    When the chat is busy, a new message runs as a short-lived decision turn that
+    sees the running tasks of the current chat as structural context and picks the
+    one to steer. This verb just transports the message to that task's owner-mailbox
+    (the running task drains it at its next safe checkpoint). LLM-first (BIBLE P5):
+    the code never decides which task a message belongs to — it only validates the
+    transport (task exists, same chat, idempotent delivery) and the supervisor
+    performs the mailbox write on the task's active drive. When unsure which task
+    (or none) fits, spawn a fresh task with ``promote_chat_to_task`` instead.
+    """
+    target = str(task_id or "").strip()
+    msg = str(message or "").strip()
+    if not target:
+        return (
+            "⚠️ TOOL_ARG_ERROR (steer_task): task_id is required — pick one from "
+            "current_chat.running_tasks (or promote_chat_to_task to start new work)."
+        )
+    if not msg:
+        return "⚠️ TOOL_ARG_ERROR (steer_task): message is required."
+    try:
+        current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
+    except (TypeError, ValueError):
+        current_chat_id = 0
+    _md = getattr(ctx, "task_metadata", None)
+    client_message_id = str((_md.get("client_message_id") if isinstance(_md, dict) else "") or "").strip()
+    evt: Dict[str, Any] = {
+        "type": "steer_task",
+        "target_task_id": target,
+        "message": msg,
+        "chat_id": current_chat_id,
+        "client_message_id": client_message_id,
+        "ts": utc_now_iso(),
+    }
+    mode = _emit_control_event(ctx, evt)
+    return (
+        f"✉️ Steering task {target} ({mode}): the message reaches its mailbox at the task's next "
+        "checkpoint. If that task has already finished, you'll get a notice — then answer inline "
+        "or promote_chat_to_task instead."
     )
 
 
@@ -358,10 +504,13 @@ def _build_acting_constraint(
         )
     if not get_allow_mutative_subagents():
         return (
-            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: acting (mutative) subagents are turned "
-            "off in this runtime mode. Schedule a read-only subagent (omit "
-            "write_surface), or have the owner enable OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS "
-            "(default ON in advanced/pro, OFF in light)."
+            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: the OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS toggle "
+            "is not enabled. That toggle is the master gate: an explicit owner true/false "
+            "overrides the runtime-mode default, and runtime mode only sets the default when "
+            "the toggle is empty (default ON in advanced/pro, OFF in light). Schedule a "
+            "read-only subagent (omit write_surface), or have the owner enable "
+            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS. Note: light blocks only self-repo/control-plane "
+            "writes (write_surface=self_worktree), not user/task/project deliverables."
         )
     grants: List[str] = []
     if isinstance(external_tool_grants, (list, tuple)):
@@ -407,6 +556,50 @@ def _select_subagent_constraint(write_surface, write_root, protected_paths_grant
     )
 
 
+def _populate_subagent_event_extras(
+    evt: Dict[str, Any], *, current_chat_id: Any, child_drive: Any, workspace_root: str,
+    workspace_mode: str, executor_ref: Any, context: str, parent_task_id: str,
+) -> None:
+    """Add the optional fields of a schedule_subagent event in place (extracted from
+    _schedule_task to keep it under the method gate; pure field assignment)."""
+    if current_chat_id:
+        evt["chat_id"] = current_chat_id
+    if child_drive is not None:
+        evt["drive_root"] = str(child_drive)
+        evt["child_drive_root"] = str(child_drive)
+    if workspace_root:
+        evt["workspace_root"] = workspace_root
+    if workspace_mode:
+        evt["workspace_mode"] = workspace_mode
+    if executor_ref:
+        evt["executor_ref"] = executor_ref
+        evt["metadata"] = {**(evt.get("metadata") if isinstance(evt.get("metadata"), dict) else {}), "executor_ref": executor_ref}
+    if context:
+        evt["context"] = context
+    if parent_task_id:
+        evt["parent_task_id"] = parent_task_id
+
+
+def _prepare_child_drives(slot_tasks, task_ids, status_drive_root, memory_mode, parent_project_id):
+    """Prepare forked/empty child drives for a scheduled wave. On any failure, clean up
+    every child drive + task-state dir and return ``(drives, error_string)``; otherwise
+    ``(drives, "")``. (Extracted from _schedule_task to keep it under the method gate.)"""
+    child_drives: Dict[str, Path] = {}
+    if memory_mode not in {"forked", "empty"}:
+        return child_drives, ""
+    for tid, _slot in slot_tasks:
+        try:
+            child_drives[tid] = prepare_task_drive(status_drive_root, tid, memory_mode, project_id=parent_project_id)
+        except Exception as exc:
+            for child_drive in child_drives.values():
+                shutil.rmtree(child_drive, ignore_errors=True)
+            for cleanup_tid in task_ids:
+                shutil.rmtree(task_state_dir(status_drive_root, cleanup_tid), ignore_errors=True)
+            log.warning("Failed to prepare child drive for subtask %s", tid, exc_info=True)
+            return child_drives, f"⚠️ SUBTASK_DRIVE_ERROR: failed to prepare {memory_mode} child drive: {exc}"
+    return child_drives, ""
+
+
 def _schedule_task(
     ctx: ToolContext,
     objective: str = "",
@@ -420,6 +613,10 @@ def _schedule_task(
     write_root: str = "",
     protected_paths_grant: bool = False,
     external_tool_grants: Any = None,
+    delegation_intent: str = "",
+    may_mutate: bool = False,
+    may_fan_out: bool = True,
+    max_children: int = 0,
     **legacy_or_unknown: Any,
 ) -> str:
     if legacy_or_unknown:
@@ -535,18 +732,20 @@ def _schedule_task(
         root_task_id=root_task_id_seed,
         role=role,
     ) if task_group_id else {}
-    child_drives: Dict[str, Path] = {}
-    if memory_mode in {"forked", "empty"}:
-        for tid, _slot in slot_tasks:
-            try:
-                child_drives[tid] = prepare_task_drive(status_drive_root, tid, memory_mode, project_id=parent_project_id)
-            except Exception as exc:
-                for child_drive in child_drives.values():
-                    shutil.rmtree(child_drive, ignore_errors=True)
-                for cleanup_tid in task_ids:
-                    shutil.rmtree(task_state_dir(status_drive_root, cleanup_tid), ignore_errors=True)
-                log.warning("Failed to prepare child drive for subtask %s", tid, exc_info=True)
-                return f"⚠️ SUBTASK_DRIVE_ERROR: failed to prepare {memory_mode} child drive: {exc}"
+    child_drives, _drive_err = _prepare_child_drives(
+        slot_tasks, task_ids, status_drive_root, memory_mode, parent_project_id
+    )
+    if _drive_err:
+        return _drive_err
+
+    # C3.1: propagate the parent's delegation INTENT to the child structurally (typed
+    # budget); only ever NARROWS within the parent (depth/active caps stay enforced).
+    child_delegation_budget = child_budget_for_schedule(
+        parent_contract,
+        current_depth=current_depth, new_depth=new_depth, max_depth=max_depth,
+        may_mutate=may_mutate, may_fan_out=may_fan_out, max_children=max_children,
+        intent_note=delegation_intent,
+    )
 
     events_to_emit: List[Dict[str, Any]] = []
     for tid, slot in slot_tasks:
@@ -579,7 +778,8 @@ def _schedule_task(
                     "objective": objective,
                     "expected_output": expected_output,
                     "constraints": constraints,
-                } if isinstance(parent_contract, dict) else {},
+                    "delegation_budget": child_delegation_budget,
+                } if isinstance(parent_contract, dict) else {"delegation_budget": child_delegation_budget},
             },
         })
         envelope = build_subagent_envelope(
@@ -624,22 +824,11 @@ def _schedule_task(
             "task_group": task_group,
             "subagent_envelope": envelope,
         }
-        if current_chat_id:
-            evt["chat_id"] = current_chat_id
-        if child_drive is not None:
-            evt["drive_root"] = str(child_drive)
-            evt["child_drive_root"] = str(child_drive)
-        if workspace_root:
-            evt["workspace_root"] = workspace_root
-        if workspace_mode:
-            evt["workspace_mode"] = workspace_mode
-        if executor_ref:
-            evt["executor_ref"] = executor_ref
-            evt["metadata"] = {**(evt.get("metadata") if isinstance(evt.get("metadata"), dict) else {}), "executor_ref": executor_ref}
-        if context:
-            evt["context"] = context
-        if parent_task_id:
-            evt["parent_task_id"] = parent_task_id
+        _populate_subagent_event_extras(
+            evt, current_chat_id=current_chat_id, child_drive=child_drive,
+            workspace_root=workspace_root, workspace_mode=workspace_mode,
+            executor_ref=executor_ref, context=context, parent_task_id=parent_task_id,
+        )
         try:
             write_task_result(
                 status_drive_root,
@@ -922,8 +1111,7 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     if model:
         if model not in available:
             return f"⚠️ Unknown model: {model}. Available: {', '.join(available)}"
-        ctx.active_model_override = model
-        
+
         import os
         use_local = False
         if model == os.environ.get("OUROBOROS_MODEL") and os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
@@ -934,7 +1122,31 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
             use_local = True
         elif model == os.environ.get("OUROBOROS_MODEL_FALLBACK") and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
             use_local = True
-            
+
+        # CW2 (v6.34.0): the per-round re-gate downgrades the MODE for a sub-1M switch, but
+        # the already-built transcript still carries the max-mode reference docs — switching
+        # to a route that can't confirm >=1M would send that max-sized prompt to a smaller
+        # window. Refuse the switch while the transcript is max-sized (BIBLE P1).
+        if str(getattr(ctx, "active_context_mode", "") or "") == "max":
+            try:
+                from ouroboros.gateway.settings import _active_route_confirms_max
+                if not _active_route_confirms_max(model=model, use_local=use_local):
+                    return (
+                        f"⚠️ SWITCH_BLOCKED: '{model}' does not confirm a >=1M context window, but the "
+                        "current transcript was built in Max context mode and would overflow it. Pick a "
+                        ">=1M route, or have the owner lower context mode to Low before switching."
+                    )
+            except Exception:
+                # Fail CLOSED: an errored capability check must not let a max-sized transcript
+                # switch to a possibly-sub-1M route (BIBLE P1 cognitive horizon).
+                log.debug("CW2 switch_model capability guard errored; failing closed", exc_info=True)
+                return (
+                    f"⚠️ SWITCH_BLOCKED: couldn't verify whether '{model}' confirms a >=1M window while "
+                    "the transcript is max-sized — failing closed. Retry, pick a known >=1M route, or have "
+                    "the owner lower context mode to Low first."
+                )
+
+        ctx.active_model_override = model
         ctx.active_use_local_override = use_local
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
@@ -985,6 +1197,28 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     return output
 
 
+def _wait_attention_poll(ctx: ToolContext, after_ts: str) -> Callable[..., Any]:
+    """on_poll hook: break a sliced wait early when a child appends an attention beacon
+    (blocker/question/interface_contract) after the wait started, so a waiting parent reacts mid-flight."""
+    # tree_note/tree_read live in ouroboros/tools/task_tree.py (extracted for module size).
+    from ouroboros.tools.task_tree import tree_root_id
+
+    rid = tree_root_id(ctx)
+
+    def _hook(_results: Dict[str, Any], _terminal: Dict[str, bool]) -> Any:
+        if not rid:
+            return None
+        try:
+            from ouroboros.task_tree_ledger import tree_ledger_attention_after
+
+            att = tree_ledger_attention_after(rid, after_ts)
+        except Exception:
+            return None
+        return {"reason": "child_attention_beacon", "beacons": att[-5:]} if att else None
+
+    return _hook
+
+
 def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> str:
     """Wait for a subtask to reach a terminal status."""
     try:
@@ -997,9 +1231,18 @@ def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> st
         timeout = 180
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-    waited = wait_for_effective_tasks(status_drive_root, [tid], timeout_sec=timeout)
-    header = "Task wait completed" if waited.get("all_terminal") else "Task wait timed out"
-    return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.\n\n{_get_task_result(ctx, tid)}"
+    waited = wait_for_effective_tasks(
+        status_drive_root, [tid], timeout_sec=timeout,
+        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+    )
+    early = waited.get("early_return")
+    if early:
+        header = "Task wait interrupted by a child attention beacon"
+        extra = f"\n\n[CHILD_BEACONS]\n{json.dumps(early, ensure_ascii=False, indent=2)}\n[/CHILD_BEACONS]"
+    else:
+        header = "Task wait completed" if waited.get("all_terminal") else "Task wait timed out"
+        extra = ""
+    return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.{extra}\n\n{_get_task_result(ctx, tid)}"
 
 
 def _wait_for_tasks(
@@ -1030,7 +1273,10 @@ def _wait_for_tasks(
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): mode must be all_terminal or any_terminal."
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-    waited = wait_for_effective_tasks(status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode)
+    waited = wait_for_effective_tasks(
+        status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode,
+        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+    )
     tasks = waited.get("tasks")
     if isinstance(tasks, dict):
         public_tasks: Dict[str, Any] = {}
@@ -1068,21 +1314,92 @@ def get_tools() -> List[ToolEntry]:
                 "Promote real work out of this conversation into a supervised pooled task "
                 "with a live card (the conversation lane stays free for the owner). Use it "
                 "whenever a chat request needs tools/files/multi-step work rather than a "
-                "conversational answer. Optional project_id scopes the task to a project's "
-                "memory/journal; optional workspace_root points at its working folder. "
-                "Owner follow-ups in chat reach the running task via its mailbox."
+                "conversational answer. Always give a short `title` (the card's name). To "
+                "CREATE A NEW NAMED PROJECT and do the work there (owner asked to 'create a "
+                "project called X and …'), set `project_name` — the project is created now "
+                "and this task runs inside it (my own judgment: the owner's phrasing is intent, "
+                "not a keyword trigger — I name the project from what they actually want it "
+                "called, and do not just answer or spawn a project-less task). `project_id` "
+                "scopes to an existing project; "
+                "`workspace_root` points at a working folder. Owner follow-ups reach the "
+                "running task via its mailbox."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string", "description": "What the task must accomplish."},
+                    "title": {"type": "string", "description": "A short human name for this task/card (<=80 chars, e.g. 'Tic-tac-toe game'). Reused as the project name if the owner later turns the card into a project — so coin a clean, concise one.", "default": ""},
+                    "project_name": {"type": "string", "description": "Set ONLY to create a brand-new NAMED project now and run this task inside it (e.g. 'airi research'). The display name; a filesystem id is derived from it.", "default": ""},
                     "expected_output": {"type": "string", "description": "What done looks like.", "default": ""},
-                    "project_id": {"type": "string", "description": "Optional project scope (filesystem-clean id).", "default": ""},
+                    "project_id": {"type": "string", "description": "Optional EXISTING project scope (filesystem-clean id).", "default": ""},
                     "workspace_root": {"type": "string", "description": "Optional absolute working-folder path.", "default": ""},
                 },
                 "required": ["objective"],
             },
         }, _promote_chat_to_task),
+        ToolEntry("ensure_project_scope", {
+            "name": "ensure_project_scope",
+            "description": (
+                "Create (or attach to) a named Ouroboros PROJECT and scope THE CURRENT running "
+                "task into it. Use this when you are ALREADY working a task and realize it should "
+                "be a named project (the owner asked to 'create a project called X', or the work "
+                "has grown into a real deliverable) — instead of a bare filesystem mkdir. Unlike "
+                "promote_chat_to_task (which creates a NEW task in a project), this binds the task "
+                "you are in: its journal_write and per-project knowledge start working, and its "
+                "live progress routes to the project thread. Idempotent for the same project; it "
+                "will NOT re-scope a task that already belongs to a different project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string", "description": "Display name for a NEW project (a filesystem id is derived from it). Honor the owner's stated name.", "default": ""},
+                    "project_id": {"type": "string", "description": "Optional EXISTING project id (filesystem-clean) to attach to instead of creating one.", "default": ""},
+                },
+                "required": [],
+            },
+        }, _ensure_project_scope),
+        ToolEntry("list_projects", {
+            "name": "list_projects",
+            "description": (
+                "List the owner's projects (id, name, recency, running flag) — read-only. "
+                "Use it in a main-chat turn to decide whether a message belongs to an existing "
+                "project, then route it there with route_to_project."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer", "default": 50, "description": "Max projects to list."},
+            }},
+        }, _list_projects),
+        ToolEntry("route_to_project", {
+            "name": "route_to_project",
+            "description": (
+                "Route a main-chat message to an EXISTING project so the work continues in that "
+                "project's own context (memory/journal/thread), keeping the main chat free. Use "
+                "when a message clearly belongs to a known project (call list_projects first if "
+                "unsure of the id). If confidence is low or several projects could match, do NOT "
+                "route silently — answer inline and offer to route. For brand-new work that is not "
+                "yet a project, use promote_chat_to_task instead. Returns a visible routing receipt."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "project_id": {"type": "string", "description": "Target project id (filesystem-clean; see list_projects)."},
+                "message": {"type": "string", "description": "The owner message / work to route into the project."},
+                "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
+            }, "required": ["project_id", "message"]},
+        }, _route_to_project),
+        ToolEntry("steer_task", {
+            "name": "steer_task",
+            "description": (
+                "Deliver a follow-up/steering message to a task ALREADY RUNNING in this chat — YOU "
+                "pick which one from current_chat.running_tasks (the runtime context lists each running "
+                "task's id + objective). Use it when a new message continues or redirects a task already "
+                "in flight, instead of spawning a duplicate. The message reaches that task's mailbox and "
+                "it picks it up at its next step. If no running task clearly fits, use promote_chat_to_task "
+                "(new work) or answer inline — never steer a task you are unsure about."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "task_id": {"type": "string", "description": "Id of the running task to steer (from current_chat.running_tasks)."},
+                "message": {"type": "string", "description": "The follow-up / steering message to deliver to that task."},
+            }, "required": ["task_id", "message"]},
+        }, _steer_task),
         ToolEntry("schedule_subagent", {
             "name": "schedule_subagent",
             "description": (
@@ -1099,8 +1416,10 @@ def get_tools() -> List[ToolEntry]:
                 "integrated into this repo). "
                 "Mutative children still cannot commit, run "
                 "review/runtime/skills lifecycle, enable tools, or write cognitive memory. Nested delegation "
-                "is allowed within configured depth/cap limits. Always retrieve the handoff with "
-                "get_task_result, wait_task, or wait_tasks before relying on its results."
+                "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
+                "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
+                "request propagates structurally instead of collapsing into one flat layer. Always retrieve "
+                "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
             ),
             "parameters": {"type": "object", "properties": {
                 "objective": {"type": "string", "description": "Focused child objective. Be specific about scope."},
@@ -1117,7 +1436,7 @@ def get_tools() -> List[ToolEntry]:
                     "type": "string",
                     "enum": ["auto", "main", "code", "light", "review", "scope"],
                     "default": "auto",
-                    "description": "Model lane for the child. auto uses safe light; main/code/light use those configured slots; review/scope fan out across configured reviewer slots and return a task_group.",
+                    "description": "Model lane for the child. auto uses safe light; main/code/light use those configured slots; review/scope fan out across configured reviewer slots and return a task_group. NOTE: this lane applies to FIRST-LEVEL children only — descendants at depth>=2 (grandchildren and deeper) always resolve to the configured Light Model slot, so point Light at a strong model if you want powerful deep subagents.",
                 },
                 "write_surface": {
                     "type": "string",
@@ -1130,6 +1449,10 @@ def get_tools() -> List[ToolEntry]:
                 "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. Ignored for self_worktree and genesis (both auto-provisioned)."},
                 "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
                 "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
+                "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
+                "may_mutate": {"type": "boolean", "default": False, "description": "Optional: grant this child the intent to spawn MUTATIVE (acting) descendants of its own. Still bounded by the usual mutative-subagent gating and depth/active caps."},
+                "may_fan_out": {"type": "boolean", "default": True, "description": "Optional: whether this child may spawn MULTIPLE children (a wave). Bounded by the per-root active cap."},
+                "max_children": {"type": "integer", "default": 0, "description": "Optional soft cap on this child's own direct children (0 = inherit / configured cap)."},
             }, "required": ["objective", "expected_output"], "additionalProperties": False},
         }, _schedule_task),
         ToolEntry("cancel_task", {
@@ -1223,15 +1546,15 @@ def get_tools() -> List[ToolEntry]:
         }, _get_task_result),
         ToolEntry("wait_task", {
             "name": "wait_task",
-            "description": "Wait for a subtask to reach a terminal status and return its effective result.",
+            "description": "Wait for a subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract beacon — the result then carries a [CHILD_BEACONS] block so you can steer it.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
                 "timeout_sec": {"type": "integer", "default": 180, "description": "Maximum seconds to wait (default 180)."},
             }},
-        }, _wait_for_task),
+        }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for multiple subtasks and return full effective results for each child.",
+            "description": "Wait for multiple subtasks and return full effective results for each child. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract beacon so you can steer mid-flight.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},

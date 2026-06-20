@@ -57,11 +57,6 @@ def _file_write_lock(target_path: pathlib.Path) -> Iterator[None]:
     finally:
         release_exclusive_file_lock(lock_path, fd)
 
-STATUS_ACTIVE = "active"
-STATUS_SLEEPING = "sleeping"
-STATUS_ARCHIVED = "archived"
-_VALID_STATUSES = (STATUS_ACTIVE, STATUS_SLEEPING, STATUS_ARCHIVED)
-
 
 def _registry_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / _REGISTRY_NAME
@@ -152,6 +147,28 @@ def all_task_bindings(drive_root: Any) -> Dict[str, int]:
     return out
 
 
+def all_task_project_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
+    """Map task_id -> {project_id, chat_id} for ALL post-hoc 'Turn into project'
+    bindings. Richer than all_task_bindings (chat-id only): the UI uses project_id
+    to turn a bound main-chat card into a pointer that opens the project panel
+    (F4), not merely to suppress the stray convert button (P2). Never raises."""
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for tid, row in _load_bindings(drive_root).get("bindings", {}).items():
+            if not isinstance(row, dict):
+                continue
+            pid = str(row.get("project_id") or "").strip()
+            try:
+                cid = int(row.get("project_chat_id") or 0)
+            except (TypeError, ValueError):
+                cid = 0
+            if pid and cid:
+                out[str(tid)] = {"project_id": pid, "chat_id": cid}
+    except Exception:
+        log.debug("all_task_project_bindings failed", exc_info=True)
+    return out
+
+
 def project_binding_for_task(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
     tid = str(task_id or "").strip()
     if not tid:
@@ -172,6 +189,25 @@ def project_chat_for_task(drive_root: Any, task_id: str) -> int:
         return 0
 
 
+def project_chat_for_task_tree(
+    drive_root: Any, task_id: Any, parent_task_id: Any = "", root_task_id: Any = ""
+) -> int:
+    """Resolve the project chat for a task by its TASK TREE: the task's OWN binding
+    wins; else inherit from its parent; else its root. A subagent is never bound
+    itself, so this is how its live frames + history are recognized as belonging to
+    its root's project and route to the project thread instead of staying in the main
+    chat (the cyber-racing "subagents vanished from the project" gap). Membership is
+    DERIVED from lineage — no per-child binding store, one SSOT."""
+    for tid in (task_id, parent_task_id, root_task_id):
+        tid = str(tid or "").strip()
+        if not tid:
+            continue
+        chat = project_chat_for_task(drive_root, tid)
+        if chat:
+            return chat
+    return 0
+
+
 def list_projects(drive_root: Any) -> List[Dict[str, Any]]:
     """All registered projects (most recently active first)."""
     with _LOCK:
@@ -184,7 +220,7 @@ def list_projects(drive_root: Any) -> List[Dict[str, Any]]:
 
 
 def registered_project_chat_ids(drive_root: Any) -> set:
-    """The set of chat_ids owned by ALL registered projects (any status).
+    """The set of chat_ids owned by ALL registered projects.
 
     The TRUTH source for "is this chat a project thread" — a bare numeric range
     cannot disambiguate from large external-transport (e.g. Telegram) chat ids,
@@ -194,9 +230,7 @@ def registered_project_chat_ids(drive_root: Any) -> set:
     sees ALL threads in its unified memory. This classifier drives (a) the UI
     history/fan-out partition that organizes threads into panels, (b) message
     routing, and (c) the project TASK's FOCUSED passive context (build_recent_
-    sections shows the task its own thread). ARCHIVED projects are INCLUDED so an
-    archived thread still classifies consistently for routing/history; sidebar
-    visibility of archived projects is a SEPARATE presentation concern (web/app.js).
+    sections shows the task its own thread).
     """
     out = set()
     try:
@@ -246,7 +280,6 @@ def create_project(
         entry = {
             "id": pid,
             "name": str(name or "").strip() or pid,
-            "status": STATUS_ACTIVE,
             "chat_id": project_chat_id(pid),
             "working_dir": str(working_dir or "").strip(),
             "origin": str(origin or "owner"),
@@ -260,11 +293,11 @@ def create_project(
 
 
 def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
-    """Update mutable fields (name/status/working_dir/last_active_at)."""
+    """Update mutable fields (name/working_dir/last_active_at)."""
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    allowed = {"name", "status", "working_dir", "last_active_at"}
+    allowed = {"name", "working_dir", "last_active_at"}
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)
         for entry in data["projects"]:
@@ -272,8 +305,6 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
                 continue
             for key, value in updates.items():
                 if key not in allowed:
-                    continue
-                if key == "status" and value not in _VALID_STATUSES:
                     continue
                 entry[key] = value
             _save(drive_root, data)
@@ -287,17 +318,6 @@ def touch_project(drive_root: Any, project_id: str) -> None:
         update_project(drive_root, project_id, last_active_at=utc_now_iso())
     except Exception:
         log.debug("touch_project failed for %s", project_id, exc_info=True)
-
-
-def sleep_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
-    return update_project(drive_root, project_id, status=STATUS_SLEEPING)
-
-
-def wake_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
-    entry = update_project(drive_root, project_id, status=STATUS_ACTIVE)
-    if entry:
-        touch_project(drive_root, project_id)
-    return entry
 
 
 def reconcile_projects(drive_root: Any) -> int:
@@ -323,7 +343,6 @@ def reconcile_projects(drive_root: Any) -> int:
                 data["projects"].append({
                     "id": pid,
                     "name": pid,
-                    "status": STATUS_ACTIVE,
                     "chat_id": project_chat_id(pid),
                     "working_dir": "",
                     "origin": "reconcile",
@@ -404,7 +423,6 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
         out.append({
             "id": project.get("id"),
             "name": project.get("name"),
-            "status": project.get("status"),
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
             "last_active_at": project.get("last_active_at") or "",
@@ -414,9 +432,6 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
 
 
 __all__ = [
-    "STATUS_ACTIVE",
-    "STATUS_ARCHIVED",
-    "STATUS_SLEEPING",
     "all_task_bindings",
     "bind_task_to_project",
     "create_project",
@@ -425,11 +440,10 @@ __all__ = [
     "list_projects",
     "project_binding_for_task",
     "project_chat_for_task",
+    "project_chat_for_task_tree",
     "registered_project_chat_ids",
     "projects_summary",
     "reconcile_projects",
-    "sleep_project",
     "touch_project",
     "update_project",
-    "wake_project",
 ]

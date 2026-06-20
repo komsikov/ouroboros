@@ -50,12 +50,16 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
         plan_notice = (
-            "[CONSILIUM_FORCE_PLAN]\n"
+            "[SWARM_INITIATIVE]\n"
             f"Source: {source}.\n"
-            "Before answering or editing, call plan_task with an explicit context_level "
-            "appropriate to this task. Treat this as a planning requirement for this "
-            "task, not as user-authored content.\n"
-            "[/CONSILIUM_FORCE_PLAN]\n\n"
+            "First call plan_task with an explicit context_level appropriate to this task to think "
+            "deeply about the approach. THEN, when the work decomposes into parts that can progress "
+            "in parallel, fan out subagents with schedule_subagent (acting/mutative where the work "
+            "needs changes and the owner toggle permits it) within the configured child/worker caps, "
+            "and reconcile their results; publish the shared frame to the task-tree ledger first if "
+            "their outputs must integrate. If the task is genuinely atomic, a deep plan alone is fine. "
+            "Treat this as a planning+delegation initiative for this task, not as user-authored content.\n"
+            "[/SWARM_INITIATIVE]\n\n"
         )
         text = plan_notice + str(text or "")
     image_b64 = task.get("image_base64")
@@ -232,13 +236,110 @@ def build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
             "skill_payload only for explicit scoped skill-payload work/repair, not generic "
             "artifact transport; do not use runtime_data/uploads as artifact transport"
         )
+    # Capability SSOT (honesty): surface the SAME live gate the runtime enforces so
+    # the agent reasons FORWARD from real state instead of backward from a half-remembered
+    # rule. Structural facts only — the model still chooses by judgment (BIBLE P5); this is
+    # not a string gate, it is the truth the gate is derived from.
+    try:
+        from ouroboros.config import get_allow_mutative_subagents
+        from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+
+        runtime_data["capabilities"] = {
+            "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
+            "write_surfaces": sorted(VALID_WRITE_SURFACES),
+            "note": (
+                "allow_mutative_subagents is the MASTER gate (the owner toggle overrides the "
+                "runtime-mode default; runtime mode only sets the default when the toggle is "
+                "empty). light blocks ONLY Ouroboros self-repo/control-plane mutation "
+                "(write_surface=self_worktree), NOT user/task/project deliverables: acting "
+                "subagents with write_surface=external_workspace or genesis remain valid in "
+                "light. Read THIS value before declaring you cannot spawn acting subagents."
+            ),
+        }
+    except Exception:
+        log.debug("Failed to build capability digest for context", exc_info=True)
+    # Live worker/queue load (honesty): derive resource facts from the real snapshot,
+    # never guess "starved"/"saturated".
+    try:
+        from ouroboros.config import DATA_DIR, get_max_active_subagents_per_root, get_max_workers
+        from ouroboros.task_status import _load_queue_snapshot
+
+        # The supervisor persists the snapshot at the canonical data root, NOT a forked
+        # child drive — so read it from budget_drive_root (the main root for a subagent)
+        # or DATA_DIR. Reading env.drive_root would leave subagents (the actors most likely
+        # to mis-reason about "starved" siblings) with no live-queue honesty signal.
+        _snap_root = str(task.get("budget_drive_root") or "").strip() or str(DATA_DIR)
+        _snap = _load_queue_snapshot(_snap_root)
+        if not (_snap.get("_snapshot_missing") or _snap.get("_snapshot_invalid")):
+            _running = [r for r in (_snap.get("running") or []) if isinstance(r, dict)]
+            _pending = [r for r in (_snap.get("pending") or []) if isinstance(r, dict)]
+            _maxw = int(get_max_workers())
+            _reaping = int(_snap.get("reaping_count") or 0)
+            # Prefer the ACTUAL assignable-idle worker count persisted from the live pool
+            # (the real pool can be smaller than the configured max, and a mid-reap slot is
+            # unavailable); fall back to a derived estimate for older snapshots.
+            _assignable = _snap.get("assignable_idle_workers")
+            if _assignable is not None:
+                _free = max(0, int(_assignable))
+            else:
+                _free = max(0, _maxw - len(_running) - _reaping)
+            runtime_data["queue"] = {
+                "running_count": len(_running),
+                "pending_count": len(_pending),
+                "reaping_count": _reaping,
+                "max_workers": _maxw,
+                "worker_total": int(_snap.get("worker_total") or _maxw),
+                "free_worker_slots": _free,
+                "max_active_subagents_per_root": int(get_max_active_subagents_per_root()),
+                "note": (
+                    "live worker/queue load. Read THIS before claiming children are 'starved' "
+                    "or the queue is 'saturated' — derive resource facts from here, not guesses."
+                ),
+            }
+    except Exception:
+        log.debug("Failed to build queue digest for context", exc_info=True)
     if budget_info:
         runtime_data["budget"] = budget_info
     schedule_digest = _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
+    # WS1: surface the tasks already RUNNING in this chat so a busy-chat decision
+    # turn can steer_task the right one instead of spawning a duplicate. Structural
+    # fact only — the agent chooses the target by judgment (BIBLE P5), code never
+    # auto-routes. (Also gives a project-room message its "you are in project X"
+    # default scene, closing the re-ask case.)
+    _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
+    if _current_chat and _current_chat.get("running_tasks"):
+        runtime_data["current_chat"] = _current_chat
+        runtime_data["current_chat_rule"] = (
+            "running_tasks are tasks already running in THIS chat. If a new message continues or "
+            "redirects one of them, steer_task(task_id, message) it rather than spawning a duplicate; "
+            "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
+            "message in a project room defaults to that project unless it clearly says otherwise."
+        )
     runtime_ctx = json.dumps(runtime_data, ensure_ascii=False, indent=2)
-    return "## Runtime context\n\n" + runtime_ctx
+    out = "## Runtime context\n\n" + runtime_ctx
+    # Shared task-tree coordination ledger (swarm blackboard): inject the tail so EVERY
+    # member of the tree reads the shared frame / sibling beacons forward, instead of
+    # re-deriving or duplicating work (domain-agnostic; tree_note/tree_read).
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_tail_digest
+
+        _root_id = str(task.get("root_task_id") or task.get("id") or "")
+        _tree_digest = tree_ledger_tail_digest(_root_id, limit=40) if _root_id else ""
+        if _tree_digest:
+            out += (
+                "\n\n## Task-tree coordination ledger (shared swarm blackboard)\n\n"
+                "Shared across this task tree via tree_note/tree_read. Before fanning out "
+                "INTERDEPENDENT children, publish the shared frame (contract/decision/fact); "
+                "children build against it and raise blocker/question/interface_contract beacons "
+                "for attention (interface_contract when the shared seam/contract must change).\n\n"
+                + _tree_digest
+            )
+    except Exception:
+        log.debug("Failed to inject task-tree ledger digest", exc_info=True)
+    return out
 
 
 def build_knowledge_sections(
@@ -907,6 +1008,28 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
     return "\n".join(lines)
 
 
+def effective_context_mode(task: Dict[str, Any]) -> str:
+    """CW2 (v6.34.0): the context mode actually USABLE for THIS turn's reference-doc
+    layout — the owner OUROBOROS_CONTEXT_MODE, downgraded to 'low' at point-of-use when
+    max is selected but the active route does not carry confirmed >=1M Capability
+    Evidence (read-only, no network). Without this, the FIRST context build laid out the
+    full max-mode reference docs before loop.py's later per-round gate could fail closed,
+    so an unconfirmed/sub-1M route could still be sent a max-mode horizon (BIBLE P1)."""
+    mode = get_context_mode()
+    if mode != "max":
+        return mode
+    try:
+        model = str(task.get("model") or "").strip()
+        if task.get("use_local_model") is not None:
+            use_local = bool(task.get("use_local_model"))
+        else:
+            use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
+        from ouroboros.loop import _maybe_downgrade_max_unconfirmed  # lazy: loop imports context
+        return _maybe_downgrade_max_unconfirmed(mode, use_local, model)
+    except Exception:
+        return "low"  # fail-closed (BIBLE P1)
+
+
 def build_llm_messages(
     env: Any,
     memory: Memory,
@@ -927,7 +1050,7 @@ def build_llm_messages(
     # owned by context_layout per the low/max doc matrix. SYSTEM + BIBLE are
     # tier-0 and always full.
     static_parts = [base_prompt, "## BIBLE.md\n\n" + bible_md]
-    context_mode = get_context_mode()
+    context_mode = effective_context_mode(task)  # CW2: gate max on the active route's confirmed >=1M
     docs_context_mode = context_mode
     docs_need_development = _task_requires_development_context(task)
     if _task_uses_external_context(task) and not _task_requires_self_body_docs(task):

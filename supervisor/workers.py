@@ -85,6 +85,10 @@ class Worker:
     proc: mp.Process
     in_q: Any
     busy_task_id: Optional[str] = None
+    # Variant A (off-loop reaping): set under _queue_lock when a timed-out task's heavy
+    # teardown (kill/join/archive/respawn) is handed to the background reaper. The slot
+    # is unavailable for assignment until respawn_worker() installs a fresh Worker.
+    reaping: bool = False
 
 
 _EVENT_Q = None
@@ -128,6 +132,18 @@ def _get_chat_agent():
     return _chat_agent
 
 
+def chat_turn_liveness():
+    """(busy, task_id, last_activity_ts) of the in-process direct-chat turn — read
+    WITHOUT taking _chat_agent_lock (a wedged turn holds that lock for its whole
+    duration, so the watchdog must never block on it). The supervisor liveness
+    watchdog (WS3) reads this to spot a heartbeat-silent direct turn, which is
+    in-process and therefore invisible to the worker RUNNING heartbeat table."""
+    agent = _chat_agent
+    if agent is None or not getattr(agent, "_busy", False):
+        return (False, None, None)
+    return (True, getattr(agent, "_current_task_id", None), getattr(agent, "_last_activity_ts", None))
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> None:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
 
@@ -153,6 +169,9 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> None:
             chat_id = 0
     expected_output = str(evt.get("expected_output") or "").strip()
     text = objective if not expected_output else f"{objective}\n\nExpected output: {expected_output}"
+    # Short human title the model coined at card creation (owner P1) — reused as the
+    # project name on a later "turn into project" conversion; never the bare task id.
+    title = str(evt.get("title") or "").strip()[:80]
     task = {
         "id": tid,
         "type": "task",
@@ -161,16 +180,31 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> None:
         "description": objective,
         "objective": objective,
         "expected_output": expected_output,
+        "title": title,
         "source": "promote_chat_to_task",
     }
     pid = str(evt.get("project_id") or "").strip()
     if pid:
         task["project_id"] = pid
+        # When the model is CREATING a named project (project_name set), pass the
+        # human display name so the project isn't named after its bare id (v6.33.0).
+        project_display_name = str(evt.get("project_name") or "").strip()
         try:
-            from ouroboros.projects_registry import create_project, touch_project
+            from ouroboros.projects_registry import bind_task_to_project, create_project, touch_project
 
-            project = create_project(DRIVE_ROOT, pid, origin="promote_chat_to_task")
+            project = create_project(
+                DRIVE_ROOT, pid, name=project_display_name, origin="promote_chat_to_task",
+            )
             touch_project(DRIVE_ROOT, pid)
+            # Bind the task to its project (durable task->project map). Without this
+            # the task is project-scoped only in its own metadata; the frontend (via
+            # all_task_bindings in /api/state) and the mailbox follow-up router
+            # (project_chat_for_task) can't recognise it as a project task, so it
+            # surfaces in the main chat with a stray "turn into project" button (P2).
+            try:
+                bind_task_to_project(DRIVE_ROOT, tid, pid, (project or {}).get("chat_id"))
+            except Exception:
+                log.debug("promote: bind_task_to_project failed for %s/%s", tid, pid, exc_info=True)
             # The promoted task runs in the PROJECT thread: route its live card +
             # owner mailbox to the project's chat_id (not the main chat it was
             # promoted from) so follow-ups steer to it via
@@ -201,6 +235,58 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> None:
         task["workspace_mode"] = "external"
     attach_task_contract(task)
     ctx.enqueue_task(task)
+
+
+def ensure_project_scope(evt: dict, ctx: Any) -> None:
+    """Create/attach the registry project for an in-task ensure_project_scope call
+    and bind the CURRENT (already-running) task to it, then broadcast so the UI moves
+    the card into the project thread. Mirrors the project-registration half of
+    promote_chat_to_task, but for a task that already exists (the worker has already
+    set ctx.project_id locally; this makes it durable + visible)."""
+    tid = str(evt.get("task_id") or "").strip()
+    pid = str(evt.get("project_id") or "").strip()
+    if not tid or not pid:
+        return
+    name = str(evt.get("project_name") or "").strip()
+    try:
+        from ouroboros.projects_registry import bind_task_to_project, create_project, touch_project
+
+        project = create_project(DRIVE_ROOT, pid, name=name, origin="ensure_project_scope")
+        touch_project(DRIVE_ROOT, pid)
+        try:
+            proj_chat = int((project or {}).get("chat_id") or 0)
+        except (TypeError, ValueError):
+            proj_chat = 0
+        try:
+            bind_task_to_project(DRIVE_ROOT, tid, pid, proj_chat or None)
+        except Exception:
+            log.debug("ensure_project_scope: bind failed for %s/%s", tid, pid, exc_info=True)
+        # Make the one-writer-per-project lease recognize THIS already-running task
+        # as a lane occupant: project_lease reads task["project_id"] from the
+        # supervisor RUNNING map, which (unlike the promote path that sets it at
+        # build time) is NOT set for a mid-flight self-scope. Without this, a task
+        # that self-scopes to project X would not hold X's lane and a concurrent
+        # X task could be assigned and write the same project. SSOT helper shared
+        # with the UI api_project_from_task convert path so the two cannot drift.
+        try:
+            from ouroboros.project_lease import mark_task_project
+
+            running = getattr(ctx, "RUNNING", None)
+            pending = getattr(ctx, "PENDING", None)
+            if isinstance(running, dict):
+                with _queue_lock:
+                    mark_task_project(running, pending, tid, pid)
+        except Exception:
+            log.debug("ensure_project_scope: RUNNING project_id update failed for %s", tid, exc_info=True)
+        if proj_chat:
+            try:
+                from supervisor.message_bus import get_bridge
+
+                get_bridge().broadcast({"type": "projects_changed", "project_id": pid, "chat_id": proj_chat})
+            except Exception:
+                log.debug("ensure_project_scope: projects_changed broadcast failed for %s", pid, exc_info=True)
+    except Exception:
+        log.debug("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
 
 
 def handle_chat_direct(
@@ -236,8 +322,28 @@ def _handle_chat_direct_locked(
             pass
         return
         
+    _run_chat_task(
+        _get_chat_agent(), chat_id, text, image_data,
+        task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=False,
+    )
+
+
+def _run_chat_task(
+    agent: Any,
+    chat_id: int,
+    text: str,
+    image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
+    task_constraint: Optional[dict] = None,
+    task_metadata: Optional[dict] = None,
+    *,
+    ephemeral: bool = False,
+) -> None:
+    """Build the direct-chat task and run it on the given agent, draining events.
+
+    ``ephemeral`` marks a SHORT-LIVED same-route turn (run on a separate agent
+    instance while the shared chat agent is busy): it carries _ephemeral_turn so
+    the task pipeline skips long-term memory / reflection / evolution writes."""
     try:
-        agent = _get_chat_agent()
         from ouroboros.contracts.task_contract import attach_task_contract
 
         task = {
@@ -247,6 +353,8 @@ def _handle_chat_direct_locked(
             "text": text,
             "_is_direct_chat": True,
         }
+        if ephemeral:
+            task["_ephemeral_turn"] = True
         if task_constraint:
             task["task_constraint"] = dict(task_constraint)
         if task_metadata:
@@ -256,6 +364,16 @@ def _handle_chat_direct_locked(
             pid = str(task_metadata.get("project_id") or "").strip()
             if pid:
                 task["project_id"] = pid
+                # A real project-thread conversation task is bound to its project so
+                # the frontend (all_task_bindings) recognises it and never offers a
+                # stray "turn into project" button (P2). Ephemeral same-route turns
+                # are transient decisions — never bound.
+                if not ephemeral:
+                    try:
+                        from ouroboros.projects_registry import bind_task_to_project
+                        bind_task_to_project(DRIVE_ROOT, task["id"], pid, chat_id)
+                    except Exception:
+                        log.debug("bind_task_to_project failed for direct project task %s/%s", task["id"], pid, exc_info=True)
         if image_data:
             # image_data is (base64, mime) or (base64, mime, caption).
             task["image_base64"] = image_data[0]
@@ -287,6 +405,45 @@ def _handle_chat_direct_locked(
             get_bridge().send_message(chat_id, err_msg)
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
+
+
+# Serializes ephemeral same-route turns so concurrent main-chat messages each get
+# their own response in order, without ever touching the running locked turn.
+_ephemeral_chat_lock = _threading.Lock()
+
+
+def handle_chat_ephemeral(
+    chat_id: int,
+    text: str,
+    image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
+    task_constraint: Optional[dict] = None,
+    task_metadata: Optional[dict] = None,
+) -> None:
+    """The "turn = decision" path (v6.33.0 WS10): when the shared chat agent is
+    busy, a new main-chat message runs as a SHORT-LIVED turn on a SEPARATE agent
+    instance — bypassing _chat_agent_lock so it never freezes/injects into the
+    running turn, while keeping the SAME ROUTE (same make_agent config: model /
+    mode / effort, not a cheaper lane). Ephemeral turns are serialized among
+    themselves and are barred from long-term memory/reflection/evolution writes."""
+    from supervisor.state import budget_remaining, load_state
+    if budget_remaining(load_state()) <= 0:
+        try:
+            from supervisor.message_bus import get_bridge
+            get_bridge().send_message(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.")
+        except Exception:
+            pass
+        return
+    if not getattr(sys, 'frozen', False):
+        sys.path.insert(0, str(REPO_DIR))
+    from ouroboros.agent import make_agent
+
+    with _ephemeral_chat_lock:
+        agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
+        _run_chat_task(
+            agent, chat_id, text, image_data,
+            task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
+        )
+
 
 def auto_resume_after_restart() -> None:
     """Auto-resume after a recent restart when scratchpad still has work."""
@@ -1046,7 +1203,7 @@ def assign_tasks() -> None:
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
 
         for w in WORKERS.values():
-            if w.busy_task_id is None and PENDING:
+            if w.busy_task_id is None and not getattr(w, "reaping", False) and PENDING:
                 # One-writer-per-project lease: recompute per assignment so a
                 # task assigned in THIS loop pass immediately occupies its lane.
                 leased = running_project_ids(RUNNING.values())
@@ -1148,6 +1305,12 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
     dead_detections = 0
     crashed_tasks = []
     for wid, w in list(WORKERS.items()):
+        # Variant A: a slot marked `reaping` is owned end-to-end by the background reaper
+        # (kill -> join -> archive -> respawn). Its proc is expected to die mid-reap, so the
+        # crash detector must NOT also respawn it — that double-respawn would orphan a live
+        # worker process. The reaper installs a fresh Worker (reaping=False) when done.
+        if getattr(w, "reaping", False):
+            continue
         if not w.proc.is_alive():
             dead_detections += 1
             if w.busy_task_id is not None:

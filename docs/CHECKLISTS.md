@@ -170,6 +170,7 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | 18 | subagent_isolation | If the diff changes `schedule_subagent`, child-task queueing, task constraints, tool discovery/execution, data reads, or memory handoff, does it preserve the accepted live-subagent contract: strict `objective` + `expected_output` schema, inferred lineage/workspace/contract/deadline/resource inheritance, `local_readonly_subagent` schema and execute-time allowlist, subagent-scoped secret/control-file denial for data tools, nested readonly delegation only within configured depth/cap limits with depth>1 coerced to light, no local writes/commits/review/runtime/tool-expansion/skills-lifecycle/shell, enabled external tools allowed only by owner policy and inherited resources, the subagent browser boundary (external HTTP(S) + `file://` scoped to `workspace_root` + loopback EXCEPT Ouroboros control-plane ports; private/link-local/reserved/DNS-rebind still blocked; `evaluate` JS unavailable; `vlm_query`/`analyze_screenshot` available), full task-result handoff, new/changed wait/timeout paths for cognitive work using progress-aware/re-decidable waiting rather than a fixed cutoff that discards in-flight work (P5), and tests for both allowed and blocked paths? | critical |
 | 19 | evolution_durability | If the diff touches `supervisor/git_ops.py`, `launcher.py`, `server.py`, `ouroboros/preflight_runner.py`, `ouroboros/tools/review_helpers.py`, `ouroboros/tools/git.py`, tests, review gates, or evolution code, does it preserve hermetic preflight, live repo/data mutation fuses, remote-optional local commit success, and transaction/rescue evidence for interrupted self-modification? | critical |
 | 20 | context_budget_ssot | If the diff changes context-size budgets/constants (`ouroboros/context_budget.py`), the context layout/manifest, a section's tier/policy, or compaction thresholds: does it keep the low/max context split coherent (single SSOT + both profiles + docs + drift-guard tests in sync), preserve the tier-0 always-full core (BIBLE/SYSTEM/identity/scratchpad/knowledge-index/recent-dialogue) in EVERY mode, use a visible on-demand pointer instead of silent truncation (P1), and leave the blocking scope-reviewer >=1M floor untouched? (PASS with "Not applicable" if no context-budget/layout change.) | critical |
+| 21 | capability_regression | Does the diff REMOVE or NARROW a previously-supported user-facing behavior or capability — a tool/flag/mode/path that worked before now errors or is gated tighter (e.g. a new `is_dir`/existence guard that blocks a legitimate create, a tightened allowlist that drops a real path, a removed fallback)? If so, is it INTENTIONAL and disclosed as a breaking/capability change in the commit message + changelog? Accidental capability removal is the failure class this item names. Ask whether a golden "from zero" test would have caught it. Severity follows the `Critical surface whitelist` below — silently removing a documented capability or a safety/release contract is critical; a deliberate, disclosed narrowing or an internal-only refactor is advisory. | advisory |
 
 ### Severity rules
 
@@ -187,6 +188,10 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
   drift, off-by-one test counts, and minor descriptive inaccuracies in the
   README changelog row MUST NOT be raised as critical under `self_consistency`
   or `changelog_and_badge`. They surface here and do not block.
+- Item 21 (`capability_regression`) is advisory by default but escalates to
+  critical under the `Critical surface whitelist` below: a SILENT removal/narrowing
+  of a documented capability or a safety/release contract is critical; a
+  deliberate, disclosed narrowing or an internal-only refactor stays advisory.
 
 ### Retry convergence for tests_affected
 
@@ -670,19 +675,27 @@ Reviewers must structure their response in this order:
 | 7 | architecture_fit | Does the plan solve the class of problem or is it a narrow patch leaving the root cause unresolved? If the latter, describe what architectural change would address the root cause. | RISK (advisory) |
 | 8 | forgotten_docs | If the change affects behavior described in ARCHITECTURE.md, SYSTEM.md, README.md, DEVELOPMENT.md, or BIBLE.md, is that update included in the plan? Name the specific stale artifact. | FAIL if a concrete doc/prompt becomes stale and is not mentioned |
 
-### Aggregate signal levels (majority-vote)
+### Aggregate signal levels (adaptive quorum)
+
+The coordinator aggregates the configured reviewer slots (an arbitrary N,
+duplicates allowed) via `config.adaptive_quorum(N)` — the same reviewer-slot
+SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
+`{1, 2}` (i.e. `min(2, N)`).
 
 - **GREEN** — all reviewers PASS. Read every reviewer's `## PROPOSALS` section
   (they are the point of this call), then proceed with implementation.
-- **REVIEW_REQUIRED** — one or more of: (a) exactly one reviewer flagged
-  `REVISE_PLAN` among otherwise-clear signals (minority dissent); (b) one or
-  more RISK items were raised; (c) non-substantive degradation occurred (a
-  reviewer errored, timed out, or returned an unparseable response, so `GREEN`
-  cannot be confirmed). Read every reviewer's full response and all PROPOSALS
-  before deciding: a single dissenting reviewer often sees the structural issue
-  the others missed.
-- **REVISE_PLAN** — **≥2 reviewers flagged `REVISE_PLAN`**. Majority confirms a
-  structural problem with the plan. Redesign before writing code.
+- **REVIEW_REQUIRED** — one or more of: (a) a `REVISE_PLAN` count BELOW the
+  adaptive quorum (minority dissent — e.g. exactly one dissent in a 2+-slot
+  setup); (b) one or more RISK items were raised; (c) non-substantive
+  degradation occurred (a reviewer errored, timed out, or returned an
+  unparseable response, so `GREEN` cannot be confirmed). Read every reviewer's
+  full response and all PROPOSALS before deciding: a single dissenting reviewer
+  often sees the structural issue the others missed.
+- **REVISE_PLAN** — a `REVISE_PLAN` count **at or above `adaptive_quorum(N)`**
+  (2-of-N for 3+ slots, both in a 2-slot setup, and the lone reviewer in a
+  1-slot setup). Quorum confirms a structural problem with the plan. Redesign
+  before writing code. A single dissent in a multi-reviewer setup surfaces as
+  `REVIEW_REQUIRED`, not `REVISE_PLAN`.
 
 ### Rules for reviewers
 

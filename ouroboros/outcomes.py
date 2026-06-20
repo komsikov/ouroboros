@@ -48,10 +48,18 @@ EXECUTION_BEST_EFFORT = "best_effort"
 OBJECTIVE_BEST_EFFORT = "best_effort"
 
 # Reason codes whose forced finalization may yield a best-effort outcome.
+# deadline_local is the loop-local sibling of finalization_grace (v6.33.0 WS2): a
+# genuinely-extracted answer at a real deadline must land as best_effort, not an
+# agent failure — same as the supervisor finalize_now path.
 BEST_EFFORT_REASON_CODES = frozenset({
     "budget_exhausted",
     "round_limit",
     "finalization_grace",
+    "deadline_local",
+    # provider-death terminalization (WA2): a genuinely-extracted final answer
+    # after the same-model reroute + fallback exhausted must land as best_effort,
+    # not a flat failure — the same honest-shelf semantics as deadline/budget.
+    "provider_unavailable",
 })
 
 # Typed final-answer protocol marker (machine-readable deliverable payload,
@@ -114,6 +122,22 @@ _RECOVERY_TOOL_NAMES = frozenset({
     "stop_service",
     "write_file",
 })
+# T4 (v6.35.0): an unrecovered run_command/run_script non-zero exit / shell
+# error — e.g. an X11-teardown `exit=1` after "138 passed", or an abandoned
+# `find` probe on a nonexistent path — is cosmetic, not a degraded execution.
+# NOTE: `non_zero_exit`/`shell_error` ARE in _BLOCKING_TOOL_STATUSES; this branch
+# DELIBERATELY demotes them to a non-degrading "cosmetic" bucket (still recorded
+# on the execution axis for monitoring) because the owner accepted that an
+# ignored shell failure belongs on the LLM-review/objective axis, not the
+# execution axis. `timeout` is intentionally EXCLUDED — a stuck/aborted command
+# is a real failure. Structural status/tool-name partition, never content
+# matching (Bible P5).
+_NON_BLOCKING_RECOVERABLE_STATUSES = frozenset({"non_zero_exit", "shell_error"})
+_COSMETIC_TOOL_NAMES = frozenset({"run_command", "run_script"})
+# When cosmetic residual errors exist but no acceptance review ran, the
+# execution axis is OK yet "did it actually work?" was never judged: surface a
+# structural warning so a default-`auto` overclaim isn't displayed as clean.
+WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW = "residual_tool_errors_without_review"
 
 
 def terminal_outcome_axes(
@@ -232,6 +256,7 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
     calls = [item for item in (llm_trace.get("tool_calls") or []) if isinstance(item, dict)]
     unresolved: List[Dict[str, Any]] = []
     recovered_items: List[Dict[str, Any]] = []
+    cosmetic_items: List[Dict[str, Any]] = []
     for idx, item in enumerate(calls):
         if not item.get("is_error"):
             continue
@@ -288,7 +313,6 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
                 continue
             later_tool = str(later.get("tool") or "")
             later_status = str(later.get("status") or "ok")
-            later_result = str(later.get("result") or "")
             if later_status not in {"", "ok", "ok_autocorrected"}:
                 continue
             later_args = later.get("args") if isinstance(later.get("args"), dict) else {}
@@ -305,7 +329,11 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
                     later_paths.update(str(part) for part in value if str(part or "").strip())
             same_target = later_tool == tool and target_key == json.dumps(later_parts, sort_keys=True, default=str)
             same_path = bool(target_paths and later_paths and target_paths.intersection(later_paths))
-            artifact_registered = "ARTIFACT_OUTPUTS" in later_result or "registered output" in later_result
+            # Read the TYPED artifact-registration flag captured from the full result at
+            # execution time (loop_tool_execution), not a substring of the (truncatable)
+            # trace preview — the same typed signal turn_has_reviewable_effects uses, so
+            # the marker is never re-derived from prose on this layer (C9.5).
+            artifact_registered = bool(later.get("artifact_registered"))
             if status == "artifact_output_error":
                 recovered = artifact_registered and (same_path or not target_paths)
             else:
@@ -316,8 +344,12 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
         if recovered_by is not None:
             recovered_items.append(_tool_error_record(item, recovered_by=recovered_by))
             continue
+        if status in _NON_BLOCKING_RECOVERABLE_STATUSES and tool in _COSMETIC_TOOL_NAMES:
+            # Unrecovered run_command/run_script non-zero exit: cosmetic, not degrading.
+            cosmetic_items.append(_tool_error_record(item))
+            continue
         unresolved.append(_tool_error_record(item))
-    return {"unresolved": unresolved, "recovered": recovered_items}
+    return {"unresolved": unresolved, "recovered": recovered_items, "cosmetic": cosmetic_items}
 
 
 def _unresolved_tool_errors(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -325,17 +357,33 @@ def _unresolved_tool_errors(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
-    """Collect per-actor outcome_tier classifications from review runs."""
+    """Collect per-actor outcome_tier classifications from review runs.
+
+    On a quorum PASS run, only the actors that CONTRIBUTED the PASS lend their
+    tier — a single dissenting/degraded slot's pessimistic tier must not poison a
+    clean quorum through the objective axis (the same non-surrender rule the
+    aggregate-signal quorum already follows). FAIL/DEGRADED runs stay conservative
+    and count every parsed tier.
+    """
     tiers: List[str] = []
     for run in runs:
+        run_pass = str(run.get("aggregate_signal") or "").upper() == "PASS"
         for actor in run.get("actors") or []:
             if not isinstance(actor, dict):
                 continue
             parsed = actor.get("parsed")
-            if isinstance(parsed, dict):
-                tier = str(parsed.get("outcome_tier") or "").strip().lower()
-                if tier in _OUTCOME_TIERS:
-                    tiers.append(tier)
+            if not isinstance(parsed, dict):
+                continue
+            if run_pass:
+                # Prefer the substrate-recorded signal; fall back to the parsed
+                # verdict/status so historical runs (pre-`signal` field) still
+                # filter correctly.
+                sig = str(actor.get("signal") or parsed.get("verdict") or parsed.get("status") or "").upper()
+                if sig != "PASS":
+                    continue
+            tier = str(parsed.get("outcome_tier") or "").strip().lower()
+            if tier in _OUTCOME_TIERS:
+                tiers.append(tier)
     return tiers
 
 
@@ -352,7 +400,16 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
 
 def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     review_decision = llm_trace.get("review_decision") if isinstance(llm_trace.get("review_decision"), dict) else {}
-    runs = [run for run in (llm_trace.get("review_runs") or []) if isinstance(run, dict)]
+    # A pre-revision acceptance run marked superseded_by_revision is kept in the
+    # trace for forensics but must NOT count toward the objective when a REPLACEMENT
+    # (non-superseded) review actually landed: the re-reviewed final deliverable's
+    # verdict is authoritative, so a stale pre-revision FAIL cannot worst-case-poison
+    # a final PASS (the reducer is worst-of-all-runs). BUT if the revision never
+    # reached a terminal re-review (provider death, round limit, ...), the superseded
+    # run is the SOLE verdict — keep it, never erase a failing verdict (P3 integrity).
+    _all_runs = [run for run in (llm_trace.get("review_runs") or []) if isinstance(run, dict)]
+    _non_superseded = [run for run in _all_runs if not run.get("superseded_by_revision")]
+    runs = _non_superseded if _non_superseded else _all_runs
     if not runs:
         return {
             "status": "skipped",
@@ -579,6 +636,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     tool_error_state = _classify_tool_errors(llm_trace)
     tool_errors = tool_error_state.get("unresolved") or []
     recovered_tool_errors = tool_error_state.get("recovered") or []
+    cosmetic_tool_errors = tool_error_state.get("cosmetic") or []
     verification_failures: List[Dict[str, Any]] = []
     for event in llm_trace.get("verification_events") or []:
         if not isinstance(event, dict):
@@ -658,6 +716,15 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
+    # T4 honest residual: cosmetic shell errors no longer degrade execution, so
+    # when the objective was never judged (default "auto" with no self-call ->
+    # objective not_evaluated) a real overclaim could read as clean. Surface a
+    # structural warning (not a failure) so the UI escalates it. Gating on the
+    # objective being genuinely unjudged is the honest condition: a review that
+    # ran (any verdict) already judged it. No review is auto-run, no env knob, no
+    # content inference (Bible P5).
+    if cosmetic_tool_errors and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
+        objective["warning"] = WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW
     outcome_axes = {
         "schema_version": 1,
         "lifecycle": {"status": "completed"},
@@ -666,6 +733,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "failure": failure,
             "recoveries": recovered_tool_errors[:20],
+            "cosmetic_tool_errors": cosmetic_tool_errors[:20],
         },
         "artifacts": {"status": "not_applicable"},
         "objective": objective,
@@ -899,16 +967,22 @@ def build_verification_ledger(
         if isinstance(event, dict):
             entries.append({"kind": "runtime_event", **event})
 
-    for run in llm_trace.get("review_runs") or []:
-        if isinstance(run, dict):
-            failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
-            entries.append({
-                "kind": "task_acceptance_review",
-                "status": "failed" if failed else "ok",
-                "aggregate_signal": run.get("aggregate_signal"),
-                "degraded": run.get("degraded"),
-                "finding_count": len(run.get("parsed_findings") or []),
-            })
+    _accept_runs = [r for r in (llm_trace.get("review_runs") or []) if isinstance(r, dict)]
+    _has_replacement = any(not r.get("superseded_by_revision") for r in _accept_runs)
+    for run in _accept_runs:
+        # A superseded pre-revision run is only forensic (status 'superseded') when a
+        # REPLACEMENT review landed; with no replacement it is the sole verdict and
+        # must still read as its real failed/ok status (never hide a failing verdict).
+        superseded = bool(run.get("superseded_by_revision")) and _has_replacement
+        failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
+        entries.append({
+            "kind": "task_acceptance_review",
+            "status": "superseded" if superseded else ("failed" if failed else "ok"),
+            "aggregate_signal": run.get("aggregate_signal"),
+            "degraded": run.get("degraded"),
+            "superseded": superseded,
+            "finding_count": len(run.get("parsed_findings") or []),
+        })
 
     artifact_status = str(artifact_bundle.get("status") or "")
     if artifact_status in {ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING, "missing"}:

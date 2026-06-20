@@ -696,8 +696,18 @@ def test_workspace_context_routes_repo_tools_and_blocks_self_commit(tmp_path):
     assert (workspace / "README.md").read_text(encoding="utf-8") == "workspace edited"
 
 
-def test_workspace_run_shell_blocks_escaping_cwd(tmp_path, monkeypatch):
+def test_workspace_run_shell_cwd_allows_scratch_blocks_runtime(tmp_path, monkeypatch):
+    """External-workspace tasks may run from host scratch (a sibling checkout, a
+    /tmp tree); only the Ouroboros runtime (system repo + data drive) stays
+    off-limits as a working directory, and runtime writes remain blocked."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    # Pin $HOME outside tmp_path so the host-scratch cwd allowance holds on Windows
+    # CI too (where pytest's tmp dir lives UNDER home and the data-parent-under-home
+    # protection would otherwise block the sibling scratch cwd). See the same fixture
+    # in test_external_workspace_access.py.
+    fake_home = tmp_path / "_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
     system_repo = tmp_path / "system"
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
@@ -713,9 +723,14 @@ def test_workspace_run_shell_blocks_escaping_cwd(tmp_path, monkeypatch):
     registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
     registry.set_context(ctx)
 
-    result = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(outside)})
-
-    assert "SHELL_CWD_BLOCKED" in result
+    # Host scratch outside the declared workspace is now a legitimate cwd...
+    scratch_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(outside)})
+    assert "SHELL_CWD_BLOCKED" not in scratch_cwd
+    # ...but the Ouroboros runtime (system repo + data drive) is never a cwd.
+    runtime_repo_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(system_repo)})
+    assert "SHELL_CWD_BLOCKED" in runtime_repo_cwd
+    runtime_data_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(data)})
+    assert "SHELL_CWD_BLOCKED" in runtime_data_cwd
     git_escape = registry.execute("run_command", {"cmd": ["git", "-C", str(system_repo), "status"]})
     assert "WORKSPACE_GIT_BLOCKED" in git_escape
     git_chain = registry.execute("run_command", {"cmd": ["sh", "-c", "true && git --version; echo git binary OK"]})
@@ -1086,6 +1101,50 @@ def test_workspace_patch_includes_tracked_and_untracked_files(tmp_path):
     assert "diff --git a/tracked.txt b/tracked.txt" in patch
     assert "+new" in patch
     assert "diff --git" in patch and "new.txt" in patch
+
+
+def test_workspace_patch_excludes_binary_junk_and_oversize(tmp_path, monkeypatch):
+    """T7 (v6.35.0): the real-usage workspace patch drops untracked build/runtime
+    binaries, junk artifacts, and oversize blobs (recorded, not silently lost),
+    while keeping real source additions."""
+    import ouroboros.headless as headless
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    # Untracked additions: a real source file (keep), a compiled binary (drop),
+    # a redis dump + log junk (drop), and an oversize text file (drop).
+    (repo / "fix.py").write_text("def fixed():\n    return 1\n", encoding="utf-8")
+    (repo / "app").write_bytes(b"\x7fELF\x00\x01\x02\x03binary\x00blob")  # compiled binary
+    (repo / "dump.rdb").write_bytes(b"REDIS\x00\x01")
+    (repo / "run.log").write_text("noise\n", encoding="utf-8")
+    (repo / "htmlcov").mkdir()
+    (repo / "htmlcov" / "index.html").write_text("<html></html>\n", encoding="utf-8")  # top-level coverage junk
+    monkeypatch.setattr(headless, "_PATCH_MAX_UNTRACKED_FILE_BYTES", 100)
+    (repo / "big.txt").write_text("x" * 200, encoding="utf-8")  # 200 bytes > cap; small files pass size
+
+    artifacts, manifest = write_workspace_patch_artifacts(repo, tmp_path / "artifacts", task={})
+
+    assert manifest["exclude_rules_version"] == 2
+    excluded = {item["path"]: item["reason"] for item in manifest["untracked_excluded"]}
+    assert "binary file" in excluded.get("app", "")
+    assert "binary file" in excluded.get("dump.rdb", "") or "junk artifact" in excluded.get("dump.rdb", "")
+    assert "junk artifact" in excluded.get("run.log", "")
+    assert "junk artifact" in excluded.get("htmlcov/index.html", "")  # top-level htmlcov excluded
+    assert "size cap" in excluded.get("big.txt", "")
+    assert "fix.py" in manifest["untracked_included"]
+    patch = (tmp_path / "artifacts" / "workspace.patch").read_text(encoding="utf-8")
+    assert "fix.py" in patch
+    assert "diff --git a/app b/app" not in patch
+    assert "dump.rdb" not in patch
+    assert "run.log" not in patch
+    assert "big.txt" not in patch
 
 
 def test_workspace_patch_supports_unborn_git_worktree(tmp_path):

@@ -14,6 +14,16 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+# WA6: set sys.dont_write_bytecode BEFORE importing any project module. A signed
+# macOS .app must never write __pycache__/*.pyc into its own bundle at runtime
+# (that breaks the codesign seal and triggers AppTranslocation). os.environ alone
+# is INSUFFICIENT for THIS process: PYTHONDONTWRITEBYTECODE is only read at
+# interpreter startup, so mutating os.environ later does not stop the current
+# process's own subsequent imports — only sys.dont_write_bytecode does. The env
+# vars set further below propagate the same policy to child processes.
+sys.dont_write_bytecode = True
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
 from ouroboros.config import (
     AGENT_SERVER_PORT,
     DATA_DIR,
@@ -74,6 +84,20 @@ MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
 _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
+
+# WA6: globally suppress bytecode writes for the launcher process itself and any
+# naive os.environ.copy() child it spawns. A signed+notarized macOS .app must not
+# write __pycache__/*.pyc into its own bundle at runtime — that breaks the codesign
+# seal and triggers AppTranslocation. Uses the same data_dir/state/pycache
+# convention as launcher_bootstrap.python_bytecode_env so caches land outside the
+# bundle. setdefault keeps any explicit caller override.
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+_pycache_dir = DATA_DIR / "state" / "pycache"
+try:
+    _pycache_dir.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+os.environ.setdefault("PYTHONPYCACHEPREFIX", str(_pycache_dir))
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _log_dir = DATA_DIR / "logs"
@@ -589,6 +613,41 @@ def _poll_port_file(timeout: float = 30.0) -> int:
     return _read_port_file()
 
 
+def _kill_orphaned_children(port: int) -> None:
+    """Final safety net: kill processes still on runtime ports.
+
+    Module-level so both the window-close handler (_on_closing, main thread) and
+    the panic-stop branch (agent_lifecycle_loop, supervisor thread) tear down the
+    exact same way.
+    """
+    _cleanup_recorded_server_process("window_close")
+    _kill_stale_runtime_ports(port)
+    _kill_stale_on_port(8766)
+    try:
+        companions = json.loads((DATA_DIR / "state" / "extension_companions.json").read_text(encoding="utf-8"))
+        if isinstance(companions, dict):
+            for item in companions.values():
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    force_kill_pid(int(item.get("pid") or 0))
+                except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
+                    pass
+                for companion_port in item.get("ports") or []:
+                    try:
+                        kill_process_on_port(int(companion_port))
+                    except (TypeError, ValueError, OSError):
+                        pass
+    except Exception:
+        pass
+    for child in __import__("multiprocessing").active_children():
+        try:
+            force_kill_pid(child.pid)
+            log.info("Killed orphaned child pid=%d", child.pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
     """Start/monitor agent; restart on code 42 or bounded crashes."""
     global _agent_proc, _agent_job
@@ -627,20 +686,14 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         if exit_code == PANIC_EXIT_CODE:
             log.info("Panic stop (exit code %d) — shutting down completely.", PANIC_EXIT_CODE)
             _shutdown_event.set()
-            _kill_stale_runtime_ports(port)
-            import multiprocessing as _mp
-
-            for child in _mp.active_children():
-                try:
-                    force_kill_pid(child.pid)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            if _webview_window:
-                try:
-                    _webview_window.destroy()
-                except Exception:
-                    pass
-            break
+            # The agent (server child) already exited; tear down any orphans and
+            # force-exit the whole process. _webview_window.destroy() from this
+            # supervisor thread cannot end the main-thread Cocoa webview loop on
+            # macOS (it leaves a black frozen window), so exit with parity to the
+            # window-close path: kill orphans, release the pid lock, os._exit(0).
+            _kill_orphaned_children(port)
+            release_pid_lock()
+            os._exit(0)
 
         time.sleep(2)
 
@@ -1179,40 +1232,11 @@ def main():
         text_select=True,
     )
 
-    def _kill_orphaned_children() -> None:
-        """Final safety net: kill processes still on runtime ports."""
-        _cleanup_recorded_server_process("window_close")
-        _kill_stale_runtime_ports(port)
-        _kill_stale_on_port(8766)
-        try:
-            companions = json.loads((DATA_DIR / "state" / "extension_companions.json").read_text(encoding="utf-8"))
-            if isinstance(companions, dict):
-                for item in companions.values():
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        force_kill_pid(int(item.get("pid") or 0))
-                    except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
-                        pass
-                    for companion_port in item.get("ports") or []:
-                        try:
-                            kill_process_on_port(int(companion_port))
-                        except (TypeError, ValueError, OSError):
-                            pass
-        except Exception:
-            pass
-        for child in __import__("multiprocessing").active_children():
-            try:
-                force_kill_pid(child.pid)
-                log.info("Killed orphaned child pid=%d", child.pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
     def _on_closing() -> None:
         log.info("Window closing — graceful shutdown.")
         _shutdown_event.set()
         stop_agent()
-        _kill_orphaned_children()
+        _kill_orphaned_children(port)
         release_pid_lock()
         os._exit(0)
 

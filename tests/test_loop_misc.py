@@ -127,6 +127,68 @@ def test_time_budget_milestone_injects_once_per_threshold(monkeypatch):
     assert ctx._time_budget_milestones_seen == {"50%"}
 
 
+def test_intrinsic_pacing_injects_without_deadline(monkeypatch):
+    """No deadline_at: surface elapsed/rounds/cost once per interval bucket."""
+    messages = [{"role": "user", "content": "solve"}]
+    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"})  # no deadline_at
+    from datetime import datetime, timezone
+
+    monkeypatch.delenv("OUROBOROS_PACING_INTERVAL_SEC", raising=False)
+    # 20 min elapsed, default interval 600s -> bucket 2.
+    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 0, 20, tzinfo=timezone.utc))
+
+    injected = _maybe_inject_time_budget_milestone(
+        messages, SimpleNamespace(_ctx=ctx), round_idx=7,
+        accumulated_usage={"cost": 1.25}, task_id="t",
+    )
+    injected_again = _maybe_inject_time_budget_milestone(
+        messages, SimpleNamespace(_ctx=ctx), round_idx=8, accumulated_usage={"cost": 1.4},
+    )
+
+    assert injected is True
+    assert injected_again is False  # same bucket -> not repeated
+    assert "[PACING" in messages[-1]["content"]
+    assert "Rounds so far: 7" in messages[-1]["content"]
+
+
+def test_intrinsic_pacing_disabled_when_interval_zero(monkeypatch):
+    messages = [{"role": "user", "content": "solve"}]
+    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"})
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("OUROBOROS_PACING_INTERVAL_SEC", "0")
+    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 1, 0, tzinfo=timezone.utc))
+
+    assert _maybe_inject_time_budget_milestone(messages, SimpleNamespace(_ctx=ctx), round_idx=3) is False
+
+
+def test_deadline_local_finalize_gate(monkeypatch):
+    """Self-finalize only when a REAL deadline is within the grace window."""
+    from datetime import datetime, timezone
+
+    captured = {}
+
+    def _fake_final(ctx, *, prompt, fallback_text, reason_code):
+        captured["reason_code"] = reason_code
+        return ("BEST EFFORT", {"reason_code": reason_code}, {})
+
+    monkeypatch.setattr(loop_mod, "_forced_final_answer", _fake_final)
+    monkeypatch.setattr(loop_mod, "get_finalization_grace_sec", lambda *a, **k: 120)
+    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 9, 59, 0, tzinfo=timezone.utc))
+
+    # Far from deadline (10:30 vs now 09:59 -> ~31 min left > 120s) -> no finalize.
+    far = SimpleNamespace(_ctx=SimpleNamespace(task_metadata={"deadline_at": "2026-06-10T10:30:00Z"}))
+    assert loop_mod._maybe_deadline_local_finalize(SimpleNamespace(), far) is None
+    # Within grace (10:00 vs now 09:59 -> 60s < 120s) -> finalize best-effort.
+    near = SimpleNamespace(_ctx=SimpleNamespace(task_metadata={"deadline_at": "2026-06-10T10:00:00Z"}))
+    result = loop_mod._maybe_deadline_local_finalize(SimpleNamespace(), near)
+    assert result is not None and result[0] == "BEST EFFORT"
+    assert captured["reason_code"] == "deadline_local"
+    # No deadline_at at all -> never fires (no synthesized deadline).
+    none_ctx = SimpleNamespace(_ctx=SimpleNamespace(task_metadata={}))
+    assert loop_mod._maybe_deadline_local_finalize(SimpleNamespace(), none_ctx) is None
+
+
 def test_task_acceptance_auto_is_llm_first_not_host_enforced(monkeypatch):
     trace = {
         "tool_calls": [
@@ -159,6 +221,136 @@ def test_task_acceptance_auto_is_llm_first_not_host_enforced(monkeypatch):
     ) is False
     assert ctx._task_acceptance_reviewed is True
     assert reviewed_trace["review_decision"]["trigger"] == "agent_called_tool_result"
+
+
+def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
+    """WA4 (v6.36.0): host-forced `required` review records the full verdict on
+    the objective axis AND feeds the agent a COMPACT improvement capsule for a
+    real best_effort/blocked_with_evidence (ONE bounded pass, anti-derailment
+    framed). A solved/nothing-actionable result still finalizes with no injection."""
+    import ouroboros.review_substrate as rs
+
+    monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
+    monkeypatch.setattr(rs, "reviewer_slots", lambda **k: [object(), object(), object()])
+
+    # (a) CONTRACT-VALID solved PASS (a non-empty completion_coach, as the required
+    # contract demands) with no actionable findings -> still NO injection, finalize.
+    # A coach alone must not re-loop an already-solved deliverable.
+    solved = rs.ReviewRunResult(
+        request={"surface": "task_acceptance"},
+        actors=[{"signal": "PASS", "slot_id": "s0",
+                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship it as-is"}}],
+        parsed_findings=[], aggregate_signal="PASS",
+    )
+    monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
+    ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    result = _run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
+        llm_trace=trace, drive_root=None, messages=messages, emit_progress=lambda _m: None,
+    )
+    assert result is False                                        # nothing to improve -> no extra round
+    assert len(messages) == 2                                     # transcript NOT mutated
+    assert trace["review_runs"][0]["aggregate_signal"] == "PASS"  # full verdict recorded (objective axis)
+
+    # (b) blocked_with_evidence -> compact capsule fed back exactly once.
+    blocked = rs.ReviewRunResult(
+        request={"surface": "task_acceptance"},
+        actors=[{"signal": "FAIL", "slot_id": "s0",
+                 "parsed": {"outcome_tier": "blocked_with_evidence", "completion_coach": "run the real grader"}}],
+        parsed_findings=[{"slot_id": "s0", "severity": "critical", "item": "fake test", "recommendation": "use the pre-existing suite"}],
+        aggregate_signal="FAIL",
+    )
+    monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: blocked)
+    ctx2 = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    trace2 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    messages2 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    tools2 = SimpleNamespace(_ctx=ctx2)
+    result2 = _run_task_acceptance_review_once(
+        tools=tools2, content="done", task_id="t", task_type="task",
+        llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m: None,
+    )
+    assert result2 is True                                        # capsule -> one bounded re-loop
+    # The capsule reaches the agent (appended/merged into the trailing user turn).
+    assert "improvement note" in messages2[-1]["content"].lower()
+    assert "Do not mention this review" in messages2[-1]["content"]
+    # The CAPSULE is bounded (injected once), but the review is NOT yet terminal —
+    # so the REVISED final deliverable still gets reviewed (round-4 state-machine fix).
+    assert ctx2._task_acceptance_capsule_injected is True
+    assert getattr(ctx2, "_task_acceptance_reviewed", False) is False
+
+    # (c) the revised final deliverable IS re-reviewed (verdict on the SHIPPED answer,
+    # not the stale pre-revision one), and the one capsule is not injected again.
+    trace3 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    messages3 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    result3 = _run_task_acceptance_review_once(
+        tools=tools2, content="revised", task_id="t", task_type="task",
+        llm_trace=trace3, drive_root=None, messages=messages3, emit_progress=lambda _m: None,
+    )
+    assert result3 is False                                       # capsule already spent -> finalize
+    assert len(messages3) == 2                                    # no second capsule injected
+    assert trace3["review_runs"][0]["aggregate_signal"] == "FAIL"  # final-deliverable verdict recorded
+    assert ctx2._task_acceptance_reviewed is True                # now terminal
+
+
+def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch, tmp_path):
+    """T1 (v6.35.0): a REVIEW_BLOCKED/GIT_ERROR commit attempt is is_error=False but
+    carries a non-ok status, so it must NOT count as 'committed this turn' — else
+    collect_turn_diff would surface an unrelated prior HEAD commit as evidence."""
+    import ouroboros.review_evidence as re_mod
+    import ouroboros.review_substrate as rs
+
+    monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
+
+    class _FakeResult:
+        aggregate_signal = "PASS"
+        request = {"surface": "task_acceptance"}
+
+    monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(rs, "reviewer_slots", lambda **k: [object(), object(), object()])
+
+    captured = {}
+
+    def _fake_collect(ctx, *, include_recent_commit=False, **k):
+        captured["include_recent_commit"] = include_recent_commit
+        return ""
+
+    monkeypatch.setattr(re_mod, "collect_turn_diff", _fake_collect)
+
+    ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    # A blocked commit attempt: is_error False, but structured status is "blocked".
+    trace = {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "status": "blocked"}]}
+    messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+
+    _run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx),
+        content="done",
+        task_id="t",
+        task_type="task",
+        llm_trace=trace,
+        drive_root=None,
+        messages=messages,
+        emit_progress=lambda _m: None,
+    )
+
+    assert captured["include_recent_commit"] is False
+
+    # A genuinely landed commit (status "ok") DOES surface the committed HEAD.
+    captured.clear()
+    trace_ok = {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "status": "ok"}]}
+    ctx._task_acceptance_reviewed = False
+    _run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx),
+        content="done",
+        task_id="t",
+        task_type="task",
+        llm_trace=trace_ok,
+        drive_root=None,
+        messages=messages,
+        emit_progress=lambda _m: None,
+    )
+    assert captured["include_recent_commit"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +472,59 @@ def test_run_llm_loop_preserves_assistant_tool_call_metadata(tmp_path, monkeypat
     assert assistant_msg["response_id"] == "gen-123"
 
 
+def test_run_llm_loop_narrates_reasoning_to_bubble_not_trace(tmp_path, monkeypatch):
+    """Display-only contract: a pure tool-call round with no visible content narrates the
+    provider's readable reasoning to the progress BUBBLE, but never records it in the durable
+    trace (``reasoning_notes`` feeds build_trace_summary / task summaries) — so display-only
+    reasoning cannot leak out of the display path."""
+    from ouroboros.tools.registry import ToolRegistry
+
+    messages = [{"role": "user", "content": "go"}]
+    tool_round = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        "reasoning": "Let me read the file before answering.",
+    }
+    calls = {"count": 0}
+    emitted: list = []
+
+    class FakeLLM:
+        def default_model(self):
+            return "test-model"
+
+    def fake_call_llm_with_retry(_llm, request_messages, *_a, **_k):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return dict(tool_round), 0.0
+        return {"role": "assistant", "content": "final answer"}, 0.0
+
+    def fake_handle_tool_calls(tool_calls, _tools, _dl, _tid, _ex, request_messages, _tr, _pg):
+        request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "file body"})
+        return 0
+
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call_llm_with_retry)
+    monkeypatch.setattr(loop_mod, "handle_tool_calls", fake_handle_tool_calls)
+    monkeypatch.setenv("OUROBOROS_REASONING_SUMMARY", "auto")
+
+    result, _usage, trace = run_llm_loop(
+        messages=messages,
+        tools=ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path),
+        llm=FakeLLM(),
+        drive_logs=tmp_path,
+        emit_progress=lambda text: emitted.append(text),
+        incoming_messages=queue.Queue(),
+        task_id="narrate",
+        drive_root=tmp_path,
+    )
+
+    assert result == "final answer"
+    # the readable reasoning reached the display bubble...
+    assert any("read the file before answering" in str(e) for e in emitted)
+    # ...but did NOT leak into the durable trace (display-only).
+    assert all("read the file before answering" not in str(n) for n in trace["reasoning_notes"])
+
+
 def test_run_llm_loop_finalize_now_control_forces_best_effort_answer(tmp_path, monkeypatch):
     """A supervisor finalize_now control makes the loop extract one tool-less
     final answer and stamp the finalization_grace reason (typed best_effort
@@ -380,7 +625,7 @@ def test_run_llm_loop_keeps_task_model_override_across_tool_rounds(tmp_path, mon
     assert seen_use_local == [True, True]
 
 
-def test_run_llm_loop_enforces_consilium_force_plan_before_final(tmp_path, monkeypatch):
+def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
 
     messages = [{"role": "user", "content": "ship"}]
@@ -422,7 +667,7 @@ def test_run_llm_loop_enforces_consilium_force_plan_before_final(tmp_path, monke
         return 0
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "consilium"}
+    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "swarm"}
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call_llm_with_retry)
     monkeypatch.setattr(loop_mod, "handle_tool_calls", fake_handle_tool_calls)
 
@@ -443,7 +688,7 @@ def test_run_llm_loop_enforces_consilium_force_plan_before_final(tmp_path, monke
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
 
-def test_run_llm_loop_does_not_accept_failed_plan_task_for_consilium_force_plan(tmp_path, monkeypatch):
+def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
 
     messages = [{"role": "user", "content": "ship"}]
@@ -480,7 +725,7 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_consilium_force_plan(
         return 0
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "consilium"}
+    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "swarm"}
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call_llm_with_retry)
     monkeypatch.setattr(loop_mod, "handle_tool_calls", fake_handle_tool_calls)
 
@@ -495,9 +740,9 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_consilium_force_plan(
         drive_root=tmp_path,
     )
 
-    assert result.startswith("⚠️ CONSILIUM_FORCE_PLAN_BLOCKED")
+    assert result.startswith("⚠️ SWARM_INITIATIVE_BLOCKED")
     assert calls["count"] == 4
-    assert usage["reason_code"] == "consilium_force_plan_not_called"
+    assert usage["reason_code"] == "swarm_force_plan_not_called"
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
 
@@ -549,10 +794,12 @@ def test_run_llm_loop_injects_subagent_handoff_before_final_text(tmp_path, monke
     assert any("Subagent handoff status refreshed" in item for item in progress)
     assert any("Subagent handoff status refreshed" in item for item in trace["reasoning_notes"])
     second_text = "\n".join(str(item.get("content") or "") for item in seen_second_request["messages"])
-    assert "[SUBAGENT_HANDOFF_STATUS]" in second_text
-    assert "result_available" in second_text
+    # C3.4: the parent now ABSORBS the child's FULL authored result before
+    # finalizing (not just a 240-char preview), with a durable get_task_result pointer.
+    assert "[SUBAGENT_RESULTS" in second_text
+    assert "child child1" in second_text
     assert "child handoff" in second_text
-    assert "Use get_task_result" in second_text
+    assert "get_task_result" in second_text
 
 
 def test_run_llm_loop_reinjects_incomplete_subagent_handoff_until_final_acknowledges_status(tmp_path, monkeypatch):

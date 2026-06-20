@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -48,13 +49,26 @@ ARTIFACT_TERMINAL_STATUSES = {
 # headless → task_status → outcomes → headless cycle, and the smoke test below
 # pins equality so the literal cannot drift from the SSOT.
 _FINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected_duplicate"})
+
+# Mirrors tool_capabilities.LOCAL_READONLY_SUBAGENT_MODE; a module-level import would risk
+# an import cycle (same rationale as _FINAL_STATUSES above), and the smoke test pins equality
+# so the literal cannot drift from this SSOT — the kind of re-derivation drift that stranded
+# the reaper's artifact finalization before task_is_readonly_subagent consolidated the gate.
+_LOCAL_READONLY_SUBAGENT_MODE = "local_readonly_subagent"
 _ARTIFACT_LIFECYCLE_FIELDS = {
     "artifact_status",
     "artifact_error",
     "artifact_bundle",
     "artifact_finalized_at",
 }
-_PATCH_EXCLUDE_RULES_VERSION = 1
+# v6.35.0 (T7): bumped to 2 with binary + size + junk-artifact hygiene so the
+# real-usage workspace.patch (consumed by subagents / PR integration) never
+# carries a compiled `go build` binary, a Redis dump, or other untracked build
+# junk. Kept consistent with the bench capture_patch.sh JUNK_RE + numstat
+# binary detection. This is patch-transport hygiene only (artifact path/extension
+# + git's own binary verdict), never code/content inference (Bible P5).
+_PATCH_EXCLUDE_RULES_VERSION = 2
+_PATCH_MAX_UNTRACKED_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB per untracked file
 _TOP_LEVEL_EXCLUDE_DIRS = {".ouroboros", ".venv", "venv", "env"}
 _ANY_SEGMENT_EXCLUDE_DIRS = {
     ".cache",
@@ -68,6 +82,13 @@ _ANY_SEGMENT_EXCLUDE_DIRS = {
     "__pycache__",
     "node_modules",
 }
+# Junk file tails / build dirs the dir-sets above don't already cover; the same
+# JUNK_RE the bench capture_patch.sh uses (devtools/benchmarks/swe_bench_pro/).
+_PATCH_JUNK_RE = re.compile(
+    r"appendonlydir|\.rdb$|\.aof$|\.manifest$|\.log$|\.tmp$|\.pid$|\.sock$"
+    r"|\.pyc$|\.pyo$|^(dist|build)/|\.DS_Store|(^|/)\.coverage$"
+    r"|coverage\.xml$|(^|/)htmlcov/"
+)
 _SENSITIVE_EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
 _SENSITIVE_KEY_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 _SENSITIVE_FILENAMES = {
@@ -288,6 +309,53 @@ def prune_task_drives(
     return report
 
 
+def prune_task_trees(
+    parent_drive_root: pathlib.Path,
+    *,
+    retention_days: Optional[int] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Best-effort startup prune for ephemeral task-tree coordination ledgers
+    (``data/task_trees/<root_task_id>/blackboard.jsonl``). A tree's ledger is removed once
+    its ROOT task is terminal (or has no surviving result) and older than the GC retention
+    window — swarm-run coordination is transient, distinct from durable project memory."""
+
+    from ouroboros.retention import age_cutoff
+
+    parent = pathlib.Path(parent_drive_root)
+    base = parent / "task_trees"
+    days = _resolve_retention_days(retention_days)
+    cutoff = age_cutoff(days, now)
+    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": []}
+    if not base.is_dir():
+        return report
+    for tree_dir in sorted(base.iterdir()):
+        if not tree_dir.is_dir():
+            continue
+        root_id = tree_dir.name
+        report["scanned"] += 1
+        try:
+            dir_mtime = tree_dir.stat().st_mtime
+            try:
+                from ouroboros.task_status import load_effective_task_result
+
+                result = load_effective_task_result(parent, root_id) or {}
+            except Exception:
+                result = load_task_result(parent, root_id) or {}
+            status = str(result.get("status") or "").lower()
+            if status and status not in _FINAL_STATUSES:
+                report["skipped"].append({"root_task_id": root_id, "reason": "root_not_terminal", "status": status})
+                continue
+            if _timestamp_from_result(result, dir_mtime) > cutoff:
+                report["skipped"].append({"root_task_id": root_id, "reason": "younger_than_retention"})
+                continue
+            shutil.rmtree(tree_dir)
+            report["pruned"].append({"root_task_id": root_id, "path": str(tree_dir)})
+        except Exception as exc:
+            report["errors"].append({"root_task_id": root_id, "error": f"{type(exc).__name__}: {exc}"})
+    return report
+
+
 def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
     """Immediately remove a subagent's child drive (used on cancel/timeout).
 
@@ -329,7 +397,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         task_constraint = metadata.get("task_constraint") or {}
     readonly_subagent = (
         str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
-        and str(task_constraint.get("mode") or "") == "local_readonly_subagent"
+        and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
     )
     workspace_task = _workspace_root_from_task(task) is not None and not readonly_subagent
     child_status = str(child_result.get("status") or "completed")
@@ -428,6 +496,23 @@ def _copy_child_artifacts_to_parent(
         item["sha256"] = sha256(data).hexdigest()
         rebased.append(item)
     return rebased
+
+
+def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
+    """A local-readonly live subagent produces no durable owner-facing artifacts, so the
+    ``task_done`` finalize path (and the reaper that honors a self-finalized result) skip
+    artifact finalization for it. Single SSOT gate so every call site reads the same rule
+    instead of re-deriving it (a re-derivation drift is what stranded the reaper path)."""
+    if not isinstance(task, dict):
+        return False
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    task_constraint = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
+    if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
+        task_constraint = metadata.get("task_constraint") or {}
+    return (
+        str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
+        and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
+    )
 
 
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -630,6 +715,10 @@ def write_workspace_patch_artifacts(
         reason = _patch_exclude_reason(rel)
         if reason:
             excluded.append({"path": rel, "reason": reason})
+            continue
+        blob_reason = _untracked_blob_exclude_reason(root, rel)
+        if blob_reason:
+            excluded.append({"path": rel, "reason": blob_reason})
             continue
         included_untracked.append(rel)
     if sensitive:
@@ -1124,7 +1213,8 @@ def _write_patch_separator(fh: BinaryIO, hasher: Any) -> int:
 
 
 def _patch_exclude_reason(rel: str) -> str:
-    parts = pathlib.PurePosixPath(str(rel).replace("\\", "/")).parts
+    posix = str(rel).replace("\\", "/")
+    parts = pathlib.PurePosixPath(posix).parts
     if not parts:
         return ""
     if parts[0] in _TOP_LEVEL_EXCLUDE_DIRS:
@@ -1132,6 +1222,33 @@ def _patch_exclude_reason(rel: str) -> str:
     for part in parts:
         if part in _ANY_SEGMENT_EXCLUDE_DIRS:
             return f"env/cache directory segment: {part}"
+    if _PATCH_JUNK_RE.search(posix):
+        return f"junk artifact: {posix}"
+    return ""
+
+
+def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str) -> str:
+    """Reason to drop an untracked file from the workspace patch when it is a
+    build/runtime BINARY or exceeds the per-file size cap. Keeps real-usage
+    patches source-shaped without losing data (the file stays in the workspace
+    and is recorded under ``untracked_excluded``). On any git/stat failure the
+    file is INCLUDED (conservative — the main binary diff still applies)."""
+
+    try:
+        size = (root / rel).lstat().st_size
+    except OSError:
+        return ""  # unreadable/symlink races: include and let git decide
+    if size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
+        return f"untracked file exceeds size cap ({size}B > {_PATCH_MAX_UNTRACKED_FILE_BYTES}B)"
+    numstat = _git_stdout(
+        ["git", "diff", "--no-index", "--numstat", "--no-ext-diff", "--no-color", "--", os.devnull, rel],
+        root,
+        allow_rc={0, 1},
+        errors=None,
+    )
+    first = numstat.strip().splitlines()[0] if numstat.strip() else ""
+    if first.startswith("-\t-"):
+        return "binary file"
     return ""
 
 
@@ -1250,6 +1367,7 @@ __all__ = [
     "build_workspace_patch",
     "copy_child_task_result",
     "finalize_task_artifacts",
+    "task_is_readonly_subagent",
     "prepare_task_drive",
     "prune_headless_task_drives",
     "prune_task_drives",

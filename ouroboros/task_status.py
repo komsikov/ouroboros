@@ -7,7 +7,7 @@ import pathlib
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ouroboros.headless import (
     ARTIFACT_STATUS_FAILED,
@@ -548,6 +548,7 @@ def wait_for_effective_tasks(
     timeout_sec: float,
     mode: str = "all_terminal",
     poll_interval_sec: float = 0.5,
+    on_poll: Optional[Callable[[Dict[str, Any], Dict[str, bool]], Any]] = None,
 ) -> Dict[str, Any]:
     ids = []
     for item in task_ids:
@@ -561,6 +562,7 @@ def wait_for_effective_tasks(
     deadline = start + max(0.0, float(timeout_sec or 0))
     results: Dict[str, Dict[str, Any]] = {}
     timed_out = False
+    early: Any = None
     while True:
         results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
         terminal = {tid: str(data.get("status") or "").strip().lower() in FINAL_STATUSES for tid, data in results.items()}
@@ -568,11 +570,22 @@ def wait_for_effective_tasks(
             break
         if mode != "any_terminal" and all(terminal.values()):
             break
+        # Sliced wait hook: a child->parent attention beacon (blocker/question/interface_contract)
+        # can break the wait early so a productively-waiting parent reacts mid-flight instead of only
+        # at terminal. Never raises into the wait; a faulty hook just keeps polling.
+        if callable(on_poll):
+            try:
+                signal = on_poll(results, terminal)
+            except Exception:
+                signal = None
+            if signal is not None:
+                early = signal
+                break
         if time.monotonic() >= deadline:
             timed_out = True
             break
         time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5))))
-    return {
+    out: Dict[str, Any] = {
         "mode": mode,
         "timeout_sec": float(timeout_sec or 0),
         "elapsed_sec": max(0.0, time.monotonic() - start),
@@ -580,6 +593,20 @@ def wait_for_effective_tasks(
         "all_terminal": all(str(data.get("status") or "").strip().lower() in FINAL_STATUSES for data in results.values()) if ids else True,
         "tasks": results,
     }
+    if early is not None:
+        out["early_return"] = early
+    # Live per-child status from the queue snapshot — kills the false "starved"/"dead"
+    # claim: the parent sees which children are actually RUNNING/SCHEDULED vs terminal.
+    try:
+        _snap = _load_queue_snapshot(pathlib.Path(drive_root))
+        live: Dict[str, str] = {}
+        for tid in ids:
+            _st, _ = _queue_task_status(_snap, tid)
+            live[tid] = _st or ("terminal" if str((results.get(tid) or {}).get("status") or "").strip().lower() in FINAL_STATUSES else "unknown")
+        out["live_child_status"] = live
+    except Exception:
+        pass
+    return out
 
 
 def find_child_tasks(
@@ -673,3 +700,97 @@ def format_handoff_message(children: List[Dict[str, Any]]) -> str:
         + json.dumps(payload, ensure_ascii=False, indent=2)
         + "\n[/SUBAGENT_HANDOFF_STATUS]"
     )
+
+
+def _child_artifact_pointers(child: Dict[str, Any]) -> List[str]:
+    """Artifact name+path pointers for a child (IDENTIFIERS, not content dumps)."""
+    out: List[str] = []
+    bundle = child.get("artifact_bundle") if isinstance(child.get("artifact_bundle"), dict) else {}
+    arts = bundle.get("artifacts") if isinstance(bundle.get("artifacts"), list) else (
+        child.get("artifacts") if isinstance(child.get("artifacts"), list) else []
+    )
+    for art in arts or []:
+        if isinstance(art, dict):
+            name = str(art.get("name") or "").strip()
+            path = str(art.get("path") or art.get("abs_path") or "").strip()
+            if path:
+                out.append(f"{name} -> {path}" if name else path)
+            elif name:
+                out.append(name)
+    return out[:20]
+
+
+def format_subagent_absorption_message(
+    children: List[Dict[str, Any]],
+    *,
+    parent_task_id: str,
+    budget_chars: int = 160_000,
+) -> str:
+    """Inject completed DIRECT children's FULL authored result before finalization so
+    the parent absorbs their work (the cyber-racing parent finalized without ever
+    reading its 3 children). Whole-artifact-or-pointer: each terminal direct child is
+    injected in FULL while the aggregate fits ``budget_chars``; once exceeded, the
+    remaining children are replaced WHOLE by a get_task_result pointer — a child's
+    result is NEVER mid-truncated, and the full output is always durable + pullable
+    (P1). Grandchildren roll up to their direct parent: the root sees their STATUS
+    only, not their raw output (avoids deep-tree context explosion)."""
+    parent = str(parent_task_id or "").strip()
+    direct = [c for c in children if str(c.get("parent_task_id") or "") == parent]
+    descendants = [c for c in children if str(c.get("parent_task_id") or "") != parent]
+    terminal = [c for c in direct if str(c.get("status") or "").strip().lower() in FINAL_STATUSES]
+    pending = [c for c in direct if c not in terminal]
+
+    lines: List[str] = [
+        "[SUBAGENT_RESULTS — absorb your children's work before finalizing. "
+        "Full outputs are durable and pullable via get_task_result.]"
+    ]
+    spent = 0
+    omitted = 0
+    for child in terminal:
+        cid = str(child.get("task_id") or child.get("id") or "")
+        role = str(child.get("role") or "")
+        try:
+            cost = float(child.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        result = str(child.get("result") or "").strip()
+        lines.append(f"\n## child {cid} ({role}) — status={child.get('status')}, cost=${cost:.4f}")
+        if result and spent + len(result) <= budget_chars:
+            lines.append(result)
+            spent += len(result)
+        elif result:
+            omitted += 1
+            lines.append(
+                f"[FULL RESULT OMITTED to fit context: {len(result)} chars — pull it with "
+                f'get_task_result("{cid}")]'
+            )
+        else:
+            lines.append("[no result text returned]")
+        pointers = _child_artifact_pointers(child)
+        if pointers:
+            lines.append("artifacts: " + "; ".join(pointers))
+    if omitted:
+        lines.append(
+            f"\n[NOTE] {omitted} child result(s) omitted for the context budget — "
+            "pull them explicitly with get_task_result if you need them."
+        )
+    if pending:
+        lines.append("\n[STILL RUNNING — not yet absorbable]")
+        for child in pending:
+            lines.append(f"- {child.get('task_id') or child.get('id')}: {child.get('status')}")
+    if descendants:
+        lines.append(
+            f"\n[DEEPER DESCENDANTS — rolled up to their direct parents; status only] ({len(descendants)}):"
+        )
+        for child in descendants[:40]:
+            lines.append(
+                f"- {child.get('task_id') or child.get('id')} "
+                f"(parent {child.get('parent_task_id')}): {child.get('status')}"
+            )
+        if len(descendants) > 40:
+            # Visible omission, never a silent clip of cognitive status (BIBLE P1).
+            lines.append(
+                f"- ⚠️ OMISSION NOTE: {len(descendants) - 40} additional descendants omitted "
+                f"(full status via get_task_result on each root/child id)"
+            )
+    return "\n".join(lines)

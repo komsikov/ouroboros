@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
-from ouroboros.config import get_context_mode, get_light_model, get_task_review_mode, resolve_effort
+from ouroboros.config import adaptive_quorum, get_context_mode, get_finalization_grace_sec, get_light_model, get_pacing_interval_sec, get_task_review_mode, resolve_effort
 from ouroboros.outcomes import turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import initial_tool_schemas, list_non_core_tools
@@ -226,7 +226,7 @@ def _force_plan_completed(llm_trace: Dict[str, Any]) -> bool:
     Reads the structured ``plan_review_aggregate`` flag captured from the FULL
     tool result at execution time (loop_tool_execution); the old substring
     check against the 700-char trace preview could never see the aggregate
-    marker at the end of a long plan output, wedging Consilium tasks in the
+    marker at the end of a long plan output, wedging swarm tasks in the
     force-plan reminder loop.
     """
     for call in llm_trace.get("tool_calls") or []:
@@ -601,17 +601,37 @@ def _run_task_acceptance_review_once(
     if not eligible:
         return False
     try:
-        from ouroboros.review_substrate import ReviewRequest, reviewer_slots, run_review_request
+        from ouroboros.review_substrate import (
+            HARDNESS_ADVISORY_VISIBLE,
+            ReviewRequest,
+            build_improvement_capsule,
+            reviewer_slots,
+            run_review_request,
+        )
 
-        tools._ctx._task_acceptance_reviewed = True
+        from ouroboros.review_evidence import collect_turn_diff
+
+        # A commit only "happened this turn" when it actually LANDED. A
+        # REVIEW_BLOCKED / GIT_ERROR commit attempt is intentionally NOT a
+        # tool-execution error (is_error=False) but carries a non-ok structured
+        # status (blocked/error), so gate on the structured status, not is_error —
+        # else a blocked commit would surface an unrelated prior HEAD commit as
+        # this turn's evidence.
+        committed_this_turn = any(
+            isinstance(c, dict)
+            and str(c.get("tool") or "") in ("commit_reviewed", "vcs_commit_reviewed")
+            and str(c.get("status") or "") == "ok"
+            for c in (llm_trace.get("tool_calls") or [])
+        )
         evidence = {
             "task_id": task_id,
             "task_type": task_type,
             "tool_calls": llm_trace.get("tool_calls") or [],
             "reasoning_notes": llm_trace.get("reasoning_notes") or [],
+            "repo_diff": collect_turn_diff(tools._ctx, include_recent_commit=committed_this_turn),
         }
         slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
-        min_successful = 2 if len(slots) >= 3 else max(1, len(slots))
+        min_successful = adaptive_quorum(len(slots))
         request = ReviewRequest(
             surface="task_acceptance",
             goal=_extract_plain_text_from_content(messages[1].get("content")) if len(messages) > 1 else "",
@@ -632,7 +652,12 @@ def _run_task_acceptance_review_once(
             ),
             policy={
                 "verdict_is_advisory": True,
-                "full_output_enters_context": True,
+                # advisory_visible: the FULL review stays on the objective axis;
+                # only a compact improvement capsule (not the raw output) is fed
+                # back to the agent — so "full output does not enter context" is
+                # still truthful to the reviewer.
+                "full_output_enters_context": False,
+                "hardness": HARDNESS_ADVISORY_VISIBLE,
                 "min_successful_slots": min_successful,
                 "fail_closed_on_errors": True,
                 "classify_outcome_tier": True,
@@ -645,20 +670,46 @@ def _run_task_acceptance_review_once(
             drive_root=pathlib.Path(drive_root) if drive_root is not None else pathlib.Path(tools._ctx.drive_root),
             usage_ctx=tools._ctx,
         )
-        payload = json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str)
-        messages.append({"role": "assistant", "content": content or ""})
-        _append_or_merge_user_message(
-            messages,
-            "[TASK ACCEPTANCE REVIEW]\n"
-            "The following full reviewer output is advisory. Deliver your actual answer/result to the "
-            "user, revised only if a finding is valid; if a finding is wrong, reject it with evidence. "
-            "Do NOT replace your user-facing answer with a status report about this review unless the "
-            "user explicitly asked for one.\n\n"
-            f"{payload}",
-        )
-        llm_trace.setdefault("review_runs", []).append(result.__dict__)
-        emit_progress("Task acceptance review completed; reviewer output injected before final response.")
-        return True
+        # Record the full verdict on the objective axis (audit/status), then feed
+        # the agent a COMPACT improvement capsule (not the raw review) so a real
+        # best_effort/blocked_with_evidence gets ONE bounded chance to improve.
+        # _task_acceptance_reviewed (set above) caps it to a single pass; the
+        # capsule is anti-derailment framed ("revise only if useful, don't mention
+        # the review"), which is what the old full-output re-loop lacked when it
+        # tanked metrics. An empty capsule (solved / nothing actionable) finalizes.
+        run_record = result.__dict__
+        llm_trace.setdefault("review_runs", []).append(run_record)
+        capsule = build_improvement_capsule(result)
+        capsule_already_injected = bool(getattr(tools._ctx, "_task_acceptance_capsule_injected", False))
+        if capsule and not capsule_already_injected:
+            # ONE bounded improvement pass: inject the capsule and re-loop. Bound the
+            # CAPSULE (not the review) — we do NOT set _task_acceptance_reviewed here,
+            # so the REVISED final deliverable is reviewed once more and ITS verdict
+            # (not the pre-revision one) lands on the objective axis. The capsule is
+            # bounded to a single injection so the loop cannot derail into endless
+            # re-review even if the revision does further tool work. Mark THIS
+            # pre-revision run superseded so the objective reducer (which worst-cases
+            # across runs) does not let the stale FAIL poison the re-reviewed verdict;
+            # the run is kept in the trace for forensics.
+            run_record["superseded_by_revision"] = True
+            tools._ctx._task_acceptance_capsule_injected = True
+            # Preserve the model's just-produced final answer in the transcript
+            # before the capsule, like the sibling re-loop paths — so the revise
+            # round can actually revise its OWN deliverable, not reconstruct it.
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(messages, capsule)
+            emit_progress(f"Task acceptance review: {result.aggregate_signal} — improvement note fed back.")
+            return True
+        # Terminal review: nothing actionable, OR the one capsule was already spent on
+        # a prior pass. Record THIS (final-deliverable) verdict and finalize so the
+        # objective axis reflects the shipped answer, not a stale pre-revision one.
+        tools._ctx._task_acceptance_reviewed = True
+        if capsule:
+            emit_progress(f"Task acceptance review: {result.aggregate_signal} (improvement note already fed back; finalizing).")
+        else:
+            emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
+        return False
     except Exception as exc:
         if mode == "required":
             tools._ctx._task_acceptance_reviewed = True
@@ -676,20 +727,71 @@ def _run_task_acceptance_review_once(
                 "degraded": True,
                 "degraded_reasons": [f"{type(exc).__name__}: {safe_error}"],
             }
+            # Label-only: record the degraded review on the objective axis; do
+            # not inject it or force another round (same non-surrender rationale).
             llm_trace.setdefault("review_runs", []).append(degraded_result)
-            messages.append({"role": "assistant", "content": content or ""})
-            _append_or_merge_user_message(
-                messages,
-                "[TASK ACCEPTANCE REVIEW DEGRADED]\n"
-                "Required task acceptance review failed before reviewers returned. "
-                "This degraded review record is part of the task evidence; account for it "
-                "explicitly in your final response (it does not by itself make the work a "
-                "failure — deliver your actual result with the review gap noted).\n\n"
-                f"{json.dumps(degraded_result, ensure_ascii=False, indent=2)}",
-            )
-            return True
+            return False
         log.debug("Task acceptance review skipped after failure", exc_info=True)
         return False
+
+
+def _adopt_fallback_route(ctx: Any, fallback_model: str, fallback_use_local: bool,
+                          messages: List[Dict[str, Any]], fallback_messages: List[Dict[str, Any]]) -> tuple:
+    """Round-4 C1.1: adopt a SUCCESSFUL cross-family fallback as the active route for the
+    rest of the loop. Otherwise a subsequent round (esp. a tool loop) replays THIS
+    fallback's reasoning/thinking back to the original primary family with no
+    model-switch sanitizer firing (active_model never changed) — the cross-family
+    signature replay, in reverse. Adopting the sanitized transcript as canonical means
+    the switched route never carries the old family's provider-private blocks (a later
+    switch_model/override re-triggers the round-start sanitizer normally). Returns the
+    new ``(active_model, active_use_local)``."""
+    ctx.active_model = fallback_model
+    messages[:] = fallback_messages
+    return fallback_model, fallback_use_local
+
+
+def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content: Any) -> str:
+    """C3.4 pre-finalization child absorption: build the bounded subagent-handoff
+    reminder when a finished child's status/result changed since the last refresh, or
+    a nonterminal child is unacknowledged in the final text. Returns "" when there is
+    nothing to inject. Scans the SAME status root get_task_result uses
+    (budget_drive_root, not the forked drive_root — else nested grandchildren in
+    forked child drives are missed). Never raises."""
+    if drive_root is None or not task_id:
+        return ""
+    try:
+        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks, format_subagent_absorption_message
+
+        metadata = getattr(tools._ctx, "task_metadata", {}) if isinstance(getattr(tools._ctx, "task_metadata", {}), dict) else {}
+        status_drive_root = pathlib.Path(
+            str(metadata.get("budget_drive_root") or getattr(tools._ctx, "budget_drive_root", "") or "")
+            or drive_root
+        )
+        children = find_child_tasks(
+            status_drive_root,
+            parent_task_id=task_id,
+            root_task_id=str(metadata.get("root_task_id") or task_id),
+            exclude_task_id=task_id,
+        )
+        signature = "|".join(
+            f"{child.get('task_id') or child.get('id')}:{child.get('status')}:{len(str(child.get('result') or ''))}"
+            for child in children
+        )
+        previous = getattr(tools._ctx, "_subagent_handoff_signature", "")
+        nonterminal_children = [
+            child for child in children
+            if str(child.get("status") or "").strip().lower() not in FINAL_STATUSES
+        ]
+        needs_incomplete_ack = bool(nonterminal_children) and not _final_text_acknowledges_incomplete_children(content, nonterminal_children)
+        if children and signature and (signature != previous or needs_incomplete_ack):
+            tools._ctx._subagent_handoff_signature = signature
+            _absorb_budget = 160_000 if str(get_context_mode()).lower() == "max" else 60_000
+            return format_subagent_absorption_message(
+                children, parent_task_id=task_id, budget_chars=_absorb_budget,
+            )
+    except Exception:
+        log.debug("Failed to build subagent handoff reminder", exc_info=True)
+    return ""
 
 
 def _maybe_inject_self_check(
@@ -762,13 +864,17 @@ def _maybe_inject_time_budget_milestone(
     event_queue: Optional[queue.Queue] = None,
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
+    round_idx: int = 0,
+    accumulated_usage: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Inject deadline-awareness at 50/25/10% remaining, never per-round."""
+    """Inject deadline-awareness at 50/25/10% remaining, never per-round.
+
+    With no deadline_at (headless/benchmark runs), fall back to intrinsic
+    self-pacing: surface the agent's OWN elapsed wall-clock / rounds / cost at a
+    fixed cadence so it can decide when to wrap up. Both are ADVISORY — the model
+    judges when to finalize; neither is a deterministic stop gate (P5)."""
     meta = getattr(tools._ctx, "task_metadata", {})
     if not isinstance(meta, dict):
-        return False
-    deadline = parse_deadline_ts(meta.get("deadline_at"))
-    if deadline is None:
         return False
     created = parse_deadline_ts(meta.get("created_at") or meta.get("started_at"))
     if created is None:
@@ -777,6 +883,13 @@ def _maybe_inject_time_budget_milestone(
             created = utc_now()
             tools._ctx._time_budget_started_at = created
     now = utc_now()
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    if deadline is None:
+        return _maybe_inject_intrinsic_pacing(
+            messages, tools, created=created, now=now, round_idx=round_idx,
+            accumulated_usage=accumulated_usage, event_queue=event_queue,
+            task_id=task_id, drive_logs=drive_logs,
+        )
     total = max(1.0, (deadline - created).total_seconds())
     remaining = (deadline - now).total_seconds()
     fraction_remaining = 0.0 if remaining <= 0 else remaining / total
@@ -821,20 +934,92 @@ def _maybe_inject_time_budget_milestone(
     return True
 
 
-def _no_response_failure_text(
-    active_model: str,
-    active_use_local: bool,
-    max_retries: int,
+def _inject_round_checkpoints(
+    *,
+    round_idx: int,
+    max_rounds: int,
+    messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
-) -> str:
-    """Final failure text when the model gave no response and no distinct fallback exists."""
-    attempts_used = int(accumulated_usage.get("_llm_attempts_used") or max_retries)
-    local_tag = " (local)" if active_use_local else ""
-    return (
-        f"⚠️ Failed to get a response from model {active_model}{local_tag} after {attempts_used} attempts. "
-        f"No viable fallback model configured.{_provider_failure_hint(accumulated_usage)} "
-        f"{_provider_recovery_hint(accumulated_usage)}"
+    emit_progress: Callable[[str], None],
+    tools: ToolRegistry,
+    event_queue: Optional[queue.Queue],
+    task_id: str,
+    drive_logs: Optional[pathlib.Path],
+) -> bool:
+    """Inject the per-round self-check and the time-budget / intrinsic-pacing
+    milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
+    normal user turn). Returns whether any was injected (routine compaction is
+    skipped that round when so)."""
+    checkpoint = _maybe_inject_self_check(
+        round_idx, max_rounds, messages, accumulated_usage, emit_progress,
+        event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
+    time_budget = _maybe_inject_time_budget_milestone(
+        messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
+        round_idx=round_idx, accumulated_usage=accumulated_usage,
+    )
+    return bool(checkpoint or time_budget)
+
+
+def _maybe_inject_intrinsic_pacing(
+    messages: List[Dict[str, Any]],
+    tools: ToolRegistry,
+    *,
+    created,
+    now,
+    round_idx: int,
+    accumulated_usage: Optional[Dict[str, Any]],
+    event_queue: Optional[queue.Queue],
+    task_id: str,
+    drive_logs: Optional[pathlib.Path],
+) -> bool:
+    """No deadline: surface the agent's OWN elapsed / rounds / cost periodically.
+
+    ADVISORY only — this gives the one mind awareness so IT can choose to wrap up.
+    There is deliberately no deterministic time/round/cost stop here: finalization
+    is P5-named semantic behavior and stays the model's judgment."""
+    interval = get_pacing_interval_sec()
+    if interval <= 0:
+        return False
+    elapsed = max(0.0, (now - created).total_seconds())
+    bucket = int(elapsed // interval)
+    if bucket <= 0:
+        return False
+    last_bucket = getattr(tools._ctx, "_pacing_bucket_seen", 0)
+    if bucket <= last_bucket:
+        return False
+    tools._ctx._pacing_bucket_seen = bucket
+    cost = float((accumulated_usage or {}).get("cost") or 0.0)
+    _append_or_merge_user_message(
+        messages,
+        (
+            f"[PACING — ~{elapsed/60:.0f} min elapsed]\n"
+            f"Rounds so far: {round_idx} | Elapsed: ~{elapsed/60:.1f} min | Cost so far: ~${cost:.2f}\n"
+            "Planning context, not a command to stop. Periodically confirm you are still on the "
+            "shortest path to a verifiable result; if a passing artifact or service already exists, "
+            "prefer preserving and verifying it over speculative improvements."
+        ),
+    )
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+        "checkpoint_kind": "intrinsic_pacing",
+        "elapsed_sec": round(elapsed, 3),
+        "rounds": int(round_idx),
+        "cost": round(cost, 4),
+    })
+    return True
+
+
+def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
+    """Last real assistant text already produced this task — salvaged into the
+    terminal answer when provider-death prevents a fresh final response, so
+    useful work is never silently discarded (workspace files persist on disk
+    regardless)."""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
 
 
 def _task_deadline_epoch(tools: ToolRegistry) -> Optional[float]:
@@ -1040,11 +1225,12 @@ def _run_round_compaction(
     """Run at most one transcript compaction for this round.
 
     Manual (pending) and emergency compaction always run; routine compaction
-    covers local/low-context lanes plus known small-window (<=260K) remote
-    models, and is skipped on self-check checkpoint rounds to avoid a
-    duplicate summarizer call. Each branch persists a forensic checkpoint
-    before compacting (P1: no silent truncation). Returns the possibly-rebound
-    message list and any compaction usage record.
+    covers the local lane and owner low context mode (v6.33.0: mode is the SSOT —
+    the per-model small-window remote override was removed with the static window
+    table), and is skipped on self-check checkpoint rounds to avoid a duplicate
+    summarizer call. Each branch persists a forensic checkpoint before compacting
+    (P1: no silent truncation). Returns the possibly-rebound message list and any
+    compaction usage record.
     """
     pending_compaction = getattr(ctx.tools._ctx, "_pending_compaction", None)
     if pending_compaction is not None:
@@ -1064,18 +1250,12 @@ def _run_round_compaction(
         ctx.emit_progress("⚠️ Context compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
 
+    # The owner low/max context MODE is the SSOT for the agent's own operating
+    # window (BIBLE P1, v6.33.0): low => 400K-char emergency trigger + routine
+    # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
+    # window table; the reactive provider-overflow detector (context.py) drops the
+    # agent to low mode if a route's real window turns out smaller than assumed.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    # Window-fit: when the active remote model's window is known, tighten the
-    # trigger to fit it (profile constant stays the ceiling — never raised).
-    # A 200K-window model in max mode previously kept the 1.2M-char trigger and
-    # overflowed the provider long before emergency compaction ever fired.
-    window_tokens = 0
-    if not ctx.active_use_local:
-        from ouroboros.context_budget import WINDOW_EMERGENCY_COMPACTION_FRACTION
-        from ouroboros.provider_models import context_window_tokens
-        window_tokens = context_window_tokens(ctx.active_model)
-        if window_tokens > 0:
-            emergency_chars = min(emergency_chars, int(window_tokens * 4 * WINDOW_EMERGENCY_COMPACTION_FRACTION))
     if _estimate_messages_chars(messages) > emergency_chars:
         # keep_recent must stay BELOW the current span count or the compactor
         # no-ops (len(spans) <= keep_recent returns as-is): a transcript over
@@ -1099,15 +1279,10 @@ def _run_round_compaction(
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
 
-    # Routine remote compaction runs only when local, in low context mode, or on
-    # a small-window remote model; never on checkpoint rounds. Max with a big
-    # window relies on emergency compaction to preserve prompt-cache hits.
-    if ctx.active_context_mode != "low" and not ctx.active_use_local and window_tokens > 0:
-        from ouroboros.context_budget import SMALL_WINDOW_ROUTINE_COMPACTION_TOKENS
-        small_window_remote = window_tokens <= SMALL_WINDOW_ROUTINE_COMPACTION_TOKENS
-    else:
-        small_window_remote = False
-    if not ctx.checkpoint_injected and (ctx.active_use_local or ctx.active_context_mode == "low" or small_window_remote):
+    # Routine compaction runs only when local or in low context mode; never on
+    # checkpoint rounds. Max mode relies on emergency compaction alone to preserve
+    # prompt-cache hits (mode is the SSOT — no per-model small-window override).
+    if not ctx.checkpoint_injected and (ctx.active_use_local or ctx.active_context_mode == "low"):
         if ctx.round_idx > 6 and len(messages) > 40:
             if _persist_compaction_checkpoint(
                 messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
@@ -1139,6 +1314,9 @@ class _RoundLimitContext:
     active_use_local: bool
     max_rounds: int
     deadline_ts: Optional[float] = None
+    # Drive root for durable salvage (latest_llm_response_text) on the provider-death
+    # path; optional so existing positional construction stays valid.
+    drive_root: Optional[pathlib.Path] = None
 
 
 def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -1167,6 +1345,80 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
         "result is the expected outcome here, not a failure."
     )
     return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="finalization_grace")
+
+
+def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Provider-death terminalization (P2 unified best-effort shelf): the model
+    returned no usable response after the transport same-model reroute + retries
+    (+ any configured cross-model fallback). Join the SAME honest best-effort
+    shelf as deadline/budget/round-limit instead of discarding workspace state
+    with a bare error string — one tool-less final answer (which itself benefits
+    from the same-model reroute) and, failing that, the last assistant text
+    already produced."""
+    salvaged = _last_assistant_text(ctx.messages)
+    if not salvaged and ctx.drive_root is not None:
+        # B2: the current (possibly compacted) transcript may no longer hold the
+        # last useful assistant text, but every LLM round was persisted — fall back
+        # to the durable salvage source named by the plan (latest_llm_response_text).
+        try:
+            from ouroboros.observability import latest_llm_response_text
+            salvaged = latest_llm_response_text(pathlib.Path(ctx.drive_root), ctx.task_id) or ""
+        except Exception:
+            log.debug("latest_llm_response_text salvage failed", exc_info=True)
+    if salvaged:
+        fallback = salvaged
+    else:
+        fallback = (
+            "⚠️ The model provider returned no usable response after retries and same-model reroute."
+            f"{_provider_failure_hint(ctx.accumulated_usage)}{_provider_recovery_hint(ctx.accumulated_usage)} "
+            "Any files written so far are preserved in the workspace."
+        )
+    prompt = (
+        "[PROVIDER_UNAVAILABLE] The model provider failed to return a usable response. "
+        "Produce your best final answer NOW from the verified work so far; clearly mark "
+        "anything unverified or incomplete. An honest best-effort result is expected here, not a failure."
+    )
+    return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable")
+
+
+def _maybe_deadline_local_finalize(
+    ctx: _RoundLimitContext, tools: ToolRegistry
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Loop-local graceful finalization on a REAL task deadline.
+
+    Headless runs (benchmarks, harbor) frequently get no supervisor finalize_now:
+    the process is simply killed at the deadline, discarding any best-effort
+    artifact. When a real deadline_at is set and less than the finalization-grace
+    window remains, self-finalize one tool-less best answer here — independent of
+    the supervisor — so a deadline NEVER returns emptiness. Never fires without a
+    real deadline_at (no synthesized deadline; leaderboard timeouts stay legal)."""
+    meta = getattr(tools._ctx, "task_metadata", {})
+    if not isinstance(meta, dict):
+        return None
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    if deadline is None:
+        return None
+    remaining = (deadline - utc_now()).total_seconds()
+    if remaining > float(get_finalization_grace_sec()):
+        return None
+    prompt = (
+        f"[DEADLINE] The task deadline ({meta.get('deadline_at')}) is ~{max(0.0, remaining)/60:.1f} min away "
+        "and the run will stop at it. Produce your best final answer NOW from the verified work so far; "
+        "clearly mark anything unverified or incomplete. An honest best-effort result is the expected "
+        "outcome here, not a failure."
+    )
+    fallback = "⚠️ Task reached its deadline; local finalization produced no answer."
+    return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="deadline_local")
+
+
+def _maybe_early_finalize(
+    limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any]
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """One early-exit gate per round: supervisor finalize_now first, then a
+    loop-local real-deadline finalize. Returns the forced answer or None."""
+    if controls.get("finalize_now"):
+        return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
+    return _maybe_deadline_local_finalize(limit_ctx, tools)
 
 
 def _forced_final_answer(
@@ -1220,6 +1472,87 @@ def _apply_runtime_overrides(
         active_effort = normalize_reasoning_effort(ctx.active_effort_override, default=active_effort)
         ctx.active_effort_override = None
     return active_model, active_use_local, active_effort
+
+
+def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "") -> str:
+    """CW2 (v6.34.0): enforce the max-mode contract at the point of USE. Max is kept
+    only when the ACTUAL active route — remote OR local (USE_LOCAL_MAIN, a local model,
+    or a per-task switch_model override) — carries confirmed >=1M Capability Evidence
+    (read-only, no network on the hot path). Local routes are probed for their local
+    n_ctx, NOT skipped (CW7) — a 16K local model under OUROBOROS_CONTEXT_MODE=max must
+    still fall back to low. Fail-closed to low on any unconfirmed/unprobeable route or
+    probe error (BIBLE P1 cognitive-horizon). Composes with the reactive provider-
+    overflow fallback; this is the preflight gate (settings-save only checks at write)."""
+    if mode != "max":
+        return mode
+    try:
+        from ouroboros.gateway.settings import _active_route_confirms_max
+        if not _active_route_confirms_max(model=model, use_local=use_local):
+            log.info(
+                "Max context mode is not confirmed >=1M for the active route "
+                "(use_local=%s); using low-mode compaction for this task (fail-closed, CW2).",
+                use_local,
+            )
+            return "low"
+    except Exception:
+        log.debug("CW2 max-mode capability check failed; fail-closed to low", exc_info=True)
+        return "low"
+    return mode
+
+
+def _apply_overrides_and_regate_mode(ctx, active_model, active_use_local, active_effort, active_context_mode):
+    """Apply per-round runtime overrides, then re-gate max-mode at point-of-use if the
+    active route changed (a mid-loop switch_model / local-route change — the start-of-
+    loop gate only saw the initial route). Fail-closed to low (CW2)."""
+    _route_before = (active_model, active_use_local)
+    active_model, active_use_local, active_effort = _apply_runtime_overrides(
+        ctx, active_model, active_use_local, active_effort,
+    )
+    if (active_model, active_use_local) != _route_before:
+        active_context_mode = _maybe_downgrade_max_unconfirmed(
+            get_context_mode(), active_use_local, active_model,
+        )
+    return active_model, active_use_local, active_effort, active_context_mode
+
+
+def _visible_round_text(content: Any) -> str:
+    """The round's visible assistant text as a plain string. A provider may return ``content`` as
+    a string OR a list of typed blocks; collect the ``text`` of every block EXCEPT reasoning ones
+    (Anthropic ``thinking``/``redacted_thinking``, Gemini ``part.thought``) — the exact complement
+    of extract_display_reasoning. A regular Gemini part carries ``text`` with NO ``type``, so keying
+    on the ABSENCE of a reasoning marker (not on ``type == 'text'``) avoids dropping real answer
+    text; a non-empty block list never stringifies to a raw Python repr, and a thinking-only list
+    correctly reads as 'no visible text' (letting narration fall back to readable reasoning)."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        out: List[str] = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("type") or "") in ("thinking", "reasoning", "redacted_thinking") or b.get("thought") is True:
+                continue  # reasoning/thinking blocks are display reasoning, not visible answer text
+            txt = b.get("text")
+            if isinstance(txt, str):
+                out.append(txt)
+        return "".join(out).strip()
+    return ""
+
+
+def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_trace: Dict[str, Any]) -> None:
+    """Emit the round's progress bubble: the visible assistant text, or — for a pure tool-call round
+    with no visible text — readable reasoning the provider already returned. The reasoning fallback
+    is DISPLAY-ONLY: emitted to the UI bubble but NOT recorded in ``reasoning_notes`` (which feeds
+    build_trace_summary / task summaries) and never appended to the transcript, so it cannot leak out
+    of the display path into the durable trace or back to a provider. Gated by OUROBOROS_REASONING_SUMMARY."""
+    visible_text = _visible_round_text(content)
+    if visible_text:
+        emit_progress(visible_text)
+        llm_trace["reasoning_notes"].append(visible_text)
+    elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
+        display_reasoning = LLMClient.extract_display_reasoning(msg)
+        if display_reasoning:
+            emit_progress(display_reasoning)
 
 
 def run_llm_loop(
@@ -1291,8 +1624,8 @@ def _run_llm_loop_impl(
         active_use_local = bool(ctx.task_use_local_override)
     else:
         active_use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
-    # Low context mode compacts the transcript sooner and enables remote routine compaction.
-    active_context_mode = get_context_mode()
+    # CW2: max-mode enforced at point-of-USE — fail-closed to low if the active route (incl. local n_ctx) no longer confirms >=1M (not just at settings-save); low-mode also compacts sooner.
+    active_context_mode = _maybe_downgrade_max_unconfirmed(get_context_mode(), active_use_local, active_model)
 
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
@@ -1332,9 +1665,21 @@ def _run_llm_loop_impl(
             _round_span_cm.__enter__()
 
             ctx = tools._ctx
-            active_model, active_use_local, active_effort = _apply_runtime_overrides(
-                ctx, active_model, active_use_local, active_effort,
+            _prev_active_model = active_model
+            active_model, active_use_local, active_effort, active_context_mode = _apply_overrides_and_regate_mode(
+                ctx, active_model, active_use_local, active_effort, active_context_mode,
             )
+            if active_model != _prev_active_model:
+                # A cross-FAMILY switch_model / per-task override mid-conversation:
+                # proactively strip the prior family's provider-private reasoning/
+                # thinking blocks from the canonical history so the new family does
+                # not 400 on a signature it cannot validate (stripping is always
+                # safe — it loses only reasoning continuity). Same family is a no-op.
+                _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
+                if _sanitized is not messages:
+                    messages[:] = _sanitized
+            ctx.active_context_mode = active_context_mode  # CW2: switch_model reads this to refuse a sub-1M switch while max-sized
+            ctx.active_model = active_model  # publish the round's REAL model (incl. switch_model / per-task override) so tools (native screenshot vision-routing) don't read the stale global OUROBOROS_MODEL env
 
             # One forced-wrap-up context per round: consumed by the round-limit
             # path and the supervisor finalize_now control path below.
@@ -1342,27 +1687,26 @@ def _run_llm_loop_impl(
                 messages, llm, active_model, active_effort, max_retries,
                 drive_logs, task_id, round_idx, event_queue,
                 accumulated_usage, task_type, active_use_local, MAX_ROUNDS,
-                deadline_ts=_task_deadline_epoch(tools),
+                deadline_ts=_task_deadline_epoch(tools), drive_root=drive_root,
             )
             if round_idx > MAX_ROUNDS:
                 text, accumulated_usage, _ = _handle_round_limit(limit_ctx)
                 return text, accumulated_usage, llm_trace
 
             _controls = _drain_incoming_messages(messages, incoming_messages, drive_root, task_id, event_queue, _owner_msg_seen)
-            if _controls.get("finalize_now"):
-                text, accumulated_usage, _ = _handle_forced_finalization(limit_ctx, str(_controls["finalize_now"]))
+            # Early-exit per round: supervisor finalize_now, else loop-local real-
+            # deadline finalize (headless runs that get no finalize_now) — finalize
+            # best-effort rather than be killed mid-step with nothing.
+            _early_final = _maybe_early_finalize(limit_ctx, tools, _controls)
+            if _early_final is not None:
+                text, accumulated_usage, _ = _early_final
                 return text, accumulated_usage, llm_trace
 
-            # Inject after owner messages so the checkpoint is the LLM-call tail.
-            # It is a normal user turn; only routine compaction is skipped below.
-            _checkpoint_injected = _maybe_inject_self_check(
-                round_idx, MAX_ROUNDS, messages, accumulated_usage, emit_progress,
+            _checkpoint_injected = _inject_round_checkpoints(
+                round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages,
+                accumulated_usage=accumulated_usage, emit_progress=emit_progress, tools=tools,
                 event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
             )
-            _time_budget_injected = _maybe_inject_time_budget_milestone(
-                messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-            )
-            _checkpoint_injected = bool(_checkpoint_injected or _time_budget_injected)
 
             messages, _compaction_usage = _run_round_compaction(
                 messages,
@@ -1382,6 +1726,7 @@ def _run_llm_loop_impl(
             )
             if tools._ctx.messages is not messages:
                 tools._ctx.messages = messages
+            limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
             if _compaction_usage:
                 add_usage(accumulated_usage, _compaction_usage)
                 _cm = get_light_model()
@@ -1406,27 +1751,40 @@ def _run_llm_loop_impl(
 
             if msg is None:
                 fallback_model = os.environ.get("OUROBOROS_MODEL_FALLBACK", "").strip()
-                if not fallback_model or fallback_model == active_model:
-                    failure = _no_response_failure_text(active_model, active_use_local, max_retries, accumulated_usage)
-                    return failure, accumulated_usage, llm_trace
-
-                fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
-                primary_tag = " (local)" if active_use_local else ""
-                fallback_tag = " (local)" if fallback_use_local else ""
-                emit_progress(f"⚡ Fallback: {active_model}{primary_tag} → {fallback_model}{fallback_tag} after empty response")
-                msg, fallback_cost = call_llm_with_retry(
-                    llm, messages, fallback_model, tool_schemas, active_effort,
-                    max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
-                    use_local=fallback_use_local,
-                    deadline_ts=_task_deadline_epoch(tools),
-                )
+                if fallback_model and fallback_model != active_model:
+                    # Existing real-user cross-model resilience (the bench disables
+                    # it via fallback==main); try it before best-effort salvage.
+                    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+                    primary_tag = " (local)" if active_use_local else ""
+                    fallback_tag = " (local)" if fallback_use_local else ""
+                    emit_progress(f"⚡ Fallback: {active_model}{primary_tag} → {fallback_model}{fallback_tag} after empty response")
+                    # Cross-FAMILY fallback must not replay the primary model's
+                    # provider-private reasoning/thinking blocks to a different
+                    # family — that is the GLM->Claude 400 "Invalid signature in
+                    # thinking block" death. SSOT sanitizer returns the canonical
+                    # list unchanged on a same-family switch, a sanitized copy
+                    # otherwise; call_llm_with_retry only reads, so the canonical
+                    # `messages` keeps accumulating the fallback's response below.
+                    fallback_messages = LLMClient.sanitize_reasoning_on_model_switch(
+                        messages, active_model, fallback_model
+                    )
+                    msg, fallback_cost = call_llm_with_retry(
+                        llm, fallback_messages, fallback_model, tool_schemas, active_effort,
+                        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
+                        use_local=fallback_use_local,
+                        deadline_ts=_task_deadline_epoch(tools),
+                    )
+                    if msg is not None:
+                        active_model, active_use_local = _adopt_fallback_route(
+                            ctx, fallback_model, fallback_use_local, messages, fallback_messages
+                        )
 
                 if msg is None:
-                    return (
-                        f"⚠️ All models are down. Primary ({active_model}{primary_tag}) and fallback ({fallback_model}{fallback_tag}) "
-                        f"both returned no response. Stopping.{_provider_failure_hint(accumulated_usage)} "
-                        f"{_provider_recovery_hint(accumulated_usage)}"
-                    ), accumulated_usage, llm_trace
+                    # Provider-death: join the unified honest best-effort shelf
+                    # (deadline/budget/round-limit) instead of discarding useful
+                    # workspace state with a bare error string.
+                    text, accumulated_usage, _ = _handle_provider_unavailable(limit_ctx)
+                    return text, accumulated_usage, llm_trace
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
@@ -1435,9 +1793,9 @@ def _run_llm_loop_impl(
                     attempts = int(getattr(tools._ctx, "_force_plan_reminder_count", 0) or 0)
                     if attempts >= 2:
                         accumulated_usage["execution_status"] = "failed"
-                        accumulated_usage["reason_code"] = "consilium_force_plan_not_called"
+                        accumulated_usage["reason_code"] = "swarm_force_plan_not_called"
                         return (
-                            "⚠️ CONSILIUM_FORCE_PLAN_BLOCKED: plan_task was required for this Consilium task but was not called.",
+                            "⚠️ SWARM_INITIATIVE_BLOCKED: plan_task was required for this swarm task but was not called.",
                             accumulated_usage,
                             llm_trace,
                         )
@@ -1446,39 +1804,13 @@ def _run_llm_loop_impl(
                         messages.append({"role": "assistant", "content": content})
                     _append_or_merge_user_message(
                         messages,
-                        "[CONSILIUM_FORCE_PLAN] plan_task is required before finalizing this task. "
+                        "[SWARM_INITIATIVE] plan_task is required before finalizing this task. "
                         "Call plan_task now with an appropriate context_level, then continue.",
                     )
-                    emit_progress("Consilium force-plan reminder injected before final response.")
-                    llm_trace["reasoning_notes"].append("Consilium force-plan reminder injected before final response.")
+                    emit_progress("Swarm force-plan reminder injected before final response.")
+                    llm_trace["reasoning_notes"].append("Swarm force-plan reminder injected before final response.")
                     continue
-                handoff_msg = ""
-                if drive_root is not None and task_id:
-                    try:
-                        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks, format_handoff_message
-
-                        metadata = getattr(tools._ctx, "task_metadata", {}) if isinstance(getattr(tools._ctx, "task_metadata", {}), dict) else {}
-                        children = find_child_tasks(
-                            drive_root,
-                            parent_task_id=task_id,
-                            root_task_id=str(metadata.get("root_task_id") or task_id),
-                            exclude_task_id=task_id,
-                        )
-                        signature = "|".join(
-                            f"{child.get('task_id') or child.get('id')}:{child.get('status')}:{len(str(child.get('result') or ''))}"
-                            for child in children
-                        )
-                        previous = getattr(tools._ctx, "_subagent_handoff_signature", "")
-                        nonterminal_children = [
-                            child for child in children
-                            if str(child.get("status") or "").strip().lower() not in FINAL_STATUSES
-                        ]
-                        needs_incomplete_ack = bool(nonterminal_children) and not _final_text_acknowledges_incomplete_children(content, nonterminal_children)
-                        if children and signature and (signature != previous or needs_incomplete_ack):
-                            tools._ctx._subagent_handoff_signature = signature
-                            handoff_msg = format_handoff_message(children)
-                    except Exception:
-                        log.debug("Failed to build subagent handoff reminder", exc_info=True)
+                handoff_msg = _compute_subagent_handoff(tools, drive_root, task_id, content)
                 if handoff_msg:
                     if content and content.strip():
                         messages.append({"role": "assistant", "content": content})
@@ -1514,10 +1846,7 @@ def _run_llm_loop_impl(
             assistant_msg.setdefault("role", "assistant")
             messages.append(assistant_msg)
 
-            progress_text = str(content or "").strip()
-            if progress_text:
-                emit_progress(progress_text.strip())
-                llm_trace["reasoning_notes"].append(progress_text.strip())
+            _emit_round_progress(content, msg, emit_progress, llm_trace)
 
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,

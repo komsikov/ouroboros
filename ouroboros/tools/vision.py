@@ -7,12 +7,10 @@ import pathlib
 import os
 from typing import Any, Dict, List, Tuple
 
-from ouroboros.config import SETTINGS_DEFAULTS, resolve_effort
+from ouroboros.config import resolve_effort
 from ouroboros.tools.registry import ToolContext, ToolEntry
 
 log = logging.getLogger(__name__)
-
-_DEFAULT_VLM_MODEL = SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
 
 
 def _get_llm_client():
@@ -32,7 +30,9 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
 
     try:
         client = _get_llm_client()
-        vlm_model = _resolve_vlm_model(client, model)
+        vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
+        if not vlm_model:
+            return _VLM_NO_VISION_MODEL_MSG
         text, usage = client.vision_query(
             prompt=prompt,
             images=[_image_payload_from_base64(b64, "image/png")],
@@ -143,23 +143,95 @@ def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
     return _image_payload_from_bytes(raw, mime)
 
 
-def _resolve_vlm_model(client: Any, requested_model: str = "") -> str:
-    model = str(requested_model or "").strip()
-    if model:
-        return model
+_VLM_NO_VISION_MODEL_MSG = (
+    "⚠️ VLM_NO_VISION_MODEL: image analysis is unavailable — neither the active "
+    "model nor any configured vision slot (light/code/main/fallback) accepts image "
+    "input. Do NOT retry the image. Instead inspect the page as TEXT/DOM "
+    "(browse_page output='html' or 'text') and the console/network for errors, or "
+    "switch_model to a vision-capable model, or ask the owner to configure one."
+)
+
+
+def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
+    """Configured models that may serve a VLM sub-call, most-local/cheapest first
+    (active task model -> light -> code -> main -> fallback). Reviewer/scope slots
+    are deliberately NOT poached. De-duplicated, order-preserving, empties dropped."""
+    out: List[str] = [
+        str(getattr(ctx, "active_model", "") or getattr(ctx, "task_model_override", "") or "").strip(),
+    ]
     try:
-        return str(client.default_model() or "").strip() or _DEFAULT_VLM_MODEL
+        # Resolve the light + code slots through their configured defaults (P7), not a
+        # bare env read — the code slot has a SETTINGS_DEFAULTS fallback the raw env
+        # read would otherwise drop when OUROBOROS_MODEL_CODE is unset.
+        from ouroboros.config import SETTINGS_DEFAULTS, get_light_model
+        out.append(str(get_light_model() or "").strip())
+        out.append(str(
+            os.environ.get("OUROBOROS_MODEL_CODE", "")
+            or SETTINGS_DEFAULTS.get("OUROBOROS_MODEL_CODE", "")
+            or ""
+        ).strip())
     except Exception:
-        return os.environ.get("OUROBOROS_MODEL", _DEFAULT_VLM_MODEL)
+        out.append(str(os.environ.get("OUROBOROS_MODEL_CODE", "") or "").strip())
+    try:
+        out.append(str(client.default_model() or "").strip())
+    except Exception:
+        pass
+    out.append(str(os.environ.get("OUROBOROS_MODEL", "") or "").strip())
+    out.append(str(os.environ.get("OUROBOROS_MODEL_FALLBACK", "") or "").strip())
+    seen: set = set()
+    uniq: List[str] = []
+    for model in out:
+        if model and model not in seen:
+            seen.add(model)
+            uniq.append(model)
+    return uniq
 
 
-def _allowed_file_roots() -> List["pathlib.Path"]:
-    """Return uploads roots allowed for VLM file_path reads."""
+def _resolve_vlm_model(client: Any, requested_model: str = "", *, ctx: Any = None) -> str:
+    """Resolve a VISION-CAPABLE model for an image sub-call, or "" when none is
+    available. An explicit requested model is honored ONLY if it actually supports
+    vision (else "" -> the caller surfaces a typed capability gap, never a blind 404
+    that the loop then bangs on). Otherwise route to the first vision-capable
+    configured slot (active -> light -> code -> main -> fallback) — gemini light/code
+    are vision-capable, so this usually succeeds without any new model slot."""
+    from ouroboros.provider_models import supports_vision
+    requested = str(requested_model or "").strip()
+    if requested:
+        return requested if supports_vision(requested) else ""
+    for candidate in _vision_capable_slot_candidates(client, ctx):
+        if supports_vision(candidate):
+            return candidate
+    return ""
+
+
+def _allowed_file_roots(ctx: Any = None) -> List["pathlib.Path"]:
+    """Roots a VLM file_path may be read from: the uploads dir PLUS — same trust
+    boundary the agent already has via read_file/run_command — the ACTIVE task
+    workspace, so it can analyze a screenshot it just produced. Never arbitrary
+    filesystem paths (no exfiltration surface the agent doesn't already hold)."""
     import pathlib
     data_dir = os.environ.get("OUROBOROS_DATA_DIR", "")
     if data_dir:
-        return [pathlib.Path(data_dir).expanduser().resolve() / "uploads"]
-    return [pathlib.Path("~/Ouroboros/data/uploads").expanduser().resolve()]
+        roots = [pathlib.Path(data_dir).expanduser().resolve() / "uploads"]
+    else:
+        roots = [pathlib.Path("~/Ouroboros/data/uploads").expanduser().resolve()]
+    if ctx is not None:
+        try:
+            from ouroboros.tools.registry import active_repo_dir_for
+            roots.append(pathlib.Path(active_repo_dir_for(ctx)).expanduser().resolve())
+        except Exception:
+            pass
+        # C3: the active task's first-class artifact roots (artifact_store +
+        # task_drive) are the SAME trust boundary the agent already holds via
+        # read_file/run_command — so a screenshot it just registered as an artifact
+        # is readable too. Never arbitrary paths (no new exfiltration surface).
+        for _root in ("artifact_store", "task_drive"):
+            try:
+                from ouroboros.tool_access import resource_root_path
+                roots.append(pathlib.Path(resource_root_path(ctx, _root)).expanduser().resolve())
+            except Exception:
+                pass
+    return roots
 
 
 def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64: str = "", image_mime: str = "image/png", file_path: str = "", model: str = "") -> str:
@@ -174,12 +246,24 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
             fp = pathlib.Path(file_path).expanduser().resolve()
             if not fp.exists():
                 return f"⚠️ File not found: {file_path}"
-            allowed = _allowed_file_roots()
+            allowed = _allowed_file_roots(ctx)
             if not any(_path_is_under(fp, root) for root in allowed):
                 return (
-                    f"⚠️ file_path must be inside the uploads directory (data/uploads/). "
-                    f"Resolved path: {fp}. Use send_photo or read_file for other paths."
+                    f"⚠️ file_path must be inside the uploads directory or the active task "
+                    f"workspace. Resolved path: {fp}. Use send_photo or read_file for other paths."
                 )
+            # Honor the task protected-artifact policy: a workspace file may still be
+            # a black-box protected artifact whose bytes must not be read (same
+            # contract as read_file / query_code — protected_artifacts.block_reason_
+            # for_path with operation "read_bytes"). Without this, vlm_query would be
+            # a read_bytes bypass of task_contract.resource_policy.
+            try:
+                from ouroboros.protected_artifacts import block_reason_for_path
+                _artifact_block = block_reason_for_path(ctx, fp, "read_bytes")
+            except Exception:
+                _artifact_block = ""
+            if _artifact_block:
+                return _artifact_block
             if fp.stat().st_size > _VLM_MAX_FILE_BYTES:
                 return f"⚠️ File too large ({fp.stat().st_size} bytes). Max {_VLM_MAX_FILE_BYTES} bytes."
             try:
@@ -200,7 +284,9 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
             images.append(_image_payload_from_base64(image_base64, image_mime))
 
         client = _get_llm_client()
-        vlm_model = _resolve_vlm_model(client, model)
+        vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
+        if not vlm_model:
+            return _VLM_NO_VISION_MODEL_MSG
         text, usage = client.vision_query(
             prompt=prompt,
             images=images,
@@ -287,7 +373,7 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "file_path": {
                             "type": "string",
-                            "description": "Local file path to image (preferred — reads from disk, avoids base64 in arguments). Must be inside data/uploads/ directory.",
+                            "description": "Local file path to image (preferred — reads from disk, avoids base64 in arguments). Must be inside the uploads directory (data/uploads/) or the active task workspace.",
                         },
                         "image_url": {
                             "type": "string",
