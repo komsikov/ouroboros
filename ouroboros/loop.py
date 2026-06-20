@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import pathlib
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -750,6 +751,58 @@ def _adopt_fallback_route(ctx: Any, fallback_model: str, fallback_use_local: boo
     return fallback_model, fallback_use_local
 
 
+def _run_cross_model_fallback_chain(
+    *, llm, ctx, tools, messages, active_model, active_use_local, tool_schemas,
+    active_effort, max_retries, drive_logs, task_id, round_idx, event_queue,
+    accumulated_usage, task_type, emit_progress,
+) -> tuple:
+    """F1 (v6.39): 429-aware cross-model fallback CHAIN. Mark the failed primary on
+    cooldown if its last failure was transient (so a swarm stops stampeding it), then walk
+    the configured fallback chain, skipping cooled-down models, until one responds. Each
+    candidate gets a small per-candidate attempt cap so a multi-model chain cannot multiply
+    into a long retry storm; every call stays deadline-aware. The bench (FALLBACKS==main)
+    dedupes to an empty chain -> no cross-model fallback, by design. Returns the new
+    ``(msg, active_model, active_use_local)``; ``msg`` is None if the whole (cooled-down /
+    empty) chain is exhausted, leaving the caller to join the provider-unavailable shelf."""
+    from ouroboros import fallback_cooldown as _fcd
+    from ouroboros.config import get_fallback_models
+    from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
+
+    def _cooled(model: str, use_local: bool) -> None:
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") in _cooldown_kinds:
+            _fcd.mark_cooldown(model, use_local)
+
+    _cooled(active_model, active_use_local)
+    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+    attempt_cap = _fcd.attempts_per_model()
+    msg = None
+    for fallback_model in get_fallback_models(active_model):
+        if _fcd.is_cooling_down(fallback_model, fallback_use_local):
+            continue
+        deadline = _task_deadline_epoch(tools)
+        if deadline and time.time() >= deadline:
+            break
+        ptag = " (local)" if active_use_local else ""
+        ftag = " (local)" if fallback_use_local else ""
+        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}")
+        # Cross-FAMILY fallback must not replay the primary's provider-private reasoning to
+        # a different family (the GLM->Claude 400 "Invalid signature" death); the SSOT
+        # sanitizer is a no-op same-family.
+        fallback_messages = LLMClient.sanitize_reasoning_on_model_switch(messages, active_model, fallback_model)
+        msg, _cost = call_llm_with_retry(
+            llm, fallback_messages, fallback_model, tool_schemas, active_effort,
+            max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
+            use_local=fallback_use_local, deadline_ts=deadline, attempt_cap=attempt_cap,
+        )
+        if msg is not None:
+            active_model, active_use_local = _adopt_fallback_route(
+                ctx, fallback_model, fallback_use_local, messages, fallback_messages
+            )
+            break
+        _cooled(fallback_model, fallback_use_local)
+    return msg, active_model, active_use_local
+
+
 def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content: Any) -> str:
     """C3.4 pre-finalization child absorption: build the bounded subagent-handoff
     reminder when a finished child's status/result changed since the last refresh, or
@@ -1474,7 +1527,7 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "") -> str:
+def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "", *, allow_fetch: bool = False) -> str:
     """CW2 (v6.34.0): enforce the max-mode contract at the point of USE. Max is kept
     only when the ACTUAL active route — remote OR local (USE_LOCAL_MAIN, a local model,
     or a per-task switch_model override) — carries confirmed >=1M Capability Evidence
@@ -1487,7 +1540,7 @@ def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = ""
         return mode
     try:
         from ouroboros.gateway.settings import _active_route_confirms_max
-        if not _active_route_confirms_max(model=model, use_local=use_local):
+        if not _active_route_confirms_max(model=model, use_local=use_local, allow_fetch=allow_fetch):
             log.info(
                 "Max context mode is not confirmed >=1M for the active route "
                 "(use_local=%s); using low-mode compaction for this task (fail-closed, CW2).",
@@ -1625,7 +1678,34 @@ def _run_llm_loop_impl(
     else:
         active_use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
     # CW2: max-mode enforced at point-of-USE — fail-closed to low if the active route (incl. local n_ctx) no longer confirms >=1M (not just at settings-save); low-mode also compacts sooner.
-    active_context_mode = _maybe_downgrade_max_unconfirmed(get_context_mode(), active_use_local, active_model)
+    # H (v6.39): the start-of-loop gate does a LAZY probe-on-first-use (allow_fetch=True,
+    # once per task) so a genuine >=1M route is actually confirmed even when max is the
+    # default and the owner never toggled Low->Max; the per-round re-gate stays read-only.
+    # Single-flight: ONLY a root/non-subagent task fires the network probe — subagents
+    # stay read-only and share the parent's warm global Capability-Evidence store, so a
+    # swarm cannot stampede the route's /models endpoint (the root probes first).
+    _ctx_meta = getattr(ctx, "task_metadata", {})
+    _is_subagent = (
+        isinstance(_ctx_meta, dict)
+        and str(_ctx_meta.get("delegation_role") or "").strip().lower() == "subagent"
+    )
+    _preferred_context_mode = get_context_mode()
+    active_context_mode = _maybe_downgrade_max_unconfirmed(
+        _preferred_context_mode, active_use_local, active_model, allow_fetch=not _is_subagent,
+    )
+    if _preferred_context_mode == "max" and active_context_mode != "max":
+        # Observable effective-vs-preferred: the downgrade is no longer a silent log
+        # line. Keep type=task_checkpoint (+ checkpoint_kind) so it is BOTH broadcast
+        # live AND durably persisted to events.jsonl (the durable append is gated on
+        # type==task_checkpoint), matching every other checkpoint emitter.
+        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+            "checkpoint_kind": "context_mode_downgraded",
+            "preferred_mode": _preferred_context_mode,
+            "effective_mode": active_context_mode,
+            "model": active_model,
+            "use_local": active_use_local,
+            "reason": "route_unconfirmed_ge_1m",
+        })
 
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
@@ -1750,35 +1830,12 @@ def _run_llm_loop_impl(
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
             if msg is None:
-                fallback_model = os.environ.get("OUROBOROS_MODEL_FALLBACK", "").strip()
-                if fallback_model and fallback_model != active_model:
-                    # Existing real-user cross-model resilience (the bench disables
-                    # it via fallback==main); try it before best-effort salvage.
-                    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
-                    primary_tag = " (local)" if active_use_local else ""
-                    fallback_tag = " (local)" if fallback_use_local else ""
-                    emit_progress(f"⚡ Fallback: {active_model}{primary_tag} → {fallback_model}{fallback_tag} after empty response")
-                    # Cross-FAMILY fallback must not replay the primary model's
-                    # provider-private reasoning/thinking blocks to a different
-                    # family — that is the GLM->Claude 400 "Invalid signature in
-                    # thinking block" death. SSOT sanitizer returns the canonical
-                    # list unchanged on a same-family switch, a sanitized copy
-                    # otherwise; call_llm_with_retry only reads, so the canonical
-                    # `messages` keeps accumulating the fallback's response below.
-                    fallback_messages = LLMClient.sanitize_reasoning_on_model_switch(
-                        messages, active_model, fallback_model
-                    )
-                    msg, fallback_cost = call_llm_with_retry(
-                        llm, fallback_messages, fallback_model, tool_schemas, active_effort,
-                        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
-                        use_local=fallback_use_local,
-                        deadline_ts=_task_deadline_epoch(tools),
-                    )
-                    if msg is not None:
-                        active_model, active_use_local = _adopt_fallback_route(
-                            ctx, fallback_model, fallback_use_local, messages, fallback_messages
-                        )
-
+                msg, active_model, active_use_local = _run_cross_model_fallback_chain(
+                    llm=llm, ctx=ctx, tools=tools, messages=messages, active_model=active_model,
+                    active_use_local=active_use_local, tool_schemas=tool_schemas, active_effort=active_effort,
+                    max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
+                    event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
+                    emit_progress=emit_progress)
                 if msg is None:
                     # Provider-death: join the unified honest best-effort shelf
                     # (deadline/budget/round-limit) instead of discarding useful

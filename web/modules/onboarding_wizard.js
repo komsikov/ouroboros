@@ -231,7 +231,7 @@
         if (state.modelsDirty && !force) return;
         const defaults = MODEL_DEFAULTS[activeProviderProfile()] || MODEL_DEFAULTS.openrouter || {};
         state.mainModel = defaults.main || '';
-        state.codeModel = defaults.code || '';
+        state.heavyModel = defaults.heavy || '';
         state.lightModel = defaults.light || '';
         state.consciousnessModel = defaults.consciousness || '';
         state.fallbackModel = defaults.fallback || '';
@@ -264,8 +264,10 @@
     }
 
     function validateModelsStep() {
-        if (!trim(state.mainModel) || !trim(state.codeModel) || !trim(state.lightModel) || !trim(state.fallbackModel)) {
-            return 'Подтвердите все четыре модели перед запуском Ouroboros.';
+        // Обязательна только Основная модель: Heavy/Light опциональны (пусто = Main),
+        // а Fallback имеет значение по умолчанию. Не принуждаем заполнять все слоты.
+        if (!trim(state.mainModel)) {
+            return 'Подтвердите Основную модель перед запуском Ouroboros.';
         }
         return '';
     }
@@ -519,8 +521,8 @@
             ['Общий бюджет', formatUsd(state.totalBudget)],
             ['Мягкий порог на задачу', formatUsd(state.perTaskCostUsd)],
             ['Основная', trim(state.mainModel)],
-            ['Код', trim(state.codeModel)],
-            ['Лёгкая', trim(state.lightModel)],
+            ['Тяжёлая', trim(state.heavyModel) || '(использует Основную)'],
+            ['Лёгкая', trim(state.lightModel) || '(использует Основную)'],
             ['Запасная', trim(state.fallbackModel)],
         ];
         if (trim(state.openrouterKey)) rows.splice(1, 0, ['OpenRouter', 'настроен']);
@@ -1074,7 +1076,7 @@
                     if (!pill) return;
                     const modelId = `openai-compatible::${pill.dataset.applyModel}`;
                     if (!trim(state.mainModel)) state.mainModel = modelId;
-                    if (!trim(state.codeModel)) state.codeModel = modelId;
+                    if (!trim(state.heavyModel)) state.heavyModel = modelId;
                     if (!trim(state.lightModel)) state.lightModel = modelId;
                     if (!trim(state.fallbackModel)) state.fallbackModel = modelId;
                     state.modelsDirty = true;

@@ -83,12 +83,19 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
     "OUROBOROS_MODEL": "google/gemini-3.5-flash",
-    "OUROBOROS_MODEL_CODE": "google/gemini-3.5-flash",
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3.5-flash",
+    # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
+    # so the owner sets ONE model by default and optionally overrides a lane. HEAVY is
+    # the strong acting/coding lane (mutative first-level subagents); LIGHT is the cheap
+    # bulk lane (auto / deep subagents). (HEAVY renamed from the legacy MODEL_CODE.)
+    "OUROBOROS_MODEL_HEAVY": "",
+    "OUROBOROS_MODEL_LIGHT": "",
     # Background consciousness is a high-horizon cognitive loop, not a cheap
     # helper lane. Empty means "use OUROBOROS_MODEL".
     "OUROBOROS_MODEL_CONSCIOUSNESS": "",
-    "OUROBOROS_MODEL_FALLBACK": "anthropic/claude-sonnet-4.6",
+    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
+    # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
+    # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
+    "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.5-pro",
     "CLAUDE_CODE_MODEL": "opus[1m]",
     "OUROBOROS_MAX_WORKERS": 10,
@@ -113,6 +120,11 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
     "TOTAL_BUDGET": 10.0,
     "OUROBOROS_PER_TASK_COST_USD": 20.0,
+    # cloud.ru Foundation Models catalog prices token costs in RUB per 1M; budget is
+    # USD. Owner-configurable RUB->USD divisor for converting cloud.ru cost to USD.
+    "OUROBOROS_RUB_USD_RATE": 95.0,
+    # Live-pricing (OpenRouter + cloud.ru catalog) refetch interval; prices/FX drift.
+    "OUROBOROS_PRICING_TTL_SEC": 21600,
     # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
     "OUROBOROS_MAX_ROUNDS": 200,
     # Same-model attempt budget for TRANSIENT provider failure classes
@@ -215,21 +227,92 @@ SETTINGS_DEFAULTS = {
     "LOCAL_MODEL_CONTEXT_LENGTH": 16384,
     "LOCAL_MODEL_CHAT_FORMAT": "",
     "USE_LOCAL_MAIN": False,
-    "USE_LOCAL_CODE": False,
+    "USE_LOCAL_HEAVY": False,
     "USE_LOCAL_LIGHT": False,
     "USE_LOCAL_CONSCIOUSNESS": False,
     "USE_LOCAL_FALLBACK": False,
     "OUROBOROS_FILE_BROWSER_DEFAULT": "",
+    # Subagent depth at/below which an EXPLICIT main/heavy lane is honored; deeper
+    # descendants (grandchildren) fall to light as a cost guard. Owner-configurable
+    # (advanced); a visible note is surfaced when an explicit request is depth-capped.
+    "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT": 1,
+    # 429-aware cross-model fallback: process-local cooldown for transiently failing
+    # models (429/5xx/overloaded), passive heal-back. Owner-tunable; default-on, fail-soft.
+    "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
+    "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
+    "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
 }
 
 
-def get_light_model() -> str:
-    """Return the configured light-model slot with runtime env override."""
-
+def _main_model() -> str:
     return (
-        str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
-        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"])
+        str(os.environ.get("OUROBOROS_MODEL", "") or "").strip()
+        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
     )
+
+
+def get_light_model() -> str:
+    """Return the light-model slot; empty falls back to OUROBOROS_MODEL (only main
+    carries a real default — heavy/light/consciousness are empty->main)."""
+    return str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
+
+
+def get_heavy_model() -> str:
+    """Return the heavy (strong acting/coding) lane slot; empty falls back to
+    OUROBOROS_MODEL. Renamed from the legacy code slot."""
+    return str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
+
+
+def parse_fallback_chain() -> list[str]:
+    """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
+    (resilience walk, pricing categorization, credentialed-model resolution).
+
+    Reads OUROBOROS_MODEL_FALLBACKS, then the legacy singular OUROBOROS_MODEL_FALLBACK
+    (env-only back-compat). No dedup, no active-model drop, and NO SETTINGS_DEFAULTS
+    injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback" (so an
+    OpenAI-compatible / local owner who clears it is not silently routed to the default
+    Anthropic chain into an unconfigured provider). The shipped default reaches a default
+    install through apply_settings_to_env, which writes the non-empty default into env."""
+    raw = (
+        str(os.environ.get("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
+        or str(os.environ.get("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
+    )
+    return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]
+
+
+def get_fallback_models(active_model: str = "") -> list[str]:
+    """Return the ordered cross-model resilience CHAIN (deduped, with the active model
+    removed so a benchmark all-slots-one-model setup collapses the chain to a no-op)."""
+    out: list[str] = []
+    seen = set()
+    active = str(active_model or "").strip()
+    for m in parse_fallback_chain():
+        if m and m != active and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+# v6.39 slot rename-alias migration (same shape as the retention-key rename):
+# OUROBOROS_MODEL_CODE -> _HEAVY, USE_LOCAL_CODE -> USE_LOCAL_HEAVY,
+# OUROBOROS_MODEL_FALLBACK -> _FALLBACKS.
+_LEGACY_SLOT_RENAMES = (
+    ("OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_HEAVY"),
+    ("USE_LOCAL_CODE", "USE_LOCAL_HEAVY"),
+    ("OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_FALLBACKS"),
+)
+
+
+def migrate_legacy_slot_keys(settings: dict) -> dict:
+    """In-place v6.39 slot rename-alias migration. Preserves a stored value (never orphans
+    an owner customization), then drops the legacy key so it does not linger. Shared SSOT
+    for every settings entry point (load_settings AND the Colab settings builder) so a
+    Drive/legacy settings file is migrated the same way regardless of how it is loaded."""
+    for _old, _new in _LEGACY_SLOT_RENAMES:
+        if _new not in settings and _old in settings:
+            settings[_new] = settings[_old]
+        settings.pop(_old, None)
+    return settings
 
 
 def get_consciousness_model() -> str:
@@ -1050,6 +1133,7 @@ def load_settings() -> dict:
                 loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
         for _legacy in LEGACY_RETENTION_KEYS:
             loaded.pop(_legacy, None)
+        migrate_legacy_slot_keys(loaded)
         settings = dict(SETTINGS_DEFAULTS)
         settings.update(loaded)
         for key in SETTINGS_DEFAULTS:
@@ -1229,14 +1313,17 @@ def apply_settings_to_env(settings: dict) -> None:
         "GIGACHAT_PROFANITY_CHECK",
         "ANTHROPIC_API_KEY",
         "OUROBOROS_NETWORK_PASSWORD",
-        "OUROBOROS_MODEL", "OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_LIGHT",
+        "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_CONSCIOUSNESS",
-        "OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "OUROBOROS_FALLBACK_COOLDOWN_SEC",
+        "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
         "OUROBOROS_MAX_WORKERS", "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
         "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
+        "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
         "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC",
@@ -1273,7 +1360,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME",
         "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH",
         "LOCAL_MODEL_CHAT_FORMAT",
-        "USE_LOCAL_MAIN", "USE_LOCAL_CODE", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         "OUROBOROS_FILE_BROWSER_DEFAULT",
     ]
     for k in env_keys:

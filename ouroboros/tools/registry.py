@@ -262,6 +262,21 @@ def _detect_scope_review_floor_self_lowering(text_lower: str) -> bool:
     )
 
 
+def _detect_owner_skill_attest_self_call(text_lower: str) -> bool:
+    """Detect agent attempts to loopback-call the OWNER-ONLY skill owner-attestation endpoint
+    (C1, v6.39). Owner-attestation skips the expensive LLM skill review; it MUST be
+    owner-issued, never agent self-callable — otherwise the agent could self-bypass the
+    immune system's review for its own skill. Mirrors the context-mode/scope-floor guards.
+
+    URL-DECODE first so a percent-encoded path (e.g. ``%61ttest-review`` / ``attest%2Dreview``)
+    — which Starlette decodes back to ``attest-review`` before routing — cannot slip past the
+    literal match (decode twice to catch double-encoding)."""
+    import urllib.parse
+    decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
+    text = f"{text_lower} {decoded}"
+    return "/api/owner/skills/" in text and "attest-review" in text
+
+
 def _task_constraint_path_allowed(path_text: str, constraint: Optional[TaskConstraint], drive_root: pathlib.Path) -> bool:
     return is_skill_payload_path(
         drive_root,
@@ -990,14 +1005,24 @@ class ToolRegistry:
                 try:
                     from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
                     _mcp_ensure_configured(refresh=True)
+                    _mgr = _mcp_get_manager()
                     mcp_schemas = [
                         {
                             "type": "function",
                             "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
                         }
-                        for tool in _mcp_get_manager().list_tools_for_registry()
+                        for tool in _mgr.list_tools_for_registry()
                         if not acting_subagent or tool["name"] in acting_grants
                     ]
+                    # D1: an enabled+configured server returning zero tools WITHOUT
+                    # raising (unreachable/slow/auth-failed) is otherwise silent. Make
+                    # the reason visible so the model/owner learns WHY an expected MCP
+                    # server produced no tools, instead of "the agent can't see MCP".
+                    # Checked unconditionally so a broken server is surfaced even when a
+                    # co-located healthy server contributed tools (does not mask it).
+                    _empty = _mgr.enabled_servers_without_tools()
+                    if _empty:
+                        self._capability_omissions.append({"surface": "mcp", "reason": "server_no_tools", "servers": _empty})
                 except Exception as exc:
                     self._capability_omissions.append({"surface": "mcp", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
             return built_in + extension_schemas + mcp_schemas
@@ -1555,6 +1580,8 @@ class ToolRegistry:
             return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
         if _detect_scope_review_floor_self_lowering(cmd_lower):
             return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to weaken OUROBOROS_SCOPE_REVIEW_FLOOR (e.g. to ``advisory``) through settings.json, /api/settings, or /api/owner/scope-review-floor. The scope-review floor gates the BIBLE P3 blocking review — it is owner-controlled, and the agent must not lower it to slip its own changes past the gate. Ask the owner to change it, or stop the agent and edit settings.json directly."
+        if _detect_owner_skill_attest_self_call(cmd_lower):
+            return "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI."
         if _detect_mutative_toggle_self_change(cmd_lower):
             return "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents."
         if _detect_evolution_owner_control_self_change(cmd_lower):

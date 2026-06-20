@@ -537,8 +537,8 @@ Before every commit, verify the following:
   coordination via `tree_note`/`tree_read` (the one permitted local-write path for
   swarm beacons/shared-frame reads, not state mutation). Nested readonly
   `schedule_subagent` recursion is allowed only within configured depth/cap
-  limits; descendants deeper than the first child level are coerced to the light
-  lane. Enabled/reviewed extension tools and enabled MCP tools may remain
+  limits; descendants deeper than the configured capability depth
+  (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`) are coerced to the light lane. Enabled/reviewed extension tools and enabled MCP tools may remain
   callable by owner policy, subject to inherited `task_contract.allowed_resources`
   such as no-network/no-web.
 - `plan_task` planning scouts use the same live-subagent worker pool. The wait is
@@ -685,7 +685,13 @@ All platform-specific code **MUST** go through `ouroboros/platform_layer.py`.
 Durable JSON state files should use the SSOT helpers in `ouroboros/utils.py`:
 `atomic_write_json(path, payload, trailing_newline=False, fsync=False)` for
 write-then-rename persistence and `read_json_dict(path)` for dict-shaped JSON
-reads. Lockfile acquisition should go through
+reads. `write_text_atomic(path, content, fsync=False)` is the underlying shared
+atomic FULL-OVERWRITE primitive (temp-sibling + `os.replace`, existing permission
+bits preserved, crash leaves the old file intact); `atomic_write_json` layers JSON
+serialization on it, and `write_text` (the plain text overwrite helper) routes
+through it, so every overwrite routed through these helpers is crash-safe — prefer
+them over a bare `Path.write_text` for any full-file overwrite. Appends are
+intentionally NOT atomic (they extend in place). Lockfile acquisition should go through
 `platform_layer.acquire_exclusive_file_lock` /
 `release_exclusive_file_lock` rather than reimplementing `O_CREAT|O_EXCL`
 loops in feature modules.

@@ -448,6 +448,13 @@ def _launch_browser_with_fallback(pw_instance: Any, *, engine: str = "chromium",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=site-per-process",
             "--window-size=1920,1080",
+            # J (v6.39): software-GL via ANGLE+SwiftShader so WebGL/canvas/3D actually
+            # RENDER in headless (bundled chrome-headless-shell has no GPU) instead of a
+            # black frame; ignore the GPU blocklist so SwiftShader is used.
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
+            "--ignore-gpu-blocklist",
         ]
     browser_type = getattr(pw_instance, engine)
     try:
@@ -541,6 +548,10 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
     # use clicks/fetches to change the owner-controlled context horizon.
     bs_context.route("**/api/owner/context-mode", _block_context_mode_owner_post)
     bs_context.route("**/api/owner/scope-review-floor", _block_scope_review_floor_owner_post)
+    # Broad glob (any /api/owner/skills/** path) so a percent-encoded `attest%2Dreview`
+    # still routes to the handler, which then URL-DECODES and precisely aborts the
+    # attestation POST (the glob matches the RAW URL, so it must not assume the literal).
+    bs_context.route("**/api/owner/skills/**", _block_owner_skill_attest_post)
     # Owner-only self-modification toggles ride /api/settings; block the browser
     # click+Save path (POST /api/settings) for them, not just evaluate-JS. Applies to
     # every browser session (root + subagents).
@@ -669,6 +680,18 @@ def _blocks_post_task_evolution_js(value: str) -> bool:
     )
 
 
+def _blocks_owner_skill_attest_js(value: str) -> bool:
+    """Block browser JS that tries to loopback-POST the OWNER-ONLY skill-attestation
+    endpoint (C1, v6.39) — owner-attestation skips the LLM skill review and must be
+    owner-issued, never agent self-callable from a browser fetch. URL-decode first so a
+    percent-encoded path (``%61ttest-review``) cannot slip past the literal match."""
+    import urllib.parse
+    low = str(value or "").lower()
+    decoded = urllib.parse.unquote(urllib.parse.unquote(low)).lower()
+    text = f"{low} {decoded}"
+    return "/api/owner/skills/" in text and "attest-review" in text
+
+
 def _is_context_mode_owner_post(request: Any) -> bool:
     try:
         parsed = urlparse(str(request.url or ""))
@@ -696,6 +719,28 @@ def _is_scope_review_floor_owner_post(request: Any) -> bool:
 
 def _block_scope_review_floor_owner_post(route: Any) -> None:
     if _is_scope_review_floor_owner_post(route.request):
+        route.abort()
+        return
+    route.continue_()
+
+
+def _is_owner_skill_attest_post(request: Any) -> bool:
+    """A browser POST to the owner-only skill owner-attestation endpoint — the click/form
+    bypass of the evaluate-only JS guard (C1, v6.39)."""
+    try:
+        import urllib.parse
+        parsed = urlparse(str(request.url or ""))
+        method = str(request.method or "").upper()
+        # Decode so a percent-encoded path (which the server decodes before routing) is
+        # matched the same way the route is registered.
+        path = urllib.parse.unquote(urllib.parse.unquote(parsed.path)).rstrip("/").lower()
+    except Exception:
+        return False
+    return method == "POST" and path.startswith("/api/owner/skills/") and path.endswith("/attest-review")
+
+
+def _block_owner_skill_attest_post(route: Any) -> None:
+    if _is_owner_skill_attest_post(route.request):
         route.abort()
         return
     route.continue_()
@@ -836,9 +881,33 @@ def _page_health_snapshot(page: Any) -> str:
     return " | ".join(parts)
 
 
+def _wait_for_page_paint(page: Any, timeout_ms: int = 3000) -> None:
+    """J (v6.39): let the page paint before a screenshot — wait for document.readyState then
+    two requestAnimationFrames (the second fires AFTER the paint), so a freshly-rendered
+    canvas/WebGL frame is not captured black/blank. Best-effort + bounded; never blocks."""
+    try:
+        page.wait_for_function("document.readyState === 'complete'", timeout=min(int(timeout_ms or 3000), 3000))
+    except Exception:
+        pass
+    try:
+        # Schedule a paint flag via double-rAF (the second fires AFTER the paint), then wait
+        # for it with a HARD Playwright timeout. The flag-set evaluate returns immediately
+        # (it does not await a page-owned promise), and wait_for_function's own timeout
+        # bounds the wait — so a page that suppresses requestAnimationFrame can never hang
+        # the capture (the page's own timers are never trusted to unblock us).
+        page.evaluate(
+            "() => { window.__obo_painted = false;"
+            " requestAnimationFrame(() => requestAnimationFrame(() => { window.__obo_painted = true; })); }"
+        )
+        page.wait_for_function("window.__obo_painted === true", timeout=500)
+    except Exception:
+        pass
+
+
 def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
     """Extract page content in the requested format."""
     if output == "screenshot":
+        _wait_for_page_paint(page)  # J: paint before capture (shared with browser_action)
         data = page.screenshot(type="png", full_page=False)
         b64 = base64.b64encode(data).decode()
         ctx.browser_state.last_screenshot_b64 = b64
@@ -944,6 +1013,7 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
             page.select_option(selector, value, timeout=timeout)
             return f"Selected {value} in {selector}"
         elif normalized_action == "screenshot":
+            _wait_for_page_paint(page, int(timeout or 3000))  # J: paint before capture
             data = page.screenshot(type="png", full_page=False)
             b64 = base64.b64encode(data).decode()
             ctx.browser_state.last_screenshot_b64 = b64
@@ -985,11 +1055,28 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
                     "OUROBOROS_POST_TASK_EVOLUTION. Post-task self-evolution is owner-controlled — "
                     "the agent must not self-enable it."
                 )
+            if _blocks_owner_skill_attest_js(value):
+                return (
+                    "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: browser JavaScript looks like an "
+                    "attempt to POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips "
+                    "the LLM skill review and is owner-only — the agent must not self-attest its own skill."
+                )
             try:
                 result = page.evaluate(value)
             except Exception as eval_err:  # noqa: BLE001
                 msg = str(eval_err)
-                if "SyntaxError" in msg:
+                if "SyntaxError" not in msg:
+                    raise
+                # J (v6.39): a statement-style snippet (a top-level `return`, or several
+                # statements) is a SyntaxError for a raw evaluate EXPRESSION; retry the same
+                # code wrapped in an IIFE function body before surfacing a real parse error.
+                try:
+                    result = page.evaluate("(() => {\n" + value + "\n})()")
+                except Exception as iife_err:  # noqa: BLE001
+                    # The IIFE PARSED but threw a RUNTIME error (e.g. ReferenceError) -> that
+                    # is the real result; surface it like the raw path, not as a parse error.
+                    if "SyntaxError" not in str(iife_err):
+                        raise
                     snippet = value.strip()[:80]
                     return (
                         "⚠️ BROWSER_EVALUATE_SYNTAX_ERROR: the JS failed to parse "
@@ -997,7 +1084,6 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
                         "Check for stray git conflict markers (<<<<<<<) or shell "
                         "heredocs (<<EOF) leaked into the value."
                     )
-                raise
             out = str(result)
             return out[:20000] + ("... [truncated]" if len(out) > 20000 else "")
         elif normalized_action == "scroll":

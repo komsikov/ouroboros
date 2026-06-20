@@ -36,6 +36,12 @@ MAIN_LOOP_MAX_TOKENS = 65_536
 # large) keep failing fast. There is NO cross-model fallback here — the same
 # request is retried on the SAME model.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
+# Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
+# retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
+# cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
+# model down even though it is not a same-model retry kind. Kept separate so widening the
+# cooldown trigger never enlarges the same-model transient-retry budget.
+_COOLDOWN_ERROR_KINDS = _TRANSIENT_RETRY_KINDS | frozenset({"rate_limit"})
 _TRANSIENT_RETRY_DEFAULT = 6
 _TRANSIENT_BACKOFF_CAP_SEC = 60.0
 # Stop retrying when the remaining task deadline cannot absorb the backoff
@@ -98,6 +104,63 @@ def _classify_empty_response(usage: Dict[str, Any], msg: Dict[str, Any]) -> Tupl
     else:
         event_type = "llm_empty_response"
     return event_type, is_provider_glitch, permanent_body_error
+
+
+def _attempt_loop_budget(max_retries: int, attempt_cap: Optional[int]) -> int:
+    """Attempt-loop ceiling. Normally ``transient_retry_max(max_retries)``; when
+    ``attempt_cap`` is set (F1 fallback candidate), cap the WHOLE loop (every error class)
+    to a small total so the chain tries a candidate a fixed couple of times then moves on.
+    Applied only to candidates; the primary passes None and keeps its full budgets."""
+    budget = transient_retry_max(max_retries)
+    if attempt_cap is not None:
+        budget = max(1, min(int(budget), int(attempt_cap)))
+    return budget
+
+
+def _record_and_emit_empty_response(
+    *, usage, msg, accumulated_usage, event_queue, drive_logs, task_id, execution_id,
+    round_id, llm_call_id, round_idx, attempt, model, task_type, content, tool_calls,
+    request_ref, response_ref, transient_budget,
+) -> tuple:
+    """Classify an empty / no-tool-call response, log + emit its events, and stamp
+    accumulated_usage (last error / execution_status / reason_code / F1 cooldown kind).
+    Returns ``(event_type, is_provider_glitch, permanent_body_error)`` for the caller's
+    retry decision. Extracted from call_llm_with_retry to keep that loop readable."""
+    finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
+    event_type, is_provider_glitch, permanent_body_error = _classify_empty_response(usage, msg)
+    log_msg = _empty_response_log_msg(usage, is_provider_glitch, accumulated_usage)
+    log.warning("%s, attempt %d/%d", log_msg, attempt + 1, transient_budget)
+    _emit_empty_response_events(
+        event_type, event_queue=event_queue, drive_logs=drive_logs,
+        base={"task_id": task_id, "execution_id": execution_id, "round_id": round_id,
+              "llm_call_id": llm_call_id, "round": round_idx, "attempt": attempt + 1,
+              "model": model, "finish_reason": finish_reason},
+        task_type=task_type,
+        details={"content": content, "tool_calls": tool_calls,
+                 "request_ref": request_ref, "response_ref": response_ref},
+    )
+    accumulated_usage["_last_llm_error"] = _short_error_text(log_msg)
+    accumulated_usage["execution_status"] = (
+        "infra_failed" if (is_provider_glitch and not permanent_body_error) else "failed"
+    )
+    accumulated_usage["reason_code"] = event_type
+    # Cooldown signal for the F1 fallback gate (see helper; not a retry change).
+    accumulated_usage["_last_llm_error_kind"] = _cooldown_kind_for_empty_response(usage, event_type)
+    return event_type, is_provider_glitch, permanent_body_error
+
+
+def _cooldown_kind_for_empty_response(usage: Dict[str, Any], event_type: str) -> str:
+    """Pick the kind exposed as ``_last_llm_error_kind`` for the F1 fallback-chain cooldown
+    gate on an empty/body-error response. PREFER the provider body-error kind (a 429
+    surfaces as ``rate_limit``) so a rate-limited model cools down regardless of
+    finish_reason; otherwise fall back to ``event_type`` (``provider_incomplete_response``
+    cools; ``provider_body_error`` / ``llm_empty_response`` are not in the cooldown set, so
+    they correctly do not). This is purely the cooldown SIGNAL — it does not change the
+    same-model transient-retry layering (the primary keeps its full plan-preserved budget;
+    cooldown is the second layer once that budget is exhausted)."""
+    body_err = usage.get("provider_error") if isinstance(usage, dict) else None
+    body_kind = str((body_err or {}).get("kind") or "") if isinstance(body_err, dict) else ""
+    return body_kind if body_kind in _COOLDOWN_ERROR_KINDS else event_type
 
 
 def _sleep_within_deadline(seconds: float, deadline_ts: Optional[float]) -> bool:
@@ -302,6 +365,26 @@ def _exception_provider_code(exc: Exception, safe_error: str) -> str:
     return ""
 
 
+def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
+    """Best-effort human-readable provider error BODY text.
+
+    Strict OpenAI-compatible providers (cloud.ru Foundation Models, vLLM/SGLang)
+    return a 400 whose BODY distinguishes otherwise-identical status codes — e.g. a
+    cloud.ru content-filter ("guardrails") block vs an ``Extra inputs are not
+    permitted`` reasoning_content echo. ``provider_code`` alone cannot tell them
+    apart, so surface the body message (sanitized + truncated) into the durable
+    event for the owner. Pure read of ``exc.body``/repr; never changes routing."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        nested = body.get("error")
+        if isinstance(nested, dict) and str(nested.get("message") or "").strip():
+            return sanitize_tool_result_for_log(str(nested.get("message")))[:600]
+        if str(body.get("message") or "").strip():
+            return sanitize_tool_result_for_log(str(body.get("message")))[:600]
+    text = str(safe_error or "").strip()
+    return sanitize_tool_result_for_log(text)[:600] if text else ""
+
+
 def _provider_code_kind(provider_code: str) -> str:
     code = str(provider_code or "").strip().lower()
     if not code:
@@ -428,6 +511,7 @@ def _record_llm_call_error(
     """
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
+    provider_message = _exception_provider_message(error, safe_error)
     _emit_live_log(ctx.event_queue, {
         "type": "llm_round_error",
         "task_id": ctx.task_id,
@@ -454,9 +538,12 @@ def _record_llm_call_error(
         "retry_same_request": classification.retry_same_request,
         "status_code": classification.status_code,
         "provider_code": classification.provider_code,
+        "provider_message": provider_message,
         "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
     })
     ctx.accumulated_usage["_last_llm_error"] = _short_error_text(safe_error)
+    if provider_message:
+        ctx.accumulated_usage["_last_llm_provider_message"] = provider_message
     ctx.accumulated_usage["_last_llm_error_kind"] = classification.kind
     ctx.accumulated_usage["_last_llm_retry_same_request"] = classification.retry_same_request
     if classification.status_code:
@@ -508,6 +595,7 @@ def _record_llm_call_error(
             "error_kind": classification.kind,
             "status_code": classification.status_code,
             "provider_code": classification.provider_code,
+            "provider_message": provider_message,
         })
         return True
     return False
@@ -557,16 +645,16 @@ def call_llm_with_retry(
     task_type: str = "",
     use_local: bool = False,
     deadline_ts: Optional[float] = None,
+    attempt_cap: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], float]:
-    """
-    Call LLM with retry logic, usage tracking, and event emission.
+    """Call LLM with retry logic, usage tracking, and event emission.
 
     Retry budgets are per failure class: transient provider failures
     (finish_reason=null, 429/5xx/overloaded) may use up to
-    ``transient_retry_max(max_retries)`` same-model attempts; every other
-    retryable class keeps the caller's ``max_retries``. ``deadline_ts``
-    (epoch seconds) bounds backoff sleeps so retries never eat the remaining
-    task deadline. No cross-model fallback happens here.
+    ``transient_retry_max(max_retries)`` same-model attempts; every other retryable
+    class keeps the caller's ``max_retries``. ``deadline_ts`` (epoch seconds) bounds
+    backoff sleeps so retries never eat the remaining task deadline. ``attempt_cap``
+    (F1 fallback candidates only) caps the whole loop. No cross-model fallback here.
 
     Returns:
         (response_message, cost) on success
@@ -576,7 +664,7 @@ def call_llm_with_retry(
     drive_root = pathlib.Path(drive_logs).parent
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
-    transient_budget = transient_retry_max(max_retries)
+    transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
 
     for attempt in range(transient_budget):
         accumulated_usage["_llm_attempts_used"] = attempt + 1
@@ -700,39 +788,15 @@ def call_llm_with_retry(
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
             if not tool_calls and (not content or not content.strip()):
-                finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
-                event_type, is_provider_glitch, permanent_body_error = _classify_empty_response(usage, msg)
-                log_msg = _empty_response_log_msg(usage, is_provider_glitch, accumulated_usage)
-                log.warning("%s, attempt %d/%d", log_msg, attempt + 1, transient_budget)
-                _emit_empty_response_events(
-                    event_type,
-                    event_queue=event_queue,
-                    drive_logs=drive_logs,
-                    base={
-                        "task_id": task_id,
-                        "execution_id": execution_id,
-                        "round_id": round_id,
-                        "llm_call_id": llm_call_id,
-                        "round": round_idx,
-                        "attempt": attempt + 1,
-                        "model": model,
-                        "finish_reason": finish_reason,
-                    },
-                    task_type=task_type,
-                    details={"content": content, "tool_calls": tool_calls,
-                             "request_ref": request_ref, "response_ref": response_ref},
+                event_type, is_provider_glitch, permanent_body_error = _record_and_emit_empty_response(
+                    usage=usage, msg=msg, accumulated_usage=accumulated_usage, event_queue=event_queue,
+                    drive_logs=drive_logs, task_id=task_id, execution_id=execution_id, round_id=round_id,
+                    llm_call_id=llm_call_id, round_idx=round_idx, attempt=attempt, model=model,
+                    task_type=task_type, content=content, tool_calls=tool_calls,
+                    request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
                 )
-                accumulated_usage["_last_llm_error"] = _short_error_text(log_msg)
-                accumulated_usage["execution_status"] = (
-                    "infra_failed" if (is_provider_glitch and not permanent_body_error) else "failed"
-                )
-                accumulated_usage["reason_code"] = event_type
-
-                # Transient response glitches (and transient body errors) retry the
-                # SAME model within the transient budget, deadline-bounded. A
-                # PERMANENT body error (auth/quota/bad_request) fails fast — no
-                # retry — so the loop unifies into best-effort terminalization
-                # instead of burning the budget on a request that cannot succeed.
+                # Transient response glitches (and transient body errors) retry the SAME model
+                # within the transient budget, deadline-bounded; a PERMANENT body error fails fast.
                 if not permanent_body_error and attempt < transient_budget - 1:
                     if _sleep_within_deadline(
                         min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts
@@ -822,7 +886,11 @@ def call_llm_with_retry(
                 break
             error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
             is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-            attempt_budget = transient_budget if is_transient else max_retries
+            # Non-transient retryable classes keep the caller's max_retries, but never
+            # exceed the loop ceiling (transient_budget) — so an attempt_cap'd fallback
+            # candidate does not waste a backoff sleep on an iteration the loop won't run.
+            # For the primary, transient_budget >= max_retries, so this is a no-op there.
+            attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
             if attempt >= attempt_budget - 1:
                 break
             backoff = min(
