@@ -60,6 +60,63 @@ def send(url: str, message: str, task_id: str = "", context_id: str = "") -> str
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def stream(url: str, message: str, task_id: str = "", context_id: str = "") -> str:
+    """Send a message via message/stream (SSE) and collect all streamed events."""
+    import httpx
+
+    base = str(url or "").rstrip("/")
+    request_id = uuid.uuid4().hex
+    msg: Dict[str, Any] = {
+        "messageId": request_id,
+        "role": "user",
+        "parts": [{"kind": "text", "text": str(message or "")}],
+    }
+    if task_id:
+        msg["taskId"] = task_id
+    if context_id:
+        msg["contextId"] = context_id
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "message/stream",
+        "params": {"message": msg},
+    }
+    events: list[dict[str, Any]] = []
+    try:
+        with httpx.stream("POST", f"{base}/", json=payload, auth=_auth(), timeout=120) as response:
+            response.raise_for_status()
+            if response.headers.get("content-type", "").startswith("text/event-stream"):
+                current_data: list[str] = []
+                for line in response.iter_lines():
+                    if line.startswith("data:"):
+                        current_data.append(line[len("data:"):].strip())
+                    elif line == "" and current_data:
+                        raw = "\n".join(current_data)
+                        current_data = []
+                        try:
+                            events.append(json.loads(raw))
+                        except json.JSONDecodeError:
+                            events.append({"raw": raw})
+                # Handle remaining buffered data
+                if current_data:
+                    raw = "\n".join(current_data)
+                    try:
+                        events.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        events.append({"raw": raw})
+            else:
+                # Non-SSE response (some agents may return regular JSON)
+                try:
+                    events.append(response.json())
+                except Exception:
+                    events.append({"raw": response.text})
+    except Exception as exc:
+        return json.dumps({"error": f"Streaming request failed: {exc}"})
+    if not events:
+        return json.dumps({"error": "No events received from stream"})
+    return json.dumps(events, ensure_ascii=False, indent=2)
+
+
 def status(url: str, task_id: str) -> str:
     import httpx
 

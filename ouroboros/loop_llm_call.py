@@ -316,6 +316,13 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     """Classify provider errors without changing model/request semantics."""
 
     safe = safe_error or sanitize_tool_result_for_log(repr(exc))
+    # Guardrails input block is deterministic and non-retryable: retrying the
+    # same (blocked) input will always fail.  Without this guard the generic
+    # fallback classifies it as ``provider_error`` with retry_same_request=True
+    # and the retry loop burns attempts on a request that can never succeed.
+    from ouroboros.guardrails_llm import GuardrailsInputBlocked
+    if isinstance(exc, GuardrailsInputBlocked):
+        return LlmErrorClassification("bad_request", False, status_code=400)
     if isinstance(exc, LocalContextTooLargeError):
         return LlmErrorClassification("context_overflow", False)
     status_code = _exception_status_code(exc)

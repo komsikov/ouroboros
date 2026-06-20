@@ -18,7 +18,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 try:
@@ -256,7 +256,7 @@ def _extract_text(params: Dict[str, Any]) -> str:
     return "\n".join(text for text in texts if text).strip()
 
 
-async def jsonrpc(request: Request) -> JSONResponse:
+async def jsonrpc(request: Request) -> JSONResponse | StreamingResponse:
     payload = await request.json()
     request_id = payload.get("id") or uuid.uuid4().hex
     method = str(payload.get("method") or "")
@@ -266,15 +266,16 @@ async def jsonrpc(request: Request) -> JSONResponse:
         if not task:
             return JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "task not found"}})
         return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": task})
-    if method != "message/send":
+    if method not in ("message/send", "message/stream"):
         return JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}})
     text = _extract_text(params)
     task_id = str((params.get("message") or {}).get("taskId") or uuid.uuid4().hex)
+    context_id = (params.get("message") or {}).get("contextId") or task_id
     try:
         response_text = await _dispatch_to_host(text)
         task = {
             "id": task_id,
-            "contextId": (params.get("message") or {}).get("contextId") or task_id,
+            "contextId": context_id,
             "status": {"state": "completed"},
             "artifacts": [{"parts": [{"kind": "text", "text": response_text}]}],
         }
@@ -284,7 +285,73 @@ async def jsonrpc(request: Request) -> JSONResponse:
             "status": {"state": "failed", "message": {"parts": [{"kind": "text", "text": str(exc)}]}},
         }
     _save_task(task)
+    if method == "message/stream":
+        return _sse_response(request_id, task)
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": task})
+
+
+def _sse_event(event_name: str, data: Any) -> str:
+    """Format a single SSE event string."""
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event_name}\ndata: {payload}\n\n"
+
+
+def _sse_response(request_id: str, task: Dict[str, Any]) -> StreamingResponse:
+    """Build an SSE streaming response for message/stream."""
+    task_id = task["id"]
+    context_id = task.get("contextId", task_id)
+    status = task.get("status", {})
+    state = status.get("state", "completed")
+
+    async def _generate():
+        # 1. working status event
+        working_event = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "id": task_id,
+                "contextId": context_id,
+                "status": {"state": "working"},
+            },
+        }
+        yield _sse_event("task_status_update", working_event)
+
+        # 2. artifact event (if task has artifacts)
+        artifacts = task.get("artifacts") or []
+        if artifacts:
+            artifact_event = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "id": task_id,
+                    "contextId": context_id,
+                    "artifacts": artifacts,
+                },
+            }
+            yield _sse_event("task_artifact_update", artifact_event)
+
+        # 3. final status event
+        final_event = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "id": task_id,
+                "contextId": context_id,
+                "status": {"state": state},
+                "final": True,
+            },
+        }
+        yield _sse_event("task_status_update", final_event)
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class OuroborosExecutor(AgentExecutor if _A2A_SDK_AVAILABLE else object):

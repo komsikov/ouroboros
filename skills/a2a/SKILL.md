@@ -4,9 +4,10 @@ description: Agent-to-Agent protocol bridge for Ouroboros. Provides a local A2A-
 version: 1.0.0
 type: extension
 entry: plugin.py
-permissions: [net, tool, route, widget, read_settings, companion_process, inject_chat]
+permissions:
+  [net, tool, route, widget, read_settings, companion_process, inject_chat]
 env_from_settings: []
-when_to_use: User asks to communicate with another A2A-compatible agent, discover an agent card, send an A2A message, check A2A task status, or expose this Ouroboros instance as an A2A peer.
+when_to_use: User asks to communicate with another A2A-compatible agent, discover an agent card, send or stream an A2A message, check A2A task status, or expose this Ouroboros instance as an A2A peer.
 timeout_sec: 120
 install_specs:
   - kind: pip
@@ -24,10 +25,11 @@ companion_processes:
 
 This skill moves Ouroboros's Agent-to-Agent protocol support out of the
 core runtime. It exposes a small local A2A-compatible JSON-RPC server and
-registers three client tools:
+registers four client tools:
 
 - `discover` — fetch another agent's Agent Card.
 - `send` — send a message to another A2A agent.
+- `stream` — stream a message to another A2A agent using `message/stream` (SSE).
 - `status` — check a remote task status.
 
 The companion process talks back to the host through the loopback Host

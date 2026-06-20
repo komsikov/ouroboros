@@ -72,6 +72,23 @@ def register(api):
         },
     )
     api.register_tool(
+        "stream",
+        handler=lambda ctx, url="", message="", task_id="", context_id="": client.stream(
+            url, message, task_id=task_id, context_id=context_id
+        ),
+        description="Stream a message to another A2A-compatible agent using message/stream (SSE). Returns all streamed events as a JSON array.",
+        schema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "message": {"type": "string"},
+                "task_id": {"type": "string"},
+                "context_id": {"type": "string"},
+            },
+            "required": ["url", "message"],
+        },
+    )
+    api.register_tool(
         "status",
         handler=lambda ctx, url="", task_id="": client.status(url, task_id),
         description="Check a remote A2A task status.",

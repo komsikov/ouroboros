@@ -215,7 +215,13 @@ def _run_rails(
         return GuardrailResult(passed=True)
     try:
         options = _build_options(rails_filter)
-        result = _rails.generate(messages=rails_messages, options=options)
+        # Pass a fresh ``state`` dict on every call so NeMo's dialog engine
+        # starts from a clean slate.  Without this, a prior blocking decision
+        # (refuse / stop / abort) "sticks" inside the LLMRails object and
+        # every subsequent call inherits the blocked state — even when the
+        # new input is harmless.  This is the root cause of the GLM-4.7 +
+        # guardrails "permanent stop after first block" bug.
+        result = _rails.generate(messages=rails_messages, options=options, state={})
     except Exception as exc:
         # A rails crash must never break the LLM call itself.
         log.warning("NeMo Guardrails raised %r; treating as passthrough", exc)
@@ -324,6 +330,25 @@ def apply_output(
         # Drop tool calls so the loop does not act on potentially unsafe output.
         if "tool_calls" in message:
             message["tool_calls"] = []
+        # Strip provider-private reasoning metadata that is incompatible with
+        # the replacement content.  Thinking/reasoning blocks and signatures
+        # belong to the original (blocked) model output and cause 400 errors
+        # when replayed to the same or a different provider in a subsequent
+        # round.
+        message.pop("reasoning", None)
+        message.pop("reasoning_details", None)
+        message.pop("response_id", None)
+        _content = message.get("content")
+        if isinstance(_content, list):
+            _kept: List[Any] = []
+            for _block in _content:
+                if isinstance(_block, dict):
+                    _btype = str(_block.get("type") or "").strip().lower()
+                    if _btype in ("thinking", "reasoning", "redacted_thinking"):
+                        continue
+                    _block.pop("signature", None)
+                _kept.append(_block)
+            message["content"] = _kept
     return message, usage
 
 

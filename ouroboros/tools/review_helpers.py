@@ -231,8 +231,10 @@ _SENSITIVE_EXTENSIONS = frozenset({
 })
 _SENSITIVE_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".env.staging",
-    # Env-file variants are credential-shaped even when named for examples/tests.
-    ".env.development", ".env.dev", ".env.test", ".env.example",
+    # Env-file variants are credential-shaped.  .env.example is excluded
+    # because it is a template (no real secrets) and is conventionally
+    # committed to version control.
+    ".env.development", ".env.dev", ".env.test",
     "credentials.json", "service-account.json", "secrets.yaml", "secrets.json",
     "secrets.toml", "secrets.ini",
     "aws-credentials.json", "gcp-service-account.json",
