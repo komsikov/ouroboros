@@ -542,19 +542,18 @@ export function renderSettingsPage() {
                     <div class="form-section">
                         <h3>ClawHub Marketplace</h3>
                         <div class="settings-section-copy">
-                            Always-on surface for installing community skills from
+                            Всегда доступная площадка для установки навыков сообщества с
                             <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
-                            The Skills page exposes a Marketplace tab; every install is
-                            staged, OpenClaw frontmatter is translated into the
-                            Ouroboros manifest shape, and the standard tri-model review runs
-                            automatically before the skill becomes executable. Plugins (Node)
-                            are filtered out — only skill packages are installable.
+                            На странице «Навыки» есть вкладка «Маркетплейс»; каждая установка подготавливается,
+                            метаданные OpenClaw переводятся в формат манифеста Ouroboros,
+                            и стандартная три-модельная проверка запускается автоматически перед активацией навыка.
+                            Плагины (Node) отфильтровываются — устанавливаются только пакеты навыков.
                         </div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Registry URL</label>
+                                <label>URL реестра</label>
                                 <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1">
-                                <div class="settings-inline-note">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
+                                <div class="settings-inline-note">Переопределяйте только для самостоятельно размещённых зеркал. Имя хоста должно быть <code>clawhub.ai</code> или localhost.</div>
                             </div>
                         </div>
                     </div>
