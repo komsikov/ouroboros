@@ -63,6 +63,7 @@ TOOL_POLICY: Dict[str, str] = {
     "task_acceptance_review": POLICY_SKIP,
     "review_status": POLICY_SKIP,
     "get_task_result": POLICY_SKIP,
+    "peek_task": POLICY_SKIP,
     "wait_task": POLICY_SKIP,
     "wait_tasks": POLICY_SKIP,
     "list_projects": POLICY_SKIP,
@@ -97,6 +98,9 @@ TOOL_POLICY: Dict[str, str] = {
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
+    # Parent's explicit decision to abandon a child result: stamps parent_decision +
+    # records the reason on the tree ledger; tree-scoped, no external effect (like cancel_task).
+    "discard_child_result": POLICY_SKIP,
     "request_restart": POLICY_SKIP,
     "request_deep_self_review": POLICY_SKIP,
     "set_tool_timeout": POLICY_SKIP,

@@ -84,3 +84,29 @@ def test_normal_forward_progress_and_retry(drive):
 def test_updated_at_is_written(drive):
     tr.write_task_result(drive, "t", tr.STATUS_SCHEDULED)
     assert tr.load_task_result(drive, "t").get("updated_at")
+
+
+def test_read_paths_do_not_create_task_results_dir(tmp_path):
+    """v6.40.0: a READ/LIST scan of a never-provisioned root must NOT materialise the
+    ``task_results`` directory (regression: an unguarded scan created stray dirs)."""
+    root = tmp_path / "never_provisioned"
+    assert tr.list_task_results(root) == []
+    assert tr.load_task_result(root, "missing") is None
+    assert not (root / "task_results").exists(), "read must not create the dir"
+    # WRITE still provisions it.
+    tr.write_task_result(root, "t", tr.STATUS_SCHEDULED)
+    assert (root / "task_results").is_dir()
+
+
+def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):
+    """The exact pollution repro: a MagicMock-derived root (``MagicMock/mock``) reaching a
+    READ scan must not create a ``MagicMock`` tree in the cwd."""
+    import pathlib
+    from unittest.mock import MagicMock
+
+    monkeypatch.chdir(tmp_path)
+    stub_root = pathlib.Path(MagicMock()).parent  # == Path("MagicMock/mock")
+    assert tr.list_task_results(stub_root) == []
+    assert tr.load_task_result(stub_root, "x") is None
+    leaked = [p.name for p in pathlib.Path(".").iterdir() if "MagicMock" in p.name]
+    assert leaked == [], f"read scan leaked mock-named paths: {leaked}"
