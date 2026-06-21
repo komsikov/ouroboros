@@ -159,31 +159,31 @@ def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
     paused = bool(snapshot.get("paused"))
     next_wakeup_sec = int(snapshot.get("next_wakeup_sec") or 0)
     idle_reason = str(snapshot.get("last_idle_reason") or "")
-    detail = "Background consciousness is off."
+    detail = "Фоновое сознание выключено."
     status = "disabled"
 
     if requested_enabled and running and paused:
         status = "paused"
-        detail = "Paused while another foreground task is active."
+        detail = "Приостановлено, пока активна другая задача переднего плана."
     elif requested_enabled and running and idle_reason == "thinking":
         status = "running"
-        detail = "Background consciousness is thinking now."
+        detail = "Фоновое сознание сейчас думает."
     elif requested_enabled and running and idle_reason == "budget_blocked":
         status = "budget_blocked"
-        detail = "Background consciousness hit its budget allocation and is waiting."
+        detail = "Фоновое сознание достигло лимита бюджета и ожидает."
     elif requested_enabled and running:
         status = "running"
         detail = (
-            "Background consciousness is idle between wakeups."
-            + (f" Next wakeup in {next_wakeup_sec}s." if next_wakeup_sec > 0 else "")
+            "Фоновое сознание бездействует между пробуждениями."
+            + (f" Следующее пробуждение через {next_wakeup_sec} с." if next_wakeup_sec > 0 else "")
         )
     elif requested_enabled:
         status = "stopped"
-        detail = "Enabled in state, but the background thread is not running."
+        detail = "Включено в настройках, но фоновый поток не запущен."
 
     if idle_reason == "error_backoff" and snapshot.get("last_error"):
         status = "error_backoff"
-        detail = f"Waiting to retry after an internal error: {snapshot['last_error']}"
+        detail = f"Ожидание повторной попытки после внутренней ошибки: {snapshot['last_error']}"
 
     return {
         "enabled": requested_enabled,

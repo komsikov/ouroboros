@@ -1260,7 +1260,7 @@ def get_evolution_status_snapshot() -> Dict[str, Any]:
         None,
     )
     status = "disabled"
-    detail = "Evolution mode is off."
+    detail = "Режим эволюции выключен."
 
     campaign = _read_evolution_campaign()
     active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
@@ -1272,39 +1272,39 @@ def get_evolution_status_snapshot() -> Dict[str, Any]:
 
     if restart_blocked:
         status = "waiting_for_restart_verify"
-        detail = "Waiting for restart verification before the next absorbed evolution cycle."
+        detail = "Ожидание проверки перезапуска перед следующим циклом поглощённой эволюции."
     elif isinstance(running_task, dict):
         status = "running"
-        detail = "Evolution task is running now."
+        detail = "Задача эволюции выполняется."
     elif isinstance(queued_task, dict):
         status = "queued"
-        detail = "Evolution task is queued and waiting for a worker."
+        detail = "Задача эволюции в очереди и ожидает исполнителя."
     elif consecutive_failures >= 3:
         status = "paused_failures"
         detail = (
-            f"Paused after {consecutive_failures} consecutive failures. "
-            "Use Evolve again after investigating the failure."
+            f"Приостановлено после {consecutive_failures} последовательных неудач. "
+            "Используйте Evolve повторно после устранения причин."
         )
     elif enabled and not owner_chat_id:
         status = "waiting_for_owner_chat"
-        detail = "Waiting for the first owner chat binding before scheduling evolution."
+        detail = "Ожидание привязки первого чата владельца перед запуском эволюции."
     elif enabled and remaining < EVOLUTION_BUDGET_RESERVE:
         status = "budget_blocked"
         detail = (
-            f"Budget reserve active: ${remaining:.2f} remaining, "
-            f"${EVOLUTION_BUDGET_RESERVE:.0f} reserved for conversations."
+            f"Бюджетный резерв активен: ${remaining:.2f} осталось, "
+            f"${EVOLUTION_BUDGET_RESERVE:.0f} зарезервировано для диалогов."
         )
     elif enabled and (PENDING or RUNNING):
         status = "waiting_for_idle"
-        detail = "Waiting for active tasks to finish before the next evolution cycle."
+        detail = "Ожидание завершения активных задач перед следующим циклом эволюции."
     elif enabled:
         status = "idle_ready"
-        detail = "Idle and ready to queue the next evolution cycle."
+        detail = "Простой: готово к постановке следующего цикла эволюции в очередь."
     elif remaining < EVOLUTION_BUDGET_RESERVE and str(st.get("last_evolution_task_at") or "").strip():
         status = "budget_stopped"
         detail = (
-            f"Evolution auto-stopped because only ${remaining:.2f} remains, "
-            f"below the ${EVOLUTION_BUDGET_RESERVE:.0f} conversation reserve."
+            f"Эволюция автоматически остановлена: осталось ${remaining:.2f}, "
+            f"что ниже резерва ${EVOLUTION_BUDGET_RESERVE:.0f} для диалогов."
         )
 
     return {
