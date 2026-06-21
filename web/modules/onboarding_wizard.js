@@ -159,7 +159,7 @@
     }
 
     function runtimeModeLabel(mode) {
-        return optionByValue(RUNTIME_MODES, mode).label || 'Advanced';
+        return optionByValue(RUNTIME_MODES, mode).label || 'Стандартный';
     }
 
     function localRoutingLabel(mode) {
@@ -710,17 +710,17 @@
                 <div class="wizard-choice-grid three">
                     <button type="button" class="wizard-choice light ${runtimeMode === 'light' ? 'active' : ''}" data-runtime-mode="light"${disabledAttr}>
                         <span class="tone">Безопаснее</span>
-                        <h3>Light</h3>
+                        <h3>Лёгкий</h3>
                         <p>Самомодификация основного репозитория отключена. Лучший вариант для знакомства с Ouroboros или использования как чистого ассистента.</p>
                     </button>
                     <button type="button" class="wizard-choice advanced ${runtimeMode === 'advanced' ? 'active' : ''}" data-runtime-mode="advanced"${disabledAttr}>
                         <span class="tone">По умолчанию</span>
-                        <h3>Advanced</h3>
-                        <p>Самомодификация эволюционного слоя разрешена (текущее поведение). Защищённые файлы ядра/контрактов/релизов охраняются в режиме Advanced.</p>
+                        <h3>Стандартный</h3>
+                        <p>Самомодификация эволюционного слоя разрешена (текущее поведение). Защищённые файлы ядра/контрактов/релизов охраняются в стандартном режиме.</p>
                     </button>
                     <button type="button" class="wizard-choice pro ${runtimeMode === 'pro' ? 'active' : ''}" data-runtime-mode="pro"${disabledAttr}>
                         <span class="tone">Расширенный</span>
-                        <h3>Pro</h3>
+                        <h3>Про</h3>
                         <p>Прямой режим защищённых поверхностей. Редактирование защищённых файлов ядра/контрактов/релизов разрешено, но коммиты по-прежнему проходят через триаду и проверку области.</p>
                     </button>
                 </div>

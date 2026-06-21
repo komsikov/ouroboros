@@ -160,3 +160,38 @@ def test_settings_post_errors_on_max_route_change_when_provider_unreachable(monk
     # The model was NOT saved — the error path returns before persistence.
     assert current["OUROBOROS_MODEL"] == "openrouter/gpt-5.5"
     assert current["OUROBOROS_CONTEXT_MODE"] == "max"
+
+
+def test_settings_post_requires_password_when_changing_bind_to_wildcard(monkeypatch, tmp_path):
+    from ouroboros.config import SETTINGS_DEFAULTS as _defaults
+
+    current = dict(_defaults)
+    current["OUROBOROS_SERVER_HOST"] = "127.0.0.1"
+    client = _settings_client(monkeypatch, tmp_path, current)
+
+    resp = client.post(
+        "/api/settings",
+        json={"OUROBOROS_SERVER_HOST": "0.0.0.0"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "сетевой пароль" in resp.json()["error"].lower()
+    assert current["OUROBOROS_SERVER_HOST"] == "127.0.0.1"
+
+
+def test_settings_post_allows_wildcard_bind_without_password_when_trusted(monkeypatch, tmp_path):
+    from ouroboros.config import SETTINGS_DEFAULTS as _defaults
+
+    monkeypatch.setenv("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "1")
+    current = dict(_defaults)
+    current["OUROBOROS_SERVER_HOST"] = "127.0.0.1"
+    client = _settings_client(monkeypatch, tmp_path, current)
+
+    resp = client.post(
+        "/api/settings",
+        json={"OUROBOROS_SERVER_HOST": "0.0.0.0"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert current["OUROBOROS_SERVER_HOST"] == "0.0.0.0"
+    assert any("TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD" in w for w in resp.json().get("warnings", []))

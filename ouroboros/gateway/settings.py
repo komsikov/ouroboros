@@ -83,6 +83,11 @@ def _is_wildcard_host(host: str) -> bool:
     return host in _WILDCARD_HOSTS
 
 
+def _trust_nonlocal_bind_without_password_enabled() -> bool:
+    raw = os.environ.get("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_network_meta(bind_host: str, bind_port: int) -> dict:
     """Build /api/settings network metadata."""
     from ouroboros.server_auth import get_network_auth_startup_warning, is_loopback_host
@@ -96,7 +101,7 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
             "lan_ip": "",
             "reachability": "loopback_only",
             "recommended_url": "",
-            "warning": "Server is bound to localhost — not accessible from other devices.",
+            "warning": "Сервер привязан к localhost — недоступен с других устройств.",
         }
     wildcard = _is_wildcard_host(bind_host)
     if wildcard:
@@ -122,7 +127,7 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
         recommended_url = f"http://your-host-ip:{bind_port}"
         warning = " ".join(
             part for part in [
-                "Could not detect LAN IP automatically." if wildcard else "",
+                "Не удалось автоматически определить LAN IP." if wildcard else "",
                 auth_warning,
             ]
             if part
@@ -521,21 +526,23 @@ def _max_context_block(settings: Dict[str, Any]):
         # The probe REACHED the provider but it was down (owner decision P4:
         # "no connection -> error", not a silent downgrade).
         probe_failed = (ev.status == STATUS_FAILED)
+        model_label = str(route.get("model") or "").strip() or "модель"
         if probe_failed:
             msg = (
-                f"Couldn't reach the provider to verify {route['model']}'s context "
-                "window (no connection). The model was not changed — check the "
-                "connection and try again."
+                f"Не удалось связаться с провайдером для проверки контекстного окна "
+                f"модели {model_label} (нет соединения). Модель не была изменена — "
+                "проверьте подключение и повторите попытку."
             )
         elif verified:
             msg = (
-                f"Model {route['model']} has a confirmed context window of "
-                f"~{win // 1000}K tokens — below the 1M needed for Max context mode."
+                f"У модели {model_label} подтверждённое контекстное окно "
+                f"~{win // 1000}K токенов — ниже 1M, необходимого для режима "
+                "«Максимальный»."
             )
         else:
             msg = (
-                f"Couldn't confirm a 1M context window for {route['model']} "
-                "(no provider metadata for this route)."
+                f"Не удалось подтвердить контекстное окно 1M для {model_label} "
+                "(нет метаданных провайдера для этого маршрута)."
             )
         return {
             "error": msg,
@@ -546,7 +553,7 @@ def _max_context_block(settings: Dict[str, Any]):
         }
     except Exception as exc:  # probe machinery could not run => fail-closed (downgrade, not a connectivity error)
         return {
-            "error": f"Couldn't verify this model's capability for Max context mode: {exc}",
+            "error": f"Не удалось проверить возможности модели для режима «Максимальный»: {exc}",
             "needs_ack": {}, "window_tokens": 0, "verified": False, "probe_failed": False,
         }
 
@@ -607,8 +614,8 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     previous_mode = _config.get_context_mode()
     if previous_mode == "max" and next_mode == "low" and _has_running_agent_tasks():
         return json_error(
-            "Context mode can only be lowered while Ouroboros is idle. "
-            "Wait for running tasks to finish, then switch Low/Max.",
+            "Режим контекста можно понизить только когда Ouroboros простаивает. "
+            "Дождитесь завершения задач, затем переключите «Низкий»/«Максимальный».",
             409,
         )
     current = _owner_read_settings_raw()
@@ -902,6 +909,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             from ouroboros.server_auth import is_loopback_host
             desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
             desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+            trust_unauth = _trust_nonlocal_bind_without_password_enabled()
             allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
             if desired_host and desired_host not in allowed_saved_hosts:
                 return json_error(
@@ -911,12 +919,12 @@ async def api_settings_post(request: Request) -> JSONResponse:
                     "a reliable loopback health check.",
                     400,
                 )
-            if desired_host and not is_loopback_host(desired_host) and not desired_password:
+            if desired_host and not is_loopback_host(desired_host) and not desired_password and not trust_unauth:
                 return json_error(
-                    "Setting a non-localhost Server Bind Host through the web UI "
-                    "requires a Network Password in the same save. For manual "
-                    "trusted-lab/Docker setups, stop Ouroboros and edit "
-                    "settings.json or environment variables directly.",
+                    "Для хоста привязки вне localhost через веб-интерфейс нужен "
+                    "сетевой пароль в том же сохранении. Для Docker/lab: "
+                    "остановите Ouroboros и правьте settings.json или переменные "
+                    "окружения напрямую.",
                     400,
                 )
             current_effective_host = (
@@ -929,11 +937,12 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 and not is_loopback_host(current_effective_host)
                 and old_password
                 and not desired_password
+                and not trust_unauth
             ):
                 return json_error(
-                    "Cannot clear Network Password while the running server is "
-                    "still bound to a non-localhost interface. First save a "
-                    "loopback Server Bind Host and restart, then clear the password.",
+                    "Нельзя очистить сетевой пароль, пока сервер привязан к "
+                    "интерфейсу вне localhost. Сначала сохраните loopback-хост "
+                    "(127.0.0.1) и перезапустите, затем очистите пароль.",
                     400,
                 )
         except Exception:
@@ -968,14 +977,15 @@ async def api_settings_post(request: Request) -> JSONResponse:
                         # is an ERROR, not a silent downgrade — and the model is NOT
                         # saved. (A sub-1M/unprobeable route still auto-downgrades.)
                         return json_error(
-                            str(_block.get("error") or "Couldn't reach the provider to verify the model's context window."),
+                            str(_block.get("error") or "Не удалось связаться с провайдером для проверки контекстного окна модели."),
                             503,
                         )
                     current["OUROBOROS_CONTEXT_MODE"] = "low"
                     os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
                     _max_downgrade_notice = (
                         str(_block.get("error") or "")
-                        + " Context mode switched to Low. To use Max with this model, confirm it supports a 1M-token context window."
+                        + " Режим контекста переключён на «Низкий». Чтобы использовать «Максимальный» "
+                        "с этой моделью, подтвердите, что она поддерживает контекстное окно 1M токенов."
                     )
         all_changed = [
             k for k in current
@@ -1056,11 +1066,30 @@ async def api_settings_post(request: Request) -> JSONResponse:
             change_kind = classify_runtime_provider_change(old_effective_settings, current)
             if change_kind == "direct_normalize":
                 warnings.append(
-                    "Normalized direct-provider routing because OpenRouter is not configured for the active provider."
+                    "Маршрутизация прямого провайдера нормализована: OpenRouter не настроен для активного провайдера."
                 )
         try:
             from supervisor.message_bus import get_bridge
             get_bridge().configure_from_settings(current)
+        except Exception:
+            pass
+        try:
+            from ouroboros.server_auth import is_loopback_host
+            desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
+            desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+            if desired_host and not is_loopback_host(desired_host) and not desired_password:
+                if _trust_nonlocal_bind_without_password_enabled():
+                    warnings.append(
+                        "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1 разрешает "
+                        "привязку вне localhost без встроенного сетевого пароля Ouroboros. "
+                        "Используйте только за ingress-аутентификацией, VPN, "
+                        "приватной сетью или auth-proxy."
+                    )
+                else:
+                    warnings.append(
+                        "Хост привязки вне localhost, сетевой пароль пуст; "
+                        "после перезапуска приложение будет доступно в сети без пароля."
+                    )
         except Exception:
             pass
         _repo_slug = current.get("GITHUB_REPO", "")
@@ -1075,7 +1104,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             )
             if not remote_ok:
                 log.warning("Remote configuration failed on settings save: %s", remote_msg)
-                warnings.append(f"Remote config failed: {remote_msg}")
+                warnings.append(f"Не удалось настроить удалённый репозиторий: {remote_msg}")
             elif resolved_slug and resolved_slug != _repo_slug:
                 current["GITHUB_REPO"] = resolved_slug
                 settings_to_save["GITHUB_REPO"] = resolved_slug

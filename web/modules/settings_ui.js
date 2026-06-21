@@ -399,16 +399,16 @@ export function renderSettingsPage() {
                         <h3>Режим контекста</h3>
                         <div class="settings-section-copy">
                             Профиль размера рабочего контекста (отдельная ось от режима среды выполнения и режима проверки).
-                            <code>Max</code> встраивает ARCHITECTURE и DEVELOPMENT полностью &mdash; для моделей с контекстом ~1M (текущее поведение).
-                            <code>Low</code> рассчитан на ~200K / локальные модели: ARCHITECTURE становится навигационной картой (полные разделы читаются по запросу), DEVELOPMENT остаётся полным для обычных исполняемых задач, если структурированный неразработческий вызов не отказался от него, а память уплотняется раньше. Не меняет модель или уровень рассуждений и не понижает минимальный контекст проверки.
+                            <code>Макс</code> встраивает ARCHITECTURE и DEVELOPMENT полностью &mdash; для моделей с контекстом ~1M (текущее поведение).
+                            <code>Мин</code> рассчитан на ~200K / локальные модели: ARCHITECTURE становится навигационной картой (полные разделы читаются по запросу), DEVELOPMENT остаётся полным для обычных исполняемых задач, если структурированный неразработческий вызов не отказался от него, а память уплотняется раньше. Не меняет модель или уровень рассуждений и не понижает минимальный контекст проверки.
                             <br><strong>Управляется человеком:</strong> сохраняется через endpoint владельца; применяется к следующей задаче (без перезапуска).
                         </div>
                         <div class="settings-effort-card">
                             <label>Режим контекста</label>
                             <input id="s-context-mode" type="hidden" value="max">
                             <div class="settings-effort-group" data-effort-group data-effort-target="s-context-mode" title="Применяется к следующей задаче; перезапуск не требуется.">
-                                <button type="button" class="settings-effort-btn" data-effort-value="low">Low</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="max">Max</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="low">Мин</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="max">Макс</button>
                             </div>
                         </div>
                     </div>
@@ -417,9 +417,9 @@ export function renderSettingsPage() {
                         <h3>Режим среды выполнения</h3>
                         <div class="settings-section-copy">
                             Отдельная ось от режима проверки. Управляет степенью самомодификации Ouroboros.
-                            <code>Light</code> блокирует самомодификацию репозитория, но позволяет запускать проверенные и включённые навыки.
-                            <code>Advanced</code> — режим по умолчанию: самомодификация эволюционного слоя разрешена; защищённые файлы ядра/контрактов/релизов охраняются политикой режима.
-                            <code>Pro</code> позволяет редактировать защищённые поверхности ядра/контрактов/релизов, но коммиты по-прежнему проходят через триаду и проверку области.
+                            <code>Лёгкий</code> блокирует самомодификацию репозитория, но позволяет запускать проверенные и включённые навыки.
+                            <code>Стандартный</code> — режим по умолчанию: самомодификация эволюционного слоя разрешена; защищённые файлы ядра/контрактов/релизов охраняются политикой режима.
+                            <code>Про</code> позволяет редактировать защищённые поверхности ядра/контрактов/релизов, но коммиты по-прежнему проходят через триаду и проверку области.
                             <br><strong>Управляется пользователем:</strong> десктопные сборки запрашивают нативное подтверждение лаунчера перед сохранением изменения режима.
                             Веб/Docker-сессии сохраняют изменение режима через owner-эндпоинт; новый режим вступает в силу после перезапуска.
                         </div>
@@ -427,9 +427,9 @@ export function renderSettingsPage() {
                             <label>Режим среды выполнения</label>
                             <input id="s-runtime-mode" type="hidden" value="advanced">
                             <div class="settings-effort-group" data-effort-group data-runtime-mode-group data-effort-target="s-runtime-mode" title="Изменение режима среды требует нативного подтверждения лаунчера и перезапуска.">
-                                <button type="button" class="settings-effort-btn" data-effort-value="light">Light</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="advanced">Advanced</button>
-                                <button type="button" class="settings-effort-btn" data-effort-value="pro">Pro</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="light">Лёгкий</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="advanced">Стандартный</button>
+                                <button type="button" class="settings-effort-btn" data-effort-value="pro">Про</button>
                             </div>
                         </div>
                     </div>
@@ -438,7 +438,7 @@ export function renderSettingsPage() {
                         <h3>Изменяющие субагенты</h3>
                         <div class="settings-section-copy">
                             Главный переключатель того, может ли Ouroboros порождать изменяющие («действующие») субагенты, которые пишут код &mdash; в изолированном git-worktree этого репозитория, во внешнем рабочем пространстве или в проекте с нуля &mdash; и возвращают патчи для проверки и интеграции родителем. Субагенты только для чтения разрешены всегда.
-                            Поведение по умолчанию следует за режимом среды выполнения, если нет переопределения владельца: ВЫКЛ в Light, ВКЛ в Advanced/Pro. Этот элемент сохраняет явное переопределение Вкл/Выкл.
+                            Поведение по умолчанию следует за режимом среды выполнения, если нет переопределения владельца: ВЫКЛ в Лёгком, ВКЛ в Стандартном/Про. Этот элемент сохраняет явное переопределение Вкл/Выкл.
                             <br><strong>Управляется человеком:</strong> агент не может включить это сам; применяется к следующей задаче (без перезапуска).
                         </div>
                         <div class="settings-effort-card">
@@ -466,7 +466,7 @@ export function renderSettingsPage() {
                                 <button type="button" class="settings-effort-btn" data-effort-value="llm">После каждой задачи (решает LLM)</button>
                                 <button type="button" class="settings-effort-btn" data-effort-value="every_n">Каждые N задач</button>
                             </div>
-                            <div class="settings-inline-note"><strong>Считаются все подходящие задачи, включая короткие чаты.</strong> <code>Every N=1</code> означает, что Ouroboros рассматривает самоулучшение после каждой задачи, а фактический цикл запускается позже на idle-тике супервизора.</div>
+                            <div class="settings-inline-note"><strong>Считаются все подходящие задачи, включая короткие чаты.</strong> <code>Каждые N=1</code> означает, что Ouroboros рассматривает самоулучшение после каждой задачи, а фактический цикл запускается позже на idle-тике супервизора.</div>
                         </div>
                         <div class="form-row">
                             <div class="form-field">
@@ -529,7 +529,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>ClawHub Marketplace</h3>
+                        <h3>Маркетплейс ClawHub</h3>
                         <div class="settings-section-copy">
                             Всегда доступная площадка для установки навыков сообщества с
                             <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
@@ -726,7 +726,7 @@ export function renderSettingsPage() {
                             Рождён 16 февраля 2026 года.
                         </p>
                         <div class="about-credits">
-                            <span>Created by <strong>Anton Razzhigaev</strong> &amp; <strong>Andrew Kaznacheev</strong></span>
+                            <span>Создано <strong>Anton Razzhigaev</strong> и <strong>Andrew Kaznacheev</strong></span>
                             <div class="about-links">
                                 <a href="https://t.me/abstractDL" target="_blank" rel="noopener noreferrer">@abstractDL</a>
                                 <a href="https://github.com/razzant/ouroboros" target="_blank" rel="noopener noreferrer">GitHub</a>

@@ -116,7 +116,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Консилиум: разовый мозговой штурм/план несколькими субагентами (plan_task + веб-поиск) для следующего сообщения. Автоматически снимается после отправки.">Consilium</button>
+                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Консилиум: разовый мозговой штурм/план несколькими субагентами (plan_task + веб-поиск) для следующего сообщения. Автоматически снимается после отправки.">Консилиум</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Режим размера контекста" title="Режим контекста (настройка владельца). Low — около 200K / локальные модели; Max — полный. Применяется к следующей задаче.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>

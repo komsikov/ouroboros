@@ -116,8 +116,8 @@ function customSecretRow(key = '', value = '') {
     row.className = 'settings-custom-secret-row';
     row.dataset.customSecretRow = '1';
     row.innerHTML = `
-        <div class="form-field settings-custom-secret-key"><label>Key</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
-        <div class="form-field settings-custom-secret-value"><label>Value</label><div class="secret-input-row">
+        <div class="form-field settings-custom-secret-key"><label>Ключ</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
+        <div class="form-field settings-custom-secret-value"><label>Значение</label><div class="secret-input-row">
             <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Значение секрета">
             <button type="button" class="secret-icon-btn secret-toggle" data-row-secret-toggle aria-label="Показать секрет" title="Показать секрет"></button>
             <button type="button" class="secret-icon-btn secret-clear" data-row-secret-clear aria-label="Очистить секрет" title="Очистить секрет"></button>
@@ -469,8 +469,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (checkbox) checkbox.disabled = false;
         if (label) {
             label.title = hasBridge
-                ? 'Requires native confirmation. Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.'
-                : 'Uses the owner endpoint. Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.';
+                ? 'Требует нативного подтверждения. Применяется только после свежей исполнимой проверки навыка и только для разрешений из манифеста для этого хэша содержимого.'
+                : 'Использует owner-эндпоинт. Применяется только после свежей исполнимой проверки навыка и только для разрешений из манифеста для этого хэша содержимого.';
         }
     }
 
@@ -583,19 +583,19 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const hint = document.getElementById('settings-lan-hint');
         if (!hint || !meta) return;
         if (meta.reachability === 'loopback_only') {
-            hint.innerHTML = 'Bound to <code>localhost</code>: only accessible from this machine. Set Server Bind Host to <code>0.0.0.0</code>, save, and restart for LAN access.';
+            hint.innerHTML = 'Привязка к <code>localhost</code>: доступ только с этой машины. Установите хост привязки <code>0.0.0.0</code>, сохраните и перезапустите для доступа по LAN.';
             hint.dataset.tone = 'info';
             hint.hidden = false;
         } else if (meta.reachability === 'lan_reachable') {
             const url = escapeHtml(meta.recommended_url || '');
             const warning = escapeHtml(meta.warning || '');
-            hint.innerHTML = `LAN URL: <a href="${url}" target="_blank" rel="noopener">${url}</a>${warning ? ' — <strong>' + warning + '</strong>' : ''}`;
+            hint.innerHTML = `URL в LAN: <a href="${url}" target="_blank" rel="noopener">${url}</a>${warning ? ' — <strong>' + warning + '</strong>' : ''}`;
             hint.dataset.tone = meta.warning ? 'warn' : 'ok';
             hint.hidden = false;
         } else if (meta.reachability === 'host_ip_unknown') {
             const url = escapeHtml(meta.recommended_url || '');
             const warning = escapeHtml(meta.warning || '');
-            hint.innerHTML = `Server is listening on non-localhost but LAN IP could not be detected automatically. Try <code>${url}</code>.${warning ? ' <strong>' + warning + '</strong>' : ''}`;
+            hint.innerHTML = `Сервер слушает вне localhost, но LAN IP не удалось определить автоматически. Попробуйте <code>${url}</code>.${warning ? ' <strong>' + warning + '</strong>' : ''}`;
             hint.dataset.tone = 'warn';
             hint.hidden = false;
         } else {
@@ -781,7 +781,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         try {
             const result = await apiClient.ownerContextMode(next);
             if (!result || result.ok !== true) {
-                throw new Error(result?.error || 'Context mode change failed.');
+                throw new Error(result?.error || 'Не удалось сменить режим контекста.');
             }
             return result;
         } catch (e) {
@@ -790,14 +790,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 throw e;
             }
             const confirmed = window.confirm(
-                `${(e.body && e.body.error) || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                `Confirm that this model supports a 1,000,000-token context window?\n` +
-                `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
-                `  base_url: ${ack.base_url || '(default)'}\n\n` +
-                `This applies only to this exact model/provider and is removed if you change it.`
+                `${(e.body && e.body.error) || 'Режим «Максимальный» требует подтверждённого окна контекста 1M токенов.'}\n\n` +
+                `Подтвердить, что эта модель поддерживает контекстное окно 1 000 000 токенов?\n` +
+                `  провайдер: ${ack.provider || '(по умолчанию)'}\n  модель: ${ack.model}\n` +
+                `  base_url: ${ack.base_url || '(по умолчанию)'}\n\n` +
+                `Применяется только к этой паре провайдер/модель и сбрасывается при её смене.`
             );
             if (!confirmed) {
-                throw new Error('Max context mode was not confirmed.');
+                throw new Error('Режим «Максимальный» не был подтверждён.');
             }
             // Throws on a non-ok ack (surfaced by the save handler's catch).
             await apiClient.ownerCapabilityAck({
@@ -806,7 +806,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             });
             const retry = await apiClient.ownerContextMode(next);
             if (!retry || retry.ok !== true) {
-                throw new Error(retry?.error || 'Context mode change failed after confirmation.');
+                throw new Error(retry?.error || 'Не удалось сменить режим контекста после подтверждения.');
             }
             return retry;
         }
@@ -918,7 +918,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         panel.innerHTML = items.map((item) => `
             <button type="button" class="model-picker-item" data-value="${escapeHtml(item.value)}">
                 <span class="model-picker-item-value">${escapeHtml(item.value)}</span>
-                <span class="model-picker-item-label">${escapeHtml(item.label || item.provider || 'Catalog model')}</span>
+                <span class="model-picker-item-label">${escapeHtml(item.label || item.provider || 'Модель из каталога')}</span>
             </button>
         `).join('');
         panel.hidden = false;
@@ -975,10 +975,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         settingsModelCatalogItems = items.length
             ? items.map((item) => ({
                 value: item.value || item.id || '',
-                label: item.label || item.provider || 'Catalog model',
+                label: item.label || item.provider || 'Модель из каталога',
                 provider: item.provider || '',
             })).filter((item) => item.value)
-            : SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));
+            : SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Рекомендуемая модель' }));
         page.querySelectorAll('[data-model-picker]').forEach((picker) => {
             const panel = picker.querySelector('.model-picker-results');
             if (panel && !panel.hidden) {
@@ -1041,7 +1041,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // into a valid (e.g. every-task) cadence. Abort with a visible error instead.
         if (byId('s-post-task-evolution-mode')?.value === 'every_n'
             && !/^[1-9]\d*$/.test((byId('s-evo-cadence-n')?.value || '').trim())) {
-            setStatus('Every-N cadence needs a whole number ≥ 1.', 'warn');
+            setStatus('Для режима «Каждые N задач» укажите целое число ≥ 1.', 'warn');
             return;
         }
         const body = collectBody();
@@ -1091,7 +1091,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             }
             if (data.context_mode_downgraded) {
                 // The new model can't sustain Max, so context mode auto-dropped to Low.
-                statusMsg = `${statusMsg} ${data.notice || 'Context mode switched to Low.'}`;
+                statusMsg = `${statusMsg} ${data.notice || 'Режим контекста переключён на «Низкий».'}`;
                 statusType = 'warn';
             }
             if (runtimeModeResult?.restart_required) {

@@ -75,8 +75,8 @@ def get_network_auth_startup_warning(bind_host: str) -> str | None:
     if get_configured_network_password():
         return None
     return (
-        "Server is binding to a non-loopback host without OUROBOROS_NETWORK_PASSWORD. "
-        "Access will stay open to the network until a password is configured."
+        "Сервер привязан к хосту вне localhost без OUROBOROS_NETWORK_PASSWORD. "
+        "Доступ в сети останется открытым, пока не настроен пароль."
     )
 
 

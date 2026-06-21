@@ -6473,6 +6473,10 @@ body.nav-collapsed .nav-budget-pill {
   color: #ffffff;
 }
 
+.chat-send-group[data-send-mode="plan"] .chat-send-chevron {
+  border-left: 1px solid rgba(255, 255, 255, 0.22);
+}
+
 #chat-input-area.drag-active .chat-input-wrap {
   box-shadow:
     0 0 0 1px rgba(36, 56, 112, 0.18),
