@@ -40,7 +40,7 @@ from ouroboros.tools.review_helpers import (
     paths_from_name_status,
     paths_from_porcelain_line as _review_paths_from_porcelain_line,
 )
-from ouroboros.tools.core import _data_skill_path, is_skill_control_plane_path
+from ouroboros.tools.core import _data_skill_path, _str_match_replace, is_skill_control_plane_path
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
 from ouroboros.contracts.skill_payload_policy import (
     cross_skill_redirect_error,
@@ -1121,28 +1121,11 @@ def _str_replace_editor(
     except Exception as e:
         return f"⚠️ STR_REPLACE_ERROR: cannot read {path}: {e}"
 
-    count = content.count(old_str)
-    if count == 0:
-        preview = content[:2000]
-        return (
-            f"⚠️ STR_REPLACE_ERROR: old_str not found in {path}.\n"
-            f"File preview (first 2000 chars):\n{preview}"
-        )
-    if count > 1:
-        positions = []
-        start = 0
-        for i in range(min(count, 5)):
-            idx = content.index(old_str, start)
-            line_num = content[:idx].count('\n') + 1
-            positions.append(f"line {line_num}")
-            start = idx + 1
-        return (
-            f"⚠️ STR_REPLACE_ERROR: old_str found {count} times in {path} "
-            f"(must be unique). Occurrences at: {', '.join(positions)}. "
-            f"Include more surrounding context in old_str to make it unique."
-        )
-
-    new_content = content.replace(old_str, new_str, 1)
+    # Shared exact-match single-replacement (deferral 4): identical count==0/count>1
+    # feedback for the repo and data-plane editors.
+    new_content, _match_err = _str_match_replace(content, old_str, new_str, path, "STR_REPLACE_ERROR")
+    if _match_err:
+        return _match_err
     try:
         write_text(target, new_content)
     except Exception as e:

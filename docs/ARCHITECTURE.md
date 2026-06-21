@@ -1,4 +1,4 @@
-# Ouroboros v6.39.0 — Architecture & Reference
+# Ouroboros v6.40.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -48,6 +48,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── loop.py              ← High-level LLM tool loop
       ├── loop_llm_call.py     ← Single-round LLM call + usage accounting
       ├── fallback_cooldown.py ← (v6.39) Per-process 429-aware cooldown for the `OUROBOROS_MODEL_FALLBACKS` cross-model chain: a transiently-failed model (429/5xx/overloaded) is parked for a short window so a task's own fallback walk and repeated rounds skip it instead of re-hammering. PER-PROCESS only (not a swarm-wide governor — each worker has its own map; cross-worker coordination is Phase 3). Advisory, default-on, fail-soft, passive (timestamp) heal
+      ├── model_concurrency.py ← (v6.40) Per-(model,use_local)-route `threading.BoundedSemaphore` capping CONCURRENT provider calls (`OUROBOROS_MODEL_MAX_CONCURRENCY`, default 3) so a task's main loop + its in-process subagent threads + status pings cannot self-DoS one model's rate limit — excess threads WAIT (deadline-bounded) instead of all firing 429s. PER-PROCESS only (like `fallback_cooldown`; heavy workers are separate processes, so this is not a swarm-wide governor — cross-worker admission is future work). Wraps ONLY the provider call in `loop_llm_call.call_llm_with_retry` (not the retry/backoff chain). Default-on, fail-soft
+      ├── project_naming.py    ← (v6.40) SSOT for LLM-first project naming: a bounded LIGHT-model title with a deterministic heuristic fallback (P5, no keyword gates, fail-soft), shared by the proactive card namer (`supervisor/workers.py`), turn-into-project conversion (`gateway/projects.py`), and `ensure_project_scope`. The provider call goes through the `model_concurrency` slot
       ├── loop_tool_execution.py ← Tool dispatch and tool-result handling
       ├── deadline_utils.py    ← Shared deadline parsing/remaining-time helpers for loop milestones and process-tool timeouts
       ├── observability.py     ← Private forensic execution ledger: redaction, gzip CAS blobs, call manifests, trace refs
@@ -185,6 +187,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── skill_preflight.py ← v5.7.0 heal-safe, read-only skill payload preflight validator (manifest parse + Python compile() / node --check / bash -n; no review-state mutation)
       │   ├── project_journal.py ← Thin per-project journal/workpad tools (v6.32.0): journal_write/read (durable milestone memory), workpad_read/write (scratch page), journal_tail_digest (context injection); over-limit writes are rejected, never silently sliced
       │   ├── task_tree.py     ← (v6.38.0) Task-tree coordination tools tree_note/tree_read (the swarm blackboard + child→parent beacons; storage in ouroboros/task_tree_ledger.py)
+      │   ├── join_ledger.py   ← (v6.40) D#7 soft-join decision tools peek_task (inspect a child's status/beacons/result tail WITHOUT absorbing) + discard_child_result (explicit, lineage-gated abandon stamping parent_decision); shared child-decision helpers (_is_own_child / _status_drive_root / _record_child_decision_beacon) reused by control._cancel_task. Extracted from control.py to keep it under the module size gate
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       └── platform_layer.py    ← Cross-platform process/path/locking helpers
 
@@ -1452,6 +1455,7 @@ Runtime floors:
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background Consciousness model slot. Empty means use `OUROBOROS_MODEL`; do not silently downgrade this lane to the light model or a smaller context as a cost optimization |
 | OUROBOROS_MODEL_FALLBACKS | anthropic/claude-sonnet-4.6 | Comma-separated cross-model fallback chain tried when the primary returns no usable response (429-aware cooldown, deduped, active model dropped; a benchmark setting all slots to one model dedupes to a no-op). (Renamed from `OUROBOROS_MODEL_FALLBACK`; stored/legacy values migrate.) |
 | OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT | 1 | Capability/cost cap (distinct from the hard nesting cap `OUROBOROS_MAX_SUBAGENT_DEPTH`): the subagent depth at/below which an explicit `main`/`heavy` lane is honored; deeper descendants fall to Light. A capped explicit request surfaces a visible note |
+| OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | (v6.40) Max CONCURRENT provider calls per (model, use_local) route; excess worker threads wait (deadline-bounded) instead of storming one model's rate limit (self-DoS guard, `ouroboros/model_concurrency.py`). <=0 disables. Default-on, fail-soft |
 | OUROBOROS_FALLBACK_COOLDOWN_ENABLED | true | Default-on, fail-soft. Put a model that just failed transiently (429/5xx/overloaded) on a short process-local cooldown so the fallback chain / swarm skips it briefly |
 | OUROBOROS_FALLBACK_COOLDOWN_SEC | 120 | Cooldown window length (seconds) for a transiently-failed model |
 | OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL | 1 | Per-fallback-candidate transient-retry cap (1–2); does not touch the primary model's same-model transient-retry budget |

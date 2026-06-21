@@ -1,15 +1,16 @@
-import { escapeHtmlAttr, escapeHtmlText as escapeHtml, formatUsdWhole, renderMarkdown } from './utils.js';
-import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
-import { showToast } from './toast.js';
-import { apiClient, apiFetch } from './api_client.js';
 import { trackMetric } from './analytics.js';
+import { apiClient, apiFetch } from './api_client.js';
 import {
+    compactModel,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     normalizeLogTs,
     summarizeChatLiveEvent,
 } from './log_events.js';
+import { renderPageHeader } from './page_header.js';
+import { PAGE_ICONS } from './page_icons.js';
+import { showToast } from './toast.js';
+import { escapeHtmlText as escapeHtml, escapeHtmlAttr, formatUsdWhole, renderMarkdown } from './utils.js';
 
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
@@ -350,6 +351,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     let historySyncPromise = null;
     let welcomeShown = false;
     const liveCardRecords = new Map();
+    // Cluster B: a proactively-coined name (task_named) can arrive BEFORE the card's
+    // liveCardRecords entry exists (the namer broadcasts as the task starts). Buffer it
+    // here so createLiveCardRecord can apply it when the card appears (no lost title).
+    const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
@@ -837,6 +842,13 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             subagentsEl: null,
             // Hidden-page layout sync is deferred until page/visibility returns.
             _needsLayoutSync: false,
+            // The owner's request that spawned this card (main, non-subagent only),
+            // used to name a project on "turn into project" when the server has no
+            // title/objective yet (P1, direct-chat conversion). One-shot handoff.
+            objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
+            // Cluster B: the proactively-coined LLM project name; when set it becomes
+            // the card title (the activity headline keeps rendering in the lines below).
+            suggestedName: '',
         };
         record.summaryButtonEl?.addEventListener('click', () => {
             setLiveCardExpanded(record, record.root.dataset.expanded !== '1');
@@ -857,6 +869,13 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             turnTaskIntoProject(record);
         });
         liveCardRecords.set(normalizedGroupId, record);
+        // Cluster B: apply a name that arrived (task_named) before this card existed.
+        const _pendingName = pendingSuggestedNames.get(normalizedGroupId);
+        if (_pendingName && !record.isSubagent) {
+            pendingSuggestedNames.delete(normalizedGroupId);
+            record.suggestedName = _pendingName;
+            if (record.titleEl) record.titleEl.textContent = _pendingName;
+        }
         resetLiveCardRecord(record);
         return record;
     }
@@ -864,6 +883,25 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
     function getLiveCardRecord(groupId = '') {
         const normalizedGroupId = groupId || activeLiveGroupId || 'chat';
         return liveCardRecords.get(normalizedGroupId) || createLiveCardRecord(normalizedGroupId);
+    }
+
+    // Cluster B: apply the proactively-coined project name to a main card already on
+    // screen (live `task_named` event or history replay). A main card's groupId IS its
+    // task_id, so the lookup is direct. No-op until the card exists / without a name.
+    function applySuggestedName(taskId, name) {
+        const tid = String(taskId || '').trim();
+        const nm = String(name || '').trim();
+        if (!tid || !nm) return;
+        const record = liveCardRecords.get(tid);
+        if (!record) {
+            // Card not created yet (the namer raced ahead of the first progress event).
+            // Buffer so createLiveCardRecord applies it when the card appears.
+            pendingSuggestedNames.set(tid, nm);
+            return;
+        }
+        if (record.isSubagent) return;
+        record.suggestedName = nm;
+        if (record.titleEl) record.titleEl.textContent = nm;
     }
 
     function ensureSubagentContainer(parentId = '') {
@@ -1172,7 +1210,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         record.phaseEl.dataset.phase = activePhase;
         record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
-        record.titleEl.textContent = activeHeadline;
+        // Cluster B: a coined project name takes the title slot; the live activity
+        // headline still renders in the timeline lines below. Falls back to the
+        // activity headline until the proactive namer has produced a name.
+        record.titleEl.textContent = record.suggestedName || activeHeadline;
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
         // Legacy parent-subagent rows update in place if replayed from old
@@ -1290,6 +1331,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             finishLiveCard(taskId, 'done');
             return;
         }
+        // Cluster B: a card (re)built from a task_summary row also carries the coined name
+        // on reload (history attaches suggested_name to summary rows too) — apply it so the
+        // title survives even when no progress row was retained.
+        if (msg?.suggested_name) applySuggestedName(taskId, msg.suggested_name);
         const taskState = getTaskUiState(taskId, false);
         if (!taskState) {
             finishLiveCard(taskId, 'done');
@@ -1344,14 +1389,28 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         failed: 'failed', rejected: 'rejected', cancelled: 'cancelled', interrupted: 'interrupted',
     };
 
-    function formatSubagentHeadline(childId = '', role = '', label = '') {
+    // E2 (v6.39 UI): merge a subagent's parent/role/model, PRESERVING a previously-seen model
+    // when a later (model-less) event — e.g. a synthesized terminal — updates the entry, so the
+    // "role · model" headline survives the child's lifecycle.
+    function setSubagentParent(childId, { parentId = '', role = '', model = '' } = {}) {
+        const prev = subagentChildParents.get(childId) || {};
+        subagentChildParents.set(childId, {
+            parentId: parentId || prev.parentId || '',
+            role: role || prev.role || '',
+            model: String(model || '').trim() || prev.model || '',
+        });
+    }
+
+    function formatSubagentHeadline(childId = '', role = '', label = '', model = '') {
         const shortChild = String(childId || '').slice(0, 8);
         const cleanRole = String(role || '').trim();
         const suffix = label ? ` — ${label}` : '';
+        // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
+        const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
         if (cleanRole) {
-            return `${cleanRole}${shortChild ? ` (${shortChild})` : ''}${suffix}`;
+            return `${cleanRole}${modelPart}${shortChild ? ` (${shortChild})` : ''}${suffix}`;
         }
-        return `Subagent ${shortChild || 'child'}${suffix}`;
+        return `Subagent ${shortChild || 'child'}${modelPart}${suffix}`;
     }
 
     function updateLiveCardFromProgressMessage(msg) {
@@ -1395,6 +1454,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         });
         if (!summary) return;
         queueTaskLiveUpdate(summary, taskId, normalizeLogTs(msg.ts || new Date().toISOString()), summary.dedupeKey || '');
+        // Cluster B: history progress recs carry the coined name (live progress does
+        // not — the live path uses the separate `task_named` event). Apply it after the
+        // card exists so a reload shows the same title.
+        if (msg?.suggested_name) applySuggestedName(taskId, msg.suggested_name);
     }
 
     function updateSubagentCardFromEvent(evt, tsValue) {
@@ -1404,7 +1467,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (!parentId || !childId || parentId === childId) return false;
         const event = String(evt.subagent_event || 'update').toLowerCase();
         const role = String(evt.subagent_role || '').trim();
-        subagentChildParents.set(childId, { parentId, role });
+        setSubagentParent(childId, { parentId, role, model: evt.model });
+        const { model } = subagentChildParents.get(childId) || {};
         // NOTE: 'interrupted' is intentionally excluded — it is retryable
         // (written before requeue), so the child resumes and its later progress
         // must still flow to its card. Only true terminals lock it.
@@ -1414,7 +1478,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const phase = SUBAGENT_EVENT_PHASE[event] || 'working';
         const label = SUBAGENT_EVENT_LABEL[event] || event;
         const shortChild = childId.slice(0, 8);
-        const headline = formatSubagentHeadline(childId, role, label);
+        const headline = formatSubagentHeadline(childId, role, label, model);
         // Surface the child's handoff (result/trace/error) as expandable detail
         // on the child card.
         const detailParts = [];
@@ -1448,10 +1512,10 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const info = subagentChildParents.get(childId);
         if (!info) return;
         if (subagentTerminalChildren.has(childId)) return;  // never revive a finished child
-        const { parentId, role } = info;
+        const { parentId, role, model } = info;
         const shortChild = String(childId).slice(0, 8);
         const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
-        const headline = formatSubagentHeadline(childId, role, 'running');
+        const headline = formatSubagentHeadline(childId, role, 'running', model);
         forceTaskCard(parentId);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
@@ -1473,7 +1537,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         const childId = String(taskId || '').trim();
         const info = subagentChildParents.get(childId);
         if (!childId || !info) return false;
-        const { parentId, role } = info;
+        const { parentId, role, model } = info;
         const shortChild = childId.slice(0, 8);
         const text = String(msg?.content || msg?.text || '').trim();
         forceTaskCard(parentId);
@@ -1482,7 +1546,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (role) meta.push(`role=${role}`);
         queueTaskLiveUpdate({
             phase: 'done',
-            headline: formatSubagentHeadline(childId, role, 'result'),
+            headline: formatSubagentHeadline(childId, role, 'result', model),
             body: text.slice(0, 200),
             fullBody: text,
             visible: true,
@@ -1539,6 +1603,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             subagent_task_id: childId,
             subagent_role: info.role,
             subagent_event: event,
+            model: info.model || '',
             result: evt.result || '',
             error: evt.error || '',
         }, evt.ts || evt.timestamp || new Date().toISOString());
@@ -1738,6 +1803,27 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
+                    // Subagent lineage + terminal state live only in memory. Clear and
+                    // rebuild them from durable history BEFORE the card passes, so a
+                    // finished child card finalizes regardless of replay order or which
+                    // event carried the terminal signal (a subagent 'completed' event OR
+                    // a server task_terminal_status). Otherwise finished children stick
+                    // on "working" and get revived by parent heartbeats on reload.
+                    subagentChildParents.clear();
+                    subagentTerminalChildren.clear();
+                    for (const msg of messages) {
+                        if (String(msg.delegation_role || '').toLowerCase() !== 'subagent') continue;
+                        const parentId = String(msg.parent_task_id || '').trim();
+                        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
+                        if (!parentId || !childId || parentId === childId) continue;
+                        if (!subagentChildParents.has(childId)) {
+                            setSubagentParent(childId, { parentId, role: String(msg.subagent_role || '').trim(), model: msg.model });
+                        }
+                        const ev = String(msg.subagent_event || '').toLowerCase();
+                        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {
+                            subagentTerminalChildren.add(childId);
+                        }
+                    }
                 }
 
                 // Two passes ensure cards exist before finishLiveCard() marks them done.
@@ -2375,6 +2461,14 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         if (!msg?.data) return;
         if (!isMyThread(msg.data, { mirrorProject: true })) return;
         updateLiveCardFromLogEvent(msg.data);
+    });
+
+    // Cluster B: the proactive namer coined a project name for a fresh card — show it
+    // as the card title up front (turn-into-project then reuses the same name). Not
+    // thread-gated on chat_id: the broadcast carries only task_id, and applySuggestedName
+    // no-ops unless THIS thread already holds that card.
+    ws.on('task_named', (msg) => {
+        applySuggestedName(msg?.task_id || '', msg?.suggested_name || '');
     });
 
     ws.on('outbound_sent', (evt) => {
