@@ -345,7 +345,7 @@
         state.claudeCliError = pendingUnsavedAnthropicKey ? '' : errorText;
         state.claudeCliTone = ready ? 'ok' : (pendingUnsavedAnthropicKey ? 'muted' : (errorText ? 'error' : (installed ? 'muted' : 'error')));
         state.claudeCliStatusText = pendingUnsavedAnthropicKey
-            ? 'Claude runtime will use the Anthropic key after setup is saved.'
+            ? 'Среда Claude начнёт использовать ключ Anthropic после сохранения настроек.'
             : message;
         renderClaudeCliStatus();
     }
@@ -549,7 +549,7 @@
                 <div class="field">
                 <div class="field-label-row">
                     <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
-                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button">Clear</button>
+                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button">Очистить</button>
                 </div>
                 <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
                 <div class="field-note">${escapeHtml(note)}</div>
@@ -559,7 +559,7 @@
 
         function localInputField([id, stateKey, label, placeholder, note, className, type = 'text', min = '', step = '']) {
             const clear = ['local-source', 'local-filename', 'local-chat-format'].includes(id)
-                ? `<button class="field-clear" data-clear="${id}" type="button">Clear</button>`
+                ? `<button class="field-clear" data-clear="${id}" type="button">Очистить</button>`
                 : '';
             return `
                 <div class="${className}">

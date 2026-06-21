@@ -54,12 +54,14 @@ _SECRET_SETTING_KEYS = {
 }
 _MODEL_SETTING_KEYS = frozenset({
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_CODE",
+    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
-    "OUROBOROS_MODEL_FALLBACK",
+    "OUROBOROS_MODEL_CONSCIOUSNESS",
+    "OUROBOROS_MODEL_FALLBACKS",
     "USE_LOCAL_MAIN",
-    "USE_LOCAL_CODE",
+    "USE_LOCAL_HEAVY",
     "USE_LOCAL_LIGHT",
+    "USE_LOCAL_CONSCIOUSNESS",
     "USE_LOCAL_FALLBACK",
 })
 _CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
@@ -79,11 +81,6 @@ _WILDCARD_HOSTS = frozenset({"0.0.0.0", ""})
 
 def _is_wildcard_host(host: str) -> bool:
     return host in _WILDCARD_HOSTS
-
-
-def _trust_nonlocal_bind_without_password_enabled() -> bool:
-    raw = os.environ.get("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "")
-    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_network_meta(bind_host: str, bind_port: int) -> dict:
@@ -905,7 +902,6 @@ async def api_settings_post(request: Request) -> JSONResponse:
             from ouroboros.server_auth import is_loopback_host
             desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
             desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
-            trust_unauth = _trust_nonlocal_bind_without_password_enabled()
             allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
             if desired_host and desired_host not in allowed_saved_hosts:
                 return json_error(
@@ -915,7 +911,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
                     "a reliable loopback health check.",
                     400,
                 )
-            if desired_host and not is_loopback_host(desired_host) and not desired_password and not trust_unauth:
+            if desired_host and not is_loopback_host(desired_host) and not desired_password:
                 return json_error(
                     "Setting a non-localhost Server Bind Host through the web UI "
                     "requires a Network Password in the same save. For manual "
@@ -933,7 +929,6 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 and not is_loopback_host(current_effective_host)
                 and old_password
                 and not desired_password
-                and not trust_unauth
             ):
                 return json_error(
                     "Cannot clear Network Password while the running server is "
@@ -1066,24 +1061,6 @@ async def api_settings_post(request: Request) -> JSONResponse:
         try:
             from supervisor.message_bus import get_bridge
             get_bridge().configure_from_settings(current)
-        except Exception:
-            pass
-        try:
-            from ouroboros.server_auth import is_loopback_host
-            desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
-            desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
-            if desired_host and not is_loopback_host(desired_host) and not desired_password:
-                if _trust_nonlocal_bind_without_password_enabled():
-                    warnings.append(
-                        "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1 allows this "
-                        "non-localhost bind without Ouroboros's internal Network Password. "
-                        "Use only behind ingress auth, VPN, private networking, or an auth proxy."
-                    )
-                else:
-                    warnings.append(
-                        "Server Bind Host is non-localhost and Network Password is empty; "
-                        "after restart the app will be reachable on the network without a password."
-                    )
         except Exception:
             pass
         _repo_slug = current.get("GITHUB_REPO", "")

@@ -41,31 +41,31 @@ for _profile_defaults in _MODEL_DEFAULTS.values():
     _profile_defaults.setdefault("consciousness", "")
 
 _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
-    ("providers", "Add your access", "Keys + local", "Fill at least one remote key or a local model source. The next step adapts to what you configured here.", "Paste only what you already have. OpenRouter, direct provider keys, and an optional local model can coexist."),
-    ("models", "Choose models", "5 model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
-    ("review_mode", "Choose review mode", "Advisory vs blocking", "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.", "Pick both review enforcement and the initial runtime mode before Ouroboros starts."),
-    ("budget", "Set your budget", "Session limits", "Budget is its own step because it directly shapes how far Ouroboros can go in one session and in a single task.", "Total budget is global. Per-task cost cap is a soft reminder, not a hard kill switch."),
-    ("summary", "Review before launch", "Final check", "Check the final provider, model, review, and budget picture. Ouroboros will save these onboarding values before starting.", "The same onboarding values remain editable later in Settings."),
+    ("providers", "Добавьте доступ", "Ключи + локальная", "Заполните хотя бы один удалённый ключ или источник локальной модели. Следующий шаг адаптируется к тому, что вы настроили здесь.", "Вставляйте только то, что у вас уже есть. OpenRouter, прямые ключи провайдеров и необязательная локальная модель могут сосуществовать."),
+    ("models", "Выберите модели", "5 слотов моделей", "Просмотрите видимые настройки моделей по умолчанию, полученные из вашей текущей конфигурации, затем измените всё, что нужно, перед запуском.", "Значения вида openai/... или anthropic/... остаются в стиле роутера. Прямые значения используют openai::... и anthropic::...."),
+    ("review_mode", "Выберите режим проверки", "Рекомендательный / Блокирующий", "Определите строгость проверки перед коммитом до того, как Ouroboros начнёт самомодификацию.", "Выберите режим проверки и начальный режим среды выполнения до запуска Ouroboros."),
+    ("budget", "Установите бюджет", "Ограничения сессии", "Бюджет — отдельный шаг, потому что он напрямую определяет, насколько далеко Ouroboros может зайти за одну сессию и в одной задаче.", "Общий бюджет — глобальный. Лимит затрат на задачу — мягкое напоминание, а не жёсткий выключатель."),
+    ("summary", "Проверьте перед запуском", "Финальная проверка", "Проверьте итоговую картину по провайдерам, моделям, проверке и бюджету. Ouroboros сохранит эти значения перед запуском.", "Те же параметры останутся доступными для редактирования в Настройках."),
 ))
 _STEP_ORDER = [step["id"] for step in _STEPS]
 
 _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "label", "placeholder", "note", "inputType"), (
-    ("openrouter-key", "openrouterKey", "OPENROUTER_API_KEY", "s-openrouter", "OpenRouter API Key", "sk-or-v1-...", "Optional. Best when you want one router for OpenAI, Anthropic, Google, and more.", "password"),
-    ("openai-key", "openaiKey", "OPENAI_API_KEY", "s-openai", "OpenAI API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills direct openai::... models.", "password"),
-    ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Cloud.ru API key", "Optional. If this is the only remote key, the next step prefills direct cloudru::... models.", "password"),
-    ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Optional. Saved for direct anthropic::... models and Claude tooling.", "password"),
-    ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required when using openai-compatible:: models.", "url"),
-    ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password"),
+    ("openrouter-key", "openrouterKey", "OPENROUTER_API_KEY", "s-openrouter", "OpenRouter API Key", "sk-or-v1-...", "Необязательно. Лучший вариант, если нужен один роутер для OpenAI, Anthropic, Google и других.", "password"),
+    ("openai-key", "openaiKey", "OPENAI_API_KEY", "s-openai", "OpenAI API Key", "sk-...", "Необязательно. Если это единственный удалённый ключ, на следующем шаге будут предзаполнены прямые модели openai::...", "password"),
+    ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Ключ Cloud.ru API", "Необязательно. Если это единственный удалённый ключ, на следующем шаге будут предзаполнены прямые модели cloudru::...", "password"),
+    ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Необязательно. Сохраняется для прямых моделей anthropic::... и инструментов Claude.", "password"),
+    ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Базовый URL вашего OpenAI-совместимого эндпоинта (например, Ollama, LM Studio, vLLM). Требуется для моделей openai-compatible::.", "url"),
+    ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Оставьте пустым, если авторизация не нужна", "Ключ API для эндпоинта. Оставьте пустым, если ваш сервер не требует авторизации.", "password"),
 ))
 
 _PROFILE_SPECS = {
-    "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.5 or anthropic/claude-sonnet-4.6 continue to route through OpenRouter."),
-    "openai": ("OpenAI", "OpenAI is present, so the next step prefills direct openai:: model values.", "OpenAI-only setup detected. These defaults are explicit and official."),
-    "cloudru": ("Cloud.ru Foundation Models", "Cloud.ru is present, so the next step prefills direct cloudru:: model values.", "Cloud.ru-only setup detected. These defaults use explicit cloudru:: model IDs."),
-    "anthropic": ("Anthropic", "Anthropic is present, so the next step prefills direct anthropic:: model values.", "Anthropic-only setup detected. These defaults are explicit and official."),
-    "openai-compatible": ("OpenAI-compatible endpoint", "An OpenAI-compatible base URL is configured. Enter the model names your server exposes in the next step.", "OpenAI-compatible endpoint detected. Use openai-compatible::your-model-name for every slot. The model list is whatever your server supports."),
-    "direct-multi": ("Direct multi-provider", "Multiple direct providers are present, so the next step keeps your model values editable without forcing one provider family.", "Multiple direct providers are configured. Start here, then split model slots across them if you want."),
-    "local": ("Local-first", "No remote key is present yet, so local-only setup remains available below.", "Local-only setup detected. Review the model values and local routing before launch."),
+    "openrouter": ("OpenRouter", "OpenRouter настроен, поэтому на следующем шаге сохранятся настройки по умолчанию в стиле роутера, а дополнительные прямые ключи также будут сохранены.", "Маршрутизация в стиле OpenRouter остаётся активной. ID провайдеров без префикса, такие как openai/gpt-5.5 или anthropic/claude-sonnet-4.6, продолжают маршрутизироваться через OpenRouter."),
+    "openai": ("OpenAI", "Настроен OpenAI, поэтому на следующем шаге будут предзаполнены прямые значения openai:: моделей.", "Обнаружена конфигурация только OpenAI. Значения по умолчанию явные и официальные."),
+    "cloudru": ("Cloud.ru Foundation Models", "Настроен Cloud.ru, поэтому на следующем шаге будут предзаполнены прямые значения cloudru:: моделей.", "Обнаружена конфигурация только Cloud.ru. Значения по умолчанию используют явные ID моделей cloudru::."),
+    "anthropic": ("Anthropic", "Настроен Anthropic, поэтому на следующем шаге будут предзаполнены прямые значения anthropic:: моделей.", "Обнаружена конфигурация только Anthropic. Значения по умолчанию явные и официальные."),
+    "openai-compatible": ("OpenAI-совместимый эндпоинт", "Настроен OpenAI-совместимый базовый URL. Укажите имена моделей, которые предоставляет ваш сервер, на следующем шаге.", "Обнаружен OpenAI-совместимый эндпоинт. Используйте openai-compatible::имя-вашей-модели для каждого слота. Список моделей — это всё, что поддерживает ваш сервер."),
+    "direct-multi": ("Несколько прямых провайдеров", "Настроено несколько прямых провайдеров, поэтому на следующем шаге значения моделей остаются редактируемыми без привязки к одному семейству провайдеров.", "Настроено несколько прямых провайдеров. Начните здесь, затем при необходимости распределите слоты моделей между ними."),
+    "local": ("Локальный-первый", "Удалённый ключ ещё не добавлен, поэтому ниже доступна только-локальная конфигурация.", "Обнаружена только-локальная конфигурация. Проверьте значения моделей и локальную маршрутизацию перед запуском."),
 }
 
 _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "note", "settingsInputId", "settingsToggleId"), (
@@ -77,20 +77,20 @@ _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "not
 ))
 
 _REVIEW_MODES = _rows(("value", "label", "tone", "className", "copy"), (
-    ("advisory", "Advisory", "Flexible", "advisory", "Faster and cheaper. Review still runs, but you decide how to handle findings. Best when you want iteration speed and can manually watch for drift."),
-    ("blocking", "Blocking", "Strict", "blocking", "Slower and more expensive, but much safer. Critical review findings stop commits, which dramatically reduces the chance of gradual code degradation."),
+    ("advisory", "Рекомендательный", "Гибкий", "advisory", "Быстрее и дешевле. Проверка всё равно выполняется, но вы сами решаете, что делать с замечаниями. Лучший выбор, когда важна скорость итераций."),
+    ("blocking", "Блокирующий", "Строгий", "blocking", "Медленнее и дороже, но намного безопаснее. Критические замечания останавливают коммиты, что значительно снижает риск постепенной деградации кода."),
 ))
 
 _RUNTIME_MODES = _rows(("value", "label", "tone", "className", "copy"), (
-    ("light", "Light", "Safest", "light", "Self-modification of the main repo is disabled. Best for trying Ouroboros out without repo self-modification."),
-    ("advanced", "Advanced", "Default", "advanced", "Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode."),
-    ("pro", "Pro", "Power", "pro", "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate."),
+    ("light", "Light", "Безопаснее", "light", "Самомодификация основного репозитория отключена. Лучший вариант для знакомства с Ouroboros без самомодификации."),
+    ("advanced", "Advanced", "По умолчанию", "advanced", "Самомодификация эволюционного слоя разрешена (текущее поведение). Защищённые файлы ядра/контрактов/релизов охраняются в режиме Advanced."),
+    ("pro", "Pro", "Расширенный", "pro", "Прямой режим защищённых поверхностей. Редактирование защищённых файлов ядра/контрактов/релизов разрешено, но коммиты по-прежнему проходят через триаду и проверку области."),
 ))
 
 _LOCAL_ROUTING_MODES = _rows(("value", "buttonLabel", "label", "flags"), (
-    ("cloud", "Cloud only", "Cloud models only", (False, False, False, False, False)),
-    ("fallback", "Fallback local", "Fallback model local", (False, False, False, False, True)),
-    ("all", "All models local", "All models local", (True, True, True, True, True)),
+    ("cloud", "Только облако", "Только облачные модели", (False, False, False, False, False)),
+    ("fallback", "Запасная локальная", "Запасная модель локальная", (False, False, False, False, True)),
+    ("all", "Все локальные", "Все модели локальные", (True, True, True, True, True)),
 ))
 
 _BUDGET_FIELDS = [
@@ -99,9 +99,9 @@ _BUDGET_FIELDS = [
         "settingKey": "TOTAL_BUDGET",
         "inputId": "total-budget",
         "settingsInputId": "s-total-budget",
-        "title": "Total budget",
-        "label": "Total Budget (USD)",
-        "note": "Global spend budget across the runtime. Keep this editable even after onboarding.",
+        "title": "Общий бюджет",
+        "label": "Общий бюджет (USD)",
+        "note": "Глобальный бюджет расходов для всей среды. Оставляйте редактируемым даже после настройки.",
         "default": float(SETTINGS_DEFAULTS["TOTAL_BUDGET"]),
         "min": "0.01",
         "step": "any",
@@ -111,9 +111,9 @@ _BUDGET_FIELDS = [
         "settingKey": "OUROBOROS_PER_TASK_COST_USD",
         "inputId": "per-task-budget",
         "settingsInputId": "s-settings-per-task-cost",
-        "title": "Per-task soft threshold",
-        "label": "Per-task Cost Cap (USD)",
-        "note": "This does not hard-stop the task. It injects a budget reminder when one task starts getting expensive.",
+        "title": "Мягкий порог на задачу",
+        "label": "Лимит затрат на задачу (USD)",
+        "note": "Это не останавливает задачу жёстко. Вставляется напоминание о бюджете, когда задача становится дорогой.",
         "default": float(SETTINGS_DEFAULTS.get("OUROBOROS_PER_TASK_COST_USD", 20.0)),
         "min": "0.01",
         "step": "any",
@@ -144,27 +144,27 @@ def parse_budget_setting(
     *,
     use_default_for_blank: bool = False,
 ) -> Tuple[float | None, str | None]:
-    """Parse one shared budget setting for onboarding and Settings saves."""
+    """Разбор бюджетного параметра для онбординга и сохранения в Настройках."""
     field = _BUDGET_FIELDS_BY_KEY[key]
-    name = "Budget" if key == "TOTAL_BUDGET" else "Per-task soft threshold"
+    name = "Бюджет" if key == "TOTAL_BUDGET" else "Мягкий порог на задачу"
     if raw_value is None or raw_value == "":
         if use_default_for_blank:
             raw_value = field["default"]
         else:
-            return None, f"{name} must be a number."
+            return None, f"{name}: укажите число."
     if isinstance(raw_value, bool):
-        return None, f"{name} must be a number."
+        return None, f"{name}: укажите число."
     try:
         value = float(raw_value)
     except (TypeError, ValueError):
-        return None, f"{name} must be a number."
+        return None, f"{name}: укажите число."
     if not math.isfinite(value):
-        return None, f"{name} must be a number."
+        return None, f"{name}: укажите число."
     if value <= 0:
-        return None, f"{name} must be greater than zero."
+        return None, f"{name}: значение должно быть больше нуля."
     min_value = float(field.get("min") or 0)
     if min_value > 0 and value < min_value:
-        return None, f"{name} must be at least {field['min']}."
+        return None, f"{name}: минимум {field['min']}."
     return value, None
 
 
@@ -298,13 +298,13 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     )
     has_local = bool(local_source)
     if not has_remote and not has_local:
-        return {}, "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, Anthropic, or a local model before continuing."
+        return {}, "Перед продолжением настройте OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, Anthropic или локальную модель."
     if has_local and "/" in local_source and not local_source.startswith(("/", "~")) and not local_filename:
         return {}, "Local HuggingFace sources need a GGUF filename."
     if review_enforcement not in {"advisory", "blocking"}:
-        return {}, "Choose advisory or blocking review mode."
+        return {}, "Выберите рекомендательный или блокирующий режим проверки."
     if runtime_mode not in VALID_RUNTIME_MODES:
-        return {}, f"Choose a runtime mode from {sorted(VALID_RUNTIME_MODES)}."
+        return {}, f"Выберите режим среды из {sorted(VALID_RUNTIME_MODES)}."
 
     models = {slot["settingKey"]: _string(data.get(slot["settingKey"])) for slot in _MODEL_SLOTS}
     # Role-model (v6.39): only Main is required. Heavy/Light/Consciousness fall back to
@@ -312,7 +312,7 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     # fallback) — so the owner is not forced to fill every slot. Mirrors the relaxed
     # onboarding-wizard validateModelsStep.
     if not models.get("OUROBOROS_MODEL"):
-        return {}, "Confirm the Main model before starting Ouroboros."
+        return {}, "Подтвердите Основную модель перед запуском Ouroboros."
 
     parsed_budget: dict[str, float] = {}
     for field in _BUDGET_FIELDS:
@@ -326,11 +326,11 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
         local_context_length = int(data.get("LOCAL_MODEL_CONTEXT_LENGTH") or SETTINGS_DEFAULTS["LOCAL_MODEL_CONTEXT_LENGTH"])
         local_gpu_layers = int(data.get("LOCAL_MODEL_N_GPU_LAYERS") if data.get("LOCAL_MODEL_N_GPU_LAYERS") is not None else -1)
     except (TypeError, ValueError):
-        return {}, "Local model context length and GPU layers must be integers."
+        return {}, "Длина контекста локальной модели и GPU-слои должны быть целыми числами."
 
     use_local = local_routing_flags(local_routing_mode, has_local)
     if has_local and not has_remote and not any(use_local):
-        return {}, "Local-only setups must route at least one model to the local runtime."
+        return {}, "Для только-локальных конфигураций хотя бы одна модель должна маршрутизироваться в локальную среду."
 
     prepared = dict(current_settings)
     prepared.update(models)
