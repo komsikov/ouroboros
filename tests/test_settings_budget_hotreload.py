@@ -194,4 +194,52 @@ def test_settings_post_allows_wildcard_bind_without_password_when_trusted(monkey
 
     assert resp.status_code == 200, resp.text
     assert current["OUROBOROS_SERVER_HOST"] == "0.0.0.0"
-    assert any("TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD" in w for w in resp.json().get("warnings", []))
+    assert not resp.json().get("warnings")
+
+
+def test_settings_post_allows_unrelated_save_with_wildcard_bind_when_trusted(monkeypatch, tmp_path):
+    from ouroboros.config import SETTINGS_DEFAULTS as _defaults
+
+    monkeypatch.setenv("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "1")
+    current = dict(_defaults)
+    current["OUROBOROS_SERVER_HOST"] = "0.0.0.0"
+    current["OUROBOROS_NETWORK_PASSWORD"] = ""
+    client = _settings_client(monkeypatch, tmp_path, current)
+
+    resp = client.post(
+        "/api/settings",
+        json={
+            "OUROBOROS_SERVER_HOST": "0.0.0.0",
+            "OUROBOROS_MODEL_HEAVY": "anthropic/claude-opus-4.8",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert current["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-opus-4.8"
+    assert not resp.json().get("warnings")
+
+
+def test_settings_get_exposes_trust_bind_notice_for_wildcard_without_password(monkeypatch, tmp_path):
+    import server as srv
+    from ouroboros.config import SETTINGS_DEFAULTS as _defaults
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "1")
+    current = dict(_defaults)
+    current["OUROBOROS_SERVER_HOST"] = "0.0.0.0"
+    current["OUROBOROS_NETWORK_PASSWORD"] = ""
+    monkeypatch.setattr(srv, "load_settings", lambda: dict(current))
+
+    app = Starlette(routes=[Route("/api/settings", endpoint=srv.api_settings_get, methods=["GET"])])
+    app.state.drive_root = tmp_path / "drive"
+    app.state.repo_dir = tmp_path / "repo"
+    client = TestClient(app)
+
+    resp = client.get("/api/settings")
+
+    assert resp.status_code == 200, resp.text
+    notice = resp.json().get("_meta", {}).get("trust_bind_notice", "")
+    assert "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1" in notice
+    assert "0.0.0.0" in notice

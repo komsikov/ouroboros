@@ -286,6 +286,7 @@ export function renderSettingsPage() {
                         </div>
                         <div class="settings-inline-note">Добавляет защиту паролем только для нелокального доступа к приложению и API. Если Ouroboros доступен в LAN или Docker, установите пароль перед публикацией URL.</div>
                         <div id="settings-lan-hint" class="settings-lan-hint" hidden></div>
+                        <div id="settings-trust-bind-notice" class="settings-lan-hint" hidden></div>
                     </div>
                 </section>
 

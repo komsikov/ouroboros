@@ -579,6 +579,20 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         syncPostTaskEvolutionUi();
     }
 
+    function _renderTrustBindNotice(meta) {
+        const noticeEl = document.getElementById('settings-trust-bind-notice');
+        if (!noticeEl) return;
+        const notice = String(meta?.trust_bind_notice || '').trim();
+        if (!notice) {
+            noticeEl.hidden = true;
+            noticeEl.textContent = '';
+            return;
+        }
+        noticeEl.textContent = notice;
+        noticeEl.dataset.tone = 'info';
+        noticeEl.hidden = false;
+    }
+
     function _renderNetworkHint(meta) {
         const hint = document.getElementById('settings-lan-hint');
         if (!hint || !meta) return;
@@ -619,6 +633,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setSettingsCleanBaseline();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
+        _renderTrustBindNotice(data._meta);
         renderClaudeCodeUi();
         settingsLoaded = true;
         markSettingsDirty = updateSettingsDirtyState;

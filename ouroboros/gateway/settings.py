@@ -88,6 +88,35 @@ def _trust_nonlocal_bind_without_password_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+_TRUST_BIND_NOTICE_TEXT = (
+    "Переменная OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1 разрешает "
+    "привязку к 0.0.0.0 без встроенного сетевого пароля Ouroboros. "
+    "Используйте только если доступ уже ограничен входным шлюзом с "
+    "аутентификацией, VPN, приватной сетью или обратным прокси с "
+    "аутентификацией."
+)
+
+
+def _trust_bind_notice(
+    *,
+    effective_bind_host: str = "",
+    configured_bind_host: str = "",
+    network_password: str = "",
+) -> str | None:
+    """Informational notice for trusted Docker/K8s binds without a network password."""
+    if not _trust_nonlocal_bind_without_password_enabled():
+        return None
+    if str(network_password or "").strip():
+        return None
+    from ouroboros.server_auth import is_loopback_host
+
+    for host in (effective_bind_host, configured_bind_host):
+        text = str(host or "").strip()
+        if text and not is_loopback_host(text):
+            return _TRUST_BIND_NOTICE_TEXT
+    return None
+
+
 def _build_network_meta(bind_host: str, bind_port: int) -> dict:
     """Build /api/settings network metadata."""
     from ouroboros.server_auth import get_network_auth_startup_warning, is_loopback_host
@@ -771,6 +800,13 @@ async def api_settings_get(request: Request) -> JSONResponse:
     )
     meta["setup_contract"] = build_setup_contract("web")
     meta["fixed_infra_models"] = fixed_infra_models
+    trust_notice = _trust_bind_notice(
+        effective_bind_host=_current_bind_host(request),
+        configured_bind_host=str(settings.get("OUROBOROS_SERVER_HOST") or "").strip(),
+        network_password=str(settings.get("OUROBOROS_NETWORK_PASSWORD") or "").strip(),
+    )
+    if trust_notice:
+        meta["trust_bind_notice"] = trust_notice
     safe["_meta"] = meta
     return JSONResponse(safe)
 
@@ -1078,14 +1114,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
             desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
             if desired_host and not is_loopback_host(desired_host) and not desired_password:
-                if _trust_nonlocal_bind_without_password_enabled():
-                    warnings.append(
-                        "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1 разрешает "
-                        "привязку вне localhost без встроенного сетевого пароля Ouroboros. "
-                        "Используйте только за ingress-аутентификацией, VPN, "
-                        "приватной сетью или auth-proxy."
-                    )
-                else:
+                if not _trust_nonlocal_bind_without_password_enabled():
                     warnings.append(
                         "Хост привязки вне localhost, сетевой пароль пуст; "
                         "после перезапуска приложение будет доступно в сети без пароля."
