@@ -254,7 +254,12 @@ class Memory:
 
     def chat_history(self, count: int = 100, offset: int = 0, search: str = "") -> str:
         chat_path = self.logs_path("chat.jsonl")
-        if not chat_path.exists():
+        # Also include archived chat logs (rotate_chat_log_if_needed moves chat.jsonl
+        # to archive/ on overflow; without this, history vanishes after rotation).
+        archive_dir = self.drive_root / "archive"
+        if not chat_path.exists() and not (archive_dir.is_dir() and any(
+            p for p in archive_dir.iterdir() if p.name.startswith("chat_") and p.name.endswith(".jsonl")
+        )):
             return "(chat history is empty)"
 
         try:
@@ -265,6 +270,13 @@ class Memory:
             # in the passive default context (build_recent_sections), NOT in this
             # explicit recall tool — the one mind can deliberately recall anything.
             entries = self._read_jsonl_entries("chat.jsonl", exclude_a2a=True)
+            if archive_dir.is_dir():
+                archive_paths = sorted(
+                    (p for p in archive_dir.iterdir() if p.name.startswith("chat_") and p.name.endswith(".jsonl")),
+                    key=lambda p: p.name,
+                )
+                for ap in archive_paths:
+                    entries.extend(list(iter_jsonl_objects(ap)))
 
             if search:
                 search_lower = search.lower()

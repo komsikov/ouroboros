@@ -264,11 +264,6 @@ function renderExtensionSettingsSections(root, sections) {
     });
 }
 
-function looksMaskedSecret(value) {
-    const text = String(value || '').trim();
-    return text === '***' || text === '***set***' || text.endsWith('...');
-}
-
 function collectSecretValue(id, body) {
     const input = byId(id);
     if (!input) return;
@@ -279,7 +274,7 @@ function collectSecretValue(id, body) {
         return;
     }
     const value = input.value;
-    if (value && !looksMaskedSecret(value)) body[settingKey] = value;
+    if (value && !value.includes('...')) body[settingKey] = value;
 }
 
 // Fallback picker pills mirror config defaults plus useful direct-provider ids.
@@ -746,7 +741,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Используйте заглавные латинские буквы, цифры и подчёркивания.'; } return; }
             if (row.dataset.removeCustomSecret === '1' || valueInput?.dataset.forceClear === '1') { body[key] = ''; return; }
             const value = valueInput?.value || '';
-            if (value && !looksMaskedSecret(value)) body[key] = value;
+            if (value && !value.includes('...')) body[key] = value;
         });
 
         return body;

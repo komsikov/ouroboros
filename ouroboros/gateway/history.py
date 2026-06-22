@@ -217,6 +217,16 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             # WS4: parse the jsonl off the event loop (file read + json decode) so a
             # large history can't block the loop / delay WS broadcasts on reconnect.
             _chat_entries = await asyncio.to_thread(lambda p=chat_path: list(iter_jsonl_objects(p)))
+            # Also read archived chat logs (rotate_chat_log_if_needed moves chat.jsonl
+            # to archive/ on overflow; without this, history vanishes after rotation).
+            _archive_dir = data_dir / "archive"
+            if _archive_dir.is_dir():
+                _archive_chat_paths = sorted(
+                    (p for p in _archive_dir.iterdir() if p.name.startswith("chat_") and p.name.endswith(".jsonl")),
+                    key=lambda p: p.name,
+                )
+                for _ap in _archive_chat_paths:
+                    _chat_entries.extend(await asyncio.to_thread(lambda p=_ap: list(iter_jsonl_objects(p))))
             for entry in _chat_entries:
                 # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):

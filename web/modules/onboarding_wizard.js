@@ -551,7 +551,7 @@
                     <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
                     <button class="field-clear" data-clear="${escapeHtml(id)}" type="button">Очистить</button>
                 </div>
-                <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
+                <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}" autocomplete="off">
                 <div class="field-note">${escapeHtml(note)}</div>
             </div>
             `;

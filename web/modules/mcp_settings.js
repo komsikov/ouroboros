@@ -16,7 +16,7 @@ let onChangeCallback = null;
 function looksMasked(value) {
     const text = String(value ?? '').trim();
     if (!text) return false;
-    return text === '***' || text === '***set***' || text.endsWith('...');
+    return text === '***' || text.endsWith('...');
 }
 
 function emptyServer() {

@@ -30,12 +30,12 @@ function projectIdFromTask(taskId = '') {
 
 function getOrCreateChatSessionId() {
     try {
-        const existing = sessionStorage.getItem(CHAT_SESSION_ID_KEY);
+        const existing = localStorage.getItem(CHAT_SESSION_ID_KEY);
         if (existing) return existing;
         const created = (globalThis.crypto && typeof crypto.randomUUID === 'function')
             ? crypto.randomUUID()
             : `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        sessionStorage.setItem(CHAT_SESSION_ID_KEY, created);
+        localStorage.setItem(CHAT_SESSION_ID_KEY, created);
         return created;
     } catch {
         return `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -44,7 +44,7 @@ function getOrCreateChatSessionId() {
 
 function loadInputHistory() {
     try {
-        const raw = JSON.parse(sessionStorage.getItem(CHAT_INPUT_HISTORY_KEY) || '[]');
+        const raw = JSON.parse(localStorage.getItem(CHAT_INPUT_HISTORY_KEY) || '[]');
         return Array.isArray(raw) ? raw.filter(Boolean).slice(-50) : [];
     } catch {
         return [];
@@ -53,7 +53,7 @@ function loadInputHistory() {
 
 function saveInputHistory(entries) {
     try {
-        sessionStorage.setItem(CHAT_INPUT_HISTORY_KEY, JSON.stringify(entries.slice(-50)));
+        localStorage.setItem(CHAT_INPUT_HISTORY_KEY, JSON.stringify(entries.slice(-50)));
     } catch {}
 }
 
@@ -118,8 +118,8 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
                     <div class="chat-composer-pills" id="chat-composer-pills">
                         <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Консилиум: разовый мозговой штурм/план несколькими субагентами (plan_task + веб-поиск) для следующего сообщения. Автоматически снимается после отправки.">Консилиум</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Режим размера контекста" title="Режим контекста (настройка владельца). Low — около 200K / локальные модели; Max — полный. Применяется к следующей задаче.">
-                            <button class="chat-seg" type="button" data-mode="low">Low</button>
-                            <button class="chat-seg" type="button" data-mode="max">Max</button>
+                            <button class="chat-seg" type="button" data-mode="low">Мин</button>
+                            <button class="chat-seg" type="button" data-mode="max">Макс</button>
                         </div>
                     </div>
                 </div>
@@ -540,7 +540,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
 
     function persistVisibleHistory() {
         try {
-            sessionStorage.setItem(threadStorageKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
+            localStorage.setItem(threadStorageKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
         } catch {}
     }
 
@@ -845,7 +845,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             // The owner's request that spawned this card (main, non-subagent only),
             // used to name a project on "turn into project" when the server has no
             // title/objective yet (P1, direct-chat conversion). One-shot handoff.
-            objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
+            objectiveHint: '',
             // Cluster B: the proactively-coined LLM project name; when set it becomes
             // the card title (the activity headline keeps rendering in the lines below).
             suggestedName: '',
@@ -1997,7 +1997,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
         await loadUiPreferences();
         if (await syncHistory({ includeUser: true })) return;
         try {
-            const saved = JSON.parse(sessionStorage.getItem(threadStorageKey(CHAT_STORAGE_KEY)) || '[]');
+            const saved = JSON.parse(localStorage.getItem(threadStorageKey(CHAT_STORAGE_KEY)) || '[]');
             for (const msg of saved) {
                 addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
                     systemType: msg.systemType || '',

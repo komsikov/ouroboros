@@ -51,7 +51,7 @@ function secretField({ id, settingKey, label, placeholder }) {
         <div class="form-field">
             <label>${label}</label>
             <div class="secret-input-row">
-                <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
+                <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}" autocomplete="off">
                 <button
                     type="button"
                     class="secret-icon-btn secret-toggle"
@@ -72,7 +72,7 @@ function secretField({ id, settingKey, label, placeholder }) {
 }
 
 function plainField({ id, label, placeholder }) {
-    return `<div class="form-field"><label>${label}</label><input id="${id}" placeholder="${placeholder}"></div>`;
+    return `<div class="form-field"><label>${label}</label><input id="${id}" placeholder="${placeholder}" autocomplete="off"></div>`;
 }
 
 const PROVIDER_CARDS = [
@@ -264,7 +264,7 @@ export function renderSettingsPage() {
                         <div class="form-row">
                             <div class="form-field">
                                 <label>Устаревший OpenAI Base URL</label>
-                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 или совместимый эндпоинт">
+                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 или совместимый эндпоинт" autocomplete="off">
                             </div>
                         </div>
                         <div class="settings-inline-note">Запасной вариант для совместимости со старыми установками. Для новых пользовательских провайдеров используйте карточку <code>Пользовательский LLM-провайдер</code>.</div>
@@ -280,7 +280,7 @@ export function renderSettingsPage() {
                         <div class="form-row">
                             <div class="form-field">
                                 <label>Хост привязки сервера</label>
-                                <input id="s-server-host" placeholder="127.0.0.1 или 0.0.0.0">
+                                <input id="s-server-host" placeholder="127.0.0.1 или 0.0.0.0" autocomplete="off">
                                 <div class="settings-inline-note">Используйте <code>127.0.0.1</code> только для этой машины. Используйте <code>0.0.0.0</code> для LAN/Docker-доступа с сетевым паролем. Привязка к конкретному LAN IP — только вручную через env.</div>
                             </div>
                         </div>
