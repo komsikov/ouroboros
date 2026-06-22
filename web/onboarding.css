@@ -309,8 +309,8 @@ textarea::placeholder {
   overscroll-behavior: contain;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: rgba(18, 20, 26, 0.98);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.38);
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(0, 13, 49, 0.16);
 }
 
 .wizard-model-suggestion {
@@ -327,7 +327,12 @@ textarea::placeholder {
 }
 
 .wizard-model-suggestion:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(36, 56, 112, 0.08);
+}
+
+.wizard-model-suggestion:focus-visible {
+  outline: none;
+  background: rgba(36, 56, 112, 0.12);
 }
 
 .field-full {
@@ -342,7 +347,7 @@ textarea::placeholder {
 }
 
 .field label {
-  color: rgba(237, 242, 247, 0.68);
+  color: var(--muted);
   font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
@@ -353,7 +358,7 @@ textarea::placeholder {
   padding: 0;
   border: none;
   background: transparent;
-  color: rgba(237, 242, 247, 0.48);
+  color: var(--muted);
   cursor: pointer;
   font-size: 11px;
 }
@@ -493,12 +498,12 @@ select:focus {
 
 .wizard-choice.advisory .tone {
   background: var(--amber-dim);
-  color: #fbbf24;
+  color: #8a5a00;
 }
 
 .wizard-choice.blocking .tone {
   background: var(--green-dim);
-  color: #6ee7b7;
+  color: #166534;
 }
 
 .wizard-runtime-strip {
@@ -535,17 +540,17 @@ select:focus {
 
 .wizard-test-result[data-tone="ok"] {
   border-color: rgba(52, 211, 153, 0.22);
-  color: #86efac;
+  color: #166534;
 }
 
 .wizard-test-result[data-tone="warn"] {
   border-color: rgba(245, 158, 11, 0.18);
-  color: #fcd34d;
+  color: #8a5a00;
 }
 
 .wizard-test-result[data-tone="error"] {
   border-color: rgba(239, 68, 68, 0.18);
-  color: #fca5a5;
+  color: #b91c1c;
 }
 
 .summary-card {
@@ -563,7 +568,7 @@ select:focus {
 }
 
 .summary-kv strong {
-  color: rgba(237, 242, 247, 0.72);
+  color: var(--text);
   font-weight: 600;
 }
 
@@ -616,7 +621,7 @@ select:focus {
 
 .wizard-error {
   min-height: 22px;
-  color: #fca5a5;
+  color: #b91c1c;
   font-size: 12px;
 }
 
