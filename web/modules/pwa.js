@@ -10,9 +10,9 @@ function canRegisterServiceWorker() {
 
 async function notifyUpdateReady(registration) {
     if (!registration.waiting) return;
-    const shouldReload = window.confirm(
-        'A new version of Ouroboros is ready. Reload now to apply it?',
-    );
+    // const shouldReload = window.confirm(
+    //     'A new version of Ouroboros is ready. Reload now to apply it?',
+    // );
     if (!shouldReload) return;
     registration.waiting.postMessage({ type: 'SKIP_WAITING' });
     registration.waiting.addEventListener('statechange', (event) => {
