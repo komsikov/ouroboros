@@ -160,44 +160,67 @@ def _is_workspace_executor_control_state_path(target: pathlib.Path, data_root: p
     return "state" in lowered and "workspace_executor_processes" in lowered
 
 
+class _ListingFailure(Exception):
+    """A failed list_files state that must surface as a FIRST-CLASS tool error.
+
+    v6.54.3 (review round 4): path-escape / not-found / not-a-directory used to
+    return warning strings INSIDE an ok-shaped JSON list — the exact
+    error-inside-success shape the TB2.1 post-mortem showed silently poisoning
+    reasoning. _list_files renders this as a leading ⚠️ LIST_FILES_ERROR."""
+
+
 def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]:
     target = (root / safe_relpath(rel)).resolve()
-    if not target.exists():
-        return [f"⚠️ Directory not found: {rel}"]
-    if not target.is_dir():
-        return [f"⚠️ Not a directory: {rel}"]
-    items = []
+    # CONFINE to the root before any iterdir: a resolved target that escapes (e.g. an
+    # in-tree symlink pointing outside — common in untrusted child-created project /
+    # deliverable trees behind the new read-only roots) is rejected, never listed.
     try:
-        for entry in sorted(target.iterdir()):
-            if len(items) >= max_entries:
-                items.append(f"...(truncated at {max_entries})")
-                break
-            suffix = "/" if entry.is_dir() else ""
-            items.append(str(entry.relative_to(root)) + suffix)
-    except Exception as e:
-        items.append(f"⚠️ Error listing: {e}")
+        target.relative_to(root.resolve())
+    except ValueError:
+        raise _ListingFailure(f"Path escapes root: {rel}") from None
+    if not target.exists():
+        raise _ListingFailure(f"Directory not found: {rel}")
+    if not target.is_dir():
+        raise _ListingFailure(f"Not a directory: {rel}")
+    items = []
+    # A hard iterdir/permission/race failure PROPAGATES: _list_files renders it
+    # as a first-class "⚠️ LIST_FILES_ERROR" tool error, never an ok-shaped JSON
+    # listing carrying an error string inside (v6.54.3, review round 3).
+    for entry in sorted(target.iterdir()):
+        if len(items) >= max_entries:
+            items.append(f"...(truncated at {max_entries})")
+            break
+        suffix = "/" if entry.is_dir() else ""
+        items.append(str(entry.relative_to(root)) + suffix)
     return items
 
 
 def _list_user_files_dir(ctx: ToolContext, root: pathlib.Path, target: pathlib.Path, max_entries: int = 500) -> List[str]:
     if not target.exists():
-        return [f"⚠️ Directory not found: {target}"]
+        raise _ListingFailure(f"Directory not found: {target}")
     if not target.is_dir():
-        return [f"⚠️ Not a directory: {target}"]
+        raise _ListingFailure(f"Not a directory: {target}")
     items: List[str] = []
     hidden = 0
-    try:
-        for entry in sorted(target.iterdir()):
-            if user_files_path_block_reason(ctx, entry):
-                hidden += 1
-                continue
-            if len(items) >= max_entries:
-                items.append(f"...(truncated at {max_entries})")
-                break
-            suffix = "/" if entry.is_dir() else ""
-            items.append(str(entry.relative_to(root)) + suffix)
-    except Exception as e:
-        items.append(f"⚠️ Error listing: {e}")
+    # A hard iterdir/permission/race failure PROPAGATES to the first-class
+    # "⚠️ LIST_FILES_ERROR" path in _list_files (v6.54.3, review round 3).
+    for entry in sorted(target.iterdir()):
+        if user_files_path_block_reason(ctx, entry):
+            hidden += 1
+            continue
+        if len(items) >= max_entries:
+            items.append(f"...(truncated at {max_entries})")
+            break
+        suffix = "/" if entry.is_dir() else ""
+        # An external-workspace listing outside the user_files home has no
+        # home-relative form — render the absolute path instead of crashing
+        # the whole listing on relative_to (v6.54.3: the TB2.1
+        # "'/app/…' is not in the subpath of '/root'" class).
+        try:
+            rendered = str(entry.relative_to(root))
+        except ValueError:
+            rendered = str(entry)
+        items.append(rendered + suffix)
     if hidden:
         items.append(f"⚠️ {hidden} hidden/control entr{'y' if hidden == 1 else 'ies'} omitted from user_files listing.")
     return items
@@ -401,11 +424,9 @@ def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
     repo_root = active_repo_dir_for(ctx)
     target = ctx.repo_path(dir)
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, repo_root):
-        return json.dumps(
-            ["⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths."],
-            ensure_ascii=False,
-            indent=2,
-        )
+        # First-class tool error, not an ok-shaped one-element JSON listing
+        # (v6.54.3, review round 5 — the whole-call block IS the result).
+        return "⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths."
     # ctx.repo_path already normalized absolute/redundant-prefix dirs; pass the
     # resulting root-relative form so _list_dir doesn't re-nest the raw input.
     try:
@@ -518,31 +539,25 @@ def _data_read(
 def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     norm_dir = _normalize_data_read_path(ctx, dir)
+    # Whole-call block states are FIRST-CLASS tool errors, never ok-shaped
+    # one-element JSON listings (v6.54.3, review round 5).
     if (b := _project_store_access_block(norm_dir)):
-        return json.dumps([b], ensure_ascii=False, indent=2)
+        return str(b)
     if is_restricted_subagent_profile(ctx) and _is_subagent_secret_data_path(norm_dir):
-        return json.dumps(
-            ["⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."],
-            ensure_ascii=False,
-            indent=2,
-        )
+        return "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
     if is_restricted_subagent_profile(ctx):
         try:
             list_target = ctx.drive_path(norm_dir)
         except ValueError as e:
-            return json.dumps([f"⚠️ DATA_LIST_BLOCKED: {e}"], ensure_ascii=False, indent=2)
+            return f"⚠️ DATA_LIST_BLOCKED: {e}"
         root = pathlib.Path(ctx.drive_root).resolve(strict=False)
         if _is_skill_owner_state_target(list_target, root) or is_skill_owner_state_alias(list_target, root):
-            return json.dumps(
-                ["⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."],
-                ensure_ascii=False,
-                indent=2,
-            )
+            return "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths."
     if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             root = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, dir)
         except ValueError as e:
-            return json.dumps([f"⚠️ DATA_LIST_BLOCKED: {e}"], ensure_ascii=False, indent=2)
+            return f"⚠️ DATA_LIST_BLOCKED: {e}"
         items = _list_dir(root, ".", max_entries)
         return json.dumps(items, ensure_ascii=False, indent=2)
     # Drop any projects/<id> entry so a generic root listing never exposes the store.
@@ -1022,14 +1037,18 @@ def _list_files(
     protected_list_block = _protected_artifact_list_block(ctx, normalized, path, bucket=bucket, skill_name=skill_name)
     if protected_list_block:
         return protected_list_block
-    if normalized == "active_workspace":
-        return _repo_list(ctx, dir=path, max_entries=max_entries)
-    if normalized == "runtime_data":
-        return _data_list(ctx, dir=path, max_entries=max_entries)
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    if normalized == "skill_payload" and not bucket and not skill_name and task_constraint and task_constraint.mode == "skill_repair":
-        return _data_list(ctx, dir=path, max_entries=max_entries)
     try:
+        # Every listing branch runs inside this try: a hard iterdir/permission/
+        # race failure from any helper becomes the first-class LIST_FILES_ERROR
+        # below (v6.54.3, review round 3 — helpers no longer swallow it into an
+        # ok-shaped listing).
+        if normalized == "active_workspace":
+            return _repo_list(ctx, dir=path, max_entries=max_entries)
+        if normalized == "runtime_data":
+            return _data_list(ctx, dir=path, max_entries=max_entries)
+        if normalized == "skill_payload" and not bucket and not skill_name and task_constraint and task_constraint.mode == "skill_repair":
+            return _data_list(ctx, dir=path, max_entries=max_entries)
         base = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
         if normalized == "user_files":
             target = resolve_user_file_path(ctx, path, allow_protected_descendants=True)
@@ -1046,8 +1065,13 @@ def _list_files(
             elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files"}:
                 items = _filter_subagent_secret_listing(items, base)
         return json.dumps(items, ensure_ascii=False, indent=2)
+    except _ListingFailure as exc:
+        return f"⚠️ LIST_FILES_ERROR: {exc}"
     except Exception as exc:
-        return json.dumps([f"⚠️ LIST_FILES_ERROR: {type(exc).__name__}: {exc}"], ensure_ascii=False, indent=2)
+        # A hard failure is a first-class tool error, never a JSON "listing" that
+        # reads as success with an error string inside (v6.54.3: that shape
+        # silently poisoned reasoning in 63% of TB2.1 trials).
+        return f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
 
 
 def _write_file(
@@ -1414,6 +1438,7 @@ _MAX_SEARCH_RESULTS = 200
 # module SSOT); imported with the historical private names used by call sites.
 from ouroboros.code_search_rg import (  # noqa: E402
     MAX_SEARCH_FILES_SCANNED as _MAX_SEARCH_FILES_SCANNED,
+    _search_wall_clock_sec,
     is_search_skippable as _is_search_skippable,
 )
 
@@ -1456,6 +1481,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
     if not search_root.exists():
         return f"⚠️ SEARCH_ERROR: path not found: {display_search_path}"
+    if normalized != "user_files":
+        # Reject a search ROOT that escapes its resource root (e.g. the requested path is an
+        # in-tree symlink pointing outside — untrusted child project/deliverable trees) BEFORE
+        # any rg/os.walk. Parity with _list_dir + the per-file _path_allowed_for_rg guard.
+        try:
+            search_root.relative_to(root_path.resolve(strict=False))
+        except ValueError:
+            return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
     protected_root_block = block_reason_for_path(ctx, search_root, "static_introspection")
     if protected_root_block:
         return protected_root_block
@@ -1488,6 +1521,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             or _is_search_skippable(fp)
         )
 
+    # Validate a regex query UP FRONT so the invalid-regex contract holds for BOTH the
+    # ripgrep path and the Python fallback. ripgrep accepts some malformed patterns
+    # permissively (e.g. an unterminated '[' yields "no matches" instead of erroring),
+    # so without this the rg path would silently swallow an invalid regex while only the
+    # fallback rejected it. Non-regex queries are matched literally and need no check.
+    # (Checked before the wall-clock budget below: an invalid regex returns immediately,
+    # so there is no point starting the timer for it.)
+    if regex:
+        try:
+            re.compile(query)
+        except re.error as e:
+            return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+
+    import time as _time
+    _search_t0 = _time.monotonic()  # start the wall-clock budget BEFORE rg, so a
+    # subsequent fallback degradation shares ONE budget (not a fresh 2nd one).
     try:
         from ouroboros.code_search_rg import format_search_result, search_with_rg
 
@@ -1520,13 +1569,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     protected_omitted = 0
     truncated = False
     files_capped = False
+    deadline_hit = False
     # search_code on a single FILE: os.walk yields nothing for a file path, which
     # would make the search a silent no-op. Feed the scanner a one-file "walk".
     if search_root.is_file():
         _walker = [(str(search_root.parent), [], [search_root.name])]
     else:
         _walker = os.walk(str(search_root))
+    # Bound TOTAL (rg attempt + this fallback walk) to one budget, but always grant
+    # the fallback a small floor so an rg that ate the budget still makes some progress.
+    _search_deadline = max(_search_t0 + _search_wall_clock_sec(), _time.monotonic() + 5.0)
     for dirpath, dirnames, filenames in _walker:
+        # Wall-clock cap: the file-count cap bounds memory but a walk over a very
+        # large root (user_files == / under a bench HOME) can traverse for minutes.
+        if _time.monotonic() > _search_deadline:
+            deadline_hit = True  # ran out of TIME (distinct from the file-count cap)
+            break
         # Prune skipped dirs in-place. For runtime_data, also prune the top-level
         # per-project store (reachable only via the scoped knowledge tools).
         from ouroboros.code_intelligence import SKIP_DIRS
@@ -1562,6 +1620,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             if _is_search_skippable(fp):
                 continue
 
+            # CONFINE to the root before reading (parity with the rg path's _path_allowed_for_rg
+            # and _list_dir): a resolved file escaping the root — e.g. an in-tree symlink in an
+            # untrusted child project/deliverable tree — must never have its target read out.
+            try:
+                fp.resolve(strict=False).relative_to(root_resolved)
+            except (OSError, ValueError):
+                continue
+
             if files_searched >= _MAX_SEARCH_FILES_SCANNED:
                 files_capped = True
                 break
@@ -1582,19 +1648,28 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                         break
             if truncated:
                 break
-        if truncated or files_capped:
+        if truncated or files_capped or deadline_hit:
             break
 
+    # A deadline cutoff means even a "no matches" may be INCOMPLETE (parity with the rg
+    # path's deadline signal) — never let a timed-out fallback read as authoritative empty.
+    deadline_note = (
+        " Search stopped at the time budget before the whole tree was scanned — results "
+        "may be incomplete; narrow the path or glob, or raise OUROBOROS_SEARCH_CODE_WALL_SEC."
+        if deadline_hit else ""
+    )
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}"
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}{deadline_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
         header += f" — scan stopped at {_MAX_SEARCH_FILES_SCANNED} files (narrow the path or glob)"
     if truncated:
         header += f" — truncated at {max_results} results"
+    if deadline_hit:
+        header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
     return header + "\n\n" + "\n".join(matches)

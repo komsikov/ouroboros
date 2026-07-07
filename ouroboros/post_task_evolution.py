@@ -27,11 +27,24 @@ import os
 import pathlib
 from typing import Any, Dict, Optional
 
+from ouroboros.evolution_fingerprint import _PLAN_REVIEW_SUFFIX
+
 log = logging.getLogger(__name__)
 
 _REQUEST_REL = "state/post_task_evolution_request.json"
 _COUNTER_REL = "state/post_task_evolution_counter.json"
 _SKIP_TYPES = frozenset({"evolution", "deep_self_review"})
+
+
+def drop_pending_request(drive_root: Any) -> None:
+    """Best-effort delete of any pending post-task promotion request. Called by the
+    owner-stop sites (the fast path); the DURABLE backstop against re-arm is the
+    ``evolution_owner_stopped`` state flag checked in :func:`apply_pending_request`,
+    which also catches a request a worker re-creates after this delete. Never raises."""
+    try:
+        (pathlib.Path(str(drive_root)) / _REQUEST_REL).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _resolve(value: Any) -> Optional[pathlib.Path]:
@@ -118,10 +131,94 @@ _DECISION_PROMPT = """You decide whether Ouroboros should run ONE reviewed self-
 [SOLVE-CAPABILITY HISTORY — what past evolution cycles actually landed]
 {capability}
 
+[CLOSED / DROPPED — objectives already shipped, abandoned, or hard-blocked; do NOT re-propose these or restatements of them]
+{closed}
+
+[ACTIVE CAMPAIGN OBJECTIVE — a reviewed cycle is ALREADY running this; do NOT re-propose it]
+{active_objective}
+
 Return ONLY a JSON object:
 {{"promote": true|false, "objective": "<one concrete, self-contained improvement to Ouroboros's own code/process; empty if not promoting>", "requires_plan_review": true|false, "backlog_id": "<id if this maps to a backlog item, else empty>"}}
 
-Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. If nothing is clearly worthwhile, return promote=false. {force_note}"""
+Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. Do NOT propose anything in the CLOSED / DROPPED list, or a restatement of the ACTIVE CAMPAIGN OBJECTIVE — those are already handled; if the only candidates are closed/active, return promote=false. If nothing is clearly worthwhile, return promote=false. {force_note}"""
+
+
+def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_entries: int = 200) -> str:
+    """BUG3 Layer A: the objectives the chooser must NOT re-propose.
+
+    Built from the STRUCTURED ledger (state/evolution_checkpoints.jsonl), not patterns.md prose,
+    so it cannot rot when prose formatting changes. An objective is closed when its latest cycle
+    outcome is absorbed (already shipped), abandoned/no_op (attempted and dropped), or the
+    objective/review axis recorded outcome_tier == "blocked_with_evidence" (hard-blocked).
+    Deduped by the SSOT fingerprint so the same base objective appears once. "" when nothing.
+    """
+    import json as _json
+
+    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
+
+    path = pathlib.Path(drive_root) / "state" / "evolution_checkpoints.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-max_entries:]
+    except Exception:
+        return ""
+    by_task: Dict[str, Dict[str, Any]] = {}
+    order: list = []
+    for line in lines:
+        try:
+            row = _json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        task_id = str(row.get("task_id") or "")
+        if not task_id:
+            continue
+        if task_id not in by_task:
+            order.append(task_id)
+        merged = by_task.setdefault(task_id, {})
+        obj = str(row.get("campaign_objective") or "")
+        if obj:
+            merged["objective"] = obj
+        if str(row.get("kind") or "") == "cycle_outcome" and row.get("cycle_outcome"):
+            merged["cycle_outcome"] = str(row.get("cycle_outcome") or "")
+        else:
+            tx = row.get("transaction") if isinstance(row.get("transaction"), dict) else {}
+            merged.setdefault("cycle_outcome", str(tx.get("cycle_outcome") or ""))
+        axes = row.get("outcome_axes") if isinstance(row.get("outcome_axes"), dict) else {}
+        for axis in ("objective", "review"):
+            axis_obj = axes.get(axis) if isinstance(axes.get(axis), dict) else {}
+            if str(axis_obj.get("outcome_tier") or "") == "blocked_with_evidence":
+                merged["blocked"] = True
+    seen = set()
+    out: list = []
+    for task_id in reversed(order):  # newest first
+        info = by_task.get(task_id) or {}
+        blocked = bool(info.get("blocked"))
+        if str(info.get("cycle_outcome") or "") not in {"absorbed", "abandoned", "no_op"} and not blocked:
+            continue
+        objective = str(info.get("objective") or "").strip().replace("\n", " ")
+        if not objective:
+            continue
+        fp = canonical_objective_fingerprint(objective)
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        tag = "BLOCKED" if blocked else (str(info.get("cycle_outcome") or "DROPPED").upper())
+        if len(objective) > 110:
+            objective = objective[:110] + " …[truncated; full objective in the ledger]"
+        out.append(f"- [{tag}] {objective}")
+        if len(out) >= limit:
+            break
+    return "\n".join(out)
+
+
+def _active_campaign_objective() -> str:
+    """BUG3 Layer A: the current campaign objective (a cycle is already running it)."""
+    try:
+        from supervisor.evolution_lifecycle import _read_evolution_campaign
+        return str(_read_evolution_campaign().get("objective") or "").strip()
+    except Exception:
+        return ""
 
 
 def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional[Dict[str, Any]],
@@ -138,6 +235,11 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
         capability = truncate_review_artifact(build_solve_capability_digest(drive_root), 2000)
     except Exception:
         capability = ""
+    # BUG3 Layer A: give the chooser the objectives it must NOT re-propose (the missing input
+    # that let a CLOSED objective be re-suggested 4-5x). Sourced from the structured ledger
+    # (not patterns.md prose) plus the campaign-local dropped set, deduped by fingerprint.
+    closed = truncate_review_artifact(_closed_objectives_digest(drive_root), 1500)
+    active_objective = _active_campaign_objective()
     force_note = (
         "The cadence already decided WHEN to evolve; choose the single most valuable "
         "objective and set promote=true unless the backlog is empty/irrelevant."
@@ -145,7 +247,9 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
     )
     prompt = _DECISION_PROMPT.format(
         reflection=reflection or "(none)", backlog=backlog or "(empty)",
-        capability=capability or "(no evolution-cycle history yet)", force_note=force_note,
+        capability=capability or "(no evolution-cycle history yet)",
+        closed=closed or "(none)", active_objective=active_objective or "(no active campaign)",
+        force_note=force_note,
     )
     try:
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -297,6 +401,17 @@ def apply_pending_request(drive_root: Any) -> bool:
             # never run. Drop the stale request rather than leaking it.
             _safe_unlink(path)
             return False
+        if bool(st.get("evolution_owner_stopped")):
+            # The owner EXPLICITLY stopped evolution (/evolve off, toggle_evolution(False),
+            # or panic). Do NOT re-arm it from a queued post-task promotion — that would
+            # silently flip evolution_mode_enabled back True with no /evolve start. The
+            # flag is durable and cleared ONLY by an owner /evolve start, so this is the
+            # authoritative gate (the campaign status alone is not: start_evolution_campaign
+            # would just mint a fresh active campaign). It also drops a request a worker's
+            # maybe_promote re-created after the owner-stop cleared the file (maybe_promote
+            # is ungated on this flag), closing that race deterministically.
+            _safe_unlink(path)
+            return False
         if bool(st.get("evolution_mode_enabled")):
             # A campaign is already enabled (owner-driven or a previous
             # promotion). Activating another would hijack its objective and
@@ -314,10 +429,7 @@ def apply_pending_request(drive_root: Any) -> bool:
                 _safe_unlink(path)
                 return False
         if bool(req.get("requires_plan_review", True)):
-            objective += (
-                "\n\n(The source backlog item requires plan review: run plan_task "
-                "before implementing any code.)"
-            )
+            objective += _PLAN_REVIEW_SUFFIX
         start_evolution_campaign(objective, source="post_task")
         # Link the promoted backlog id to the campaign so close-on-commit (Phase 2 C)
         # can mark it done when the cycle is absorbed. Validate it against the OPEN
@@ -348,13 +460,44 @@ def apply_pending_request(drive_root: Any) -> bool:
         from supervisor.state import update_state
 
         def _activate_one_shot(live: dict) -> None:
+            # Atomic re-check against a RACED owner stop: the earlier load_state()
+            # snapshot can be stale if an owner /evolve off / panic set the sentinel
+            # after it (panic can fire from another thread — the toggle/`/evolve` paths
+            # are already serialized ahead of this on the supervisor loop). Honor the
+            # LIVE flag inside the atomic update so evolution is never enabled against a
+            # fresh owner stop, even in that window.
+            if bool(live.get("evolution_owner_stopped")):
+                return
             live["evolution_mode_enabled"] = True
             live["evolution_consecutive_failures"] = 0
             live["post_task_autostop"] = True
 
-        update_state(_activate_one_shot)
+        st_after = update_state(_activate_one_shot)
         _safe_unlink(path)
-        log.info("post_task_evolution: promotion applied -> gated evolution campaign activated")
+        if not bool(st_after.get("evolution_mode_enabled")):
+            # Owner stop won the race: the atomic re-check refused the enable. Terminal-
+            # close the campaign this now-stale path minted so no dangling active campaign
+            # survives, and do NOT audit a self-enable that did not happen. The durable
+            # sentinel keeps evolution off until an owner /evolve start.
+            try:
+                from supervisor.evolution_lifecycle import complete_evolution_campaign
+                complete_evolution_campaign("owner stop raced post-task enable", status="stopped")
+            except Exception:
+                pass
+            return False
+        # Audit: this is the ONLY path that flips evolution_mode_enabled True without an
+        # owner /evolve start. Record the cause + campaign id so any autonomous self-enable
+        # is observable (the other True-writer is the owner /evolve handler).
+        try:
+            from supervisor.evolution_lifecycle import _read_evolution_campaign as _rc
+            _cid = str((_rc() or {}).get("id") or "")
+        except Exception:
+            _cid = ""
+        log.info(
+            "post_task_evolution: AUTONOMOUS self-enable (source=post_task, campaign=%s, "
+            "objective=%r) — evolution_mode_enabled flipped True with no /evolve start",
+            _cid, objective[:120],
+        )
         return True
     except Exception:
         log.debug("post_task_evolution.apply_pending_request failed", exc_info=True)

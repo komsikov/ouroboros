@@ -85,6 +85,7 @@ def collect_routes(
         api_reset,
         api_update_apply,
         api_update_check,
+        api_update_preflight,
         api_update_status,
     )
     from ouroboros.gateway.projects import (
@@ -112,6 +113,7 @@ def collect_routes(
         api_onboarding,
         api_owner_auto_grant,
         api_owner_context_mode,
+        api_owner_safety_mode,
         api_owner_scope_review_floor,
         api_owner_runtime_mode,
         api_settings_get,
@@ -187,6 +189,7 @@ def collect_routes(
         Route("/api/owner/auto-grant", endpoint=api_owner_auto_grant, methods=["POST"]),
         Route("/api/owner/context-mode", endpoint=api_owner_context_mode, methods=["POST"]),
         Route("/api/owner/scope-review-floor", endpoint=api_owner_scope_review_floor, methods=["POST"]),
+        Route("/api/owner/safety-mode", endpoint=api_owner_safety_mode, methods=["POST"]),
         Route("/api/owner/capability-ack", endpoint=api_acknowledge_capability, methods=["POST"]),
         Route("/api/model-catalog", endpoint=api_model_catalog),
         Route("/api/projects", endpoint=api_projects_list, methods=["GET"]),
@@ -208,6 +211,7 @@ def collect_routes(
         Route("/api/git/promote", endpoint=api_git_promote, methods=["POST"]),
         Route("/api/update/status", endpoint=api_update_status),
         Route("/api/update/check", endpoint=api_update_check, methods=["POST"]),
+        Route("/api/update/preflight", endpoint=api_update_preflight, methods=["POST"]),
         Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
         Route("/api/cost-breakdown", endpoint=make_cost_breakdown_endpoint(data_dir)),
         Route("/api/evolution-data", endpoint=api_evolution_data),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List
 
 from ouroboros.pricing import estimate_cost
@@ -193,6 +194,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
         )
         return json.dumps({
             "answer": text or "(no answer)",
+            "answer_type": "summary",
             "sources": _extract_sources_from_response(response),
             "backend": "openrouter_server_tool",
         }, ensure_ascii=False, indent=2)
@@ -233,6 +235,7 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
         )
         return json.dumps({
             "answer": "".join(text_parts).strip() or "(no answer)",
+            "answer_type": "summary",
             "sources": _extract_sources_from_response(response),
             "backend": "anthropic_server_tool",
         }, ensure_ascii=False, indent=2)
@@ -241,30 +244,45 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
         raise RuntimeError(f"Anthropic web search failed ({type(exc).__name__}): {detail}") from exc
 
 
-def _web_search_ddgs(query: str) -> str:
-    try:
-        from ddgs import DDGS
+def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
+    # ddgs is an unofficial scraper with no SLA: it raises a RatelimitException
+    # under sustained load. Retry a few times with backoff on transient rate-limit/
+    # timeout errors so a full benchmark run (many sequential searches) survives.
+    last_exc: Exception | None = None
+    for attempt in range(max(1, _max_attempts)):
+        try:
+            from ddgs import DDGS
 
-        with DDGS() as ddgs_client:
-            results = list(ddgs_client.text(query, max_results=10))
-        sources = [{
-            "url": sanitize_tool_result_for_log(str(item.get("href") or item.get("url") or "")),
-            "title": sanitize_tool_result_for_log(str(item.get("title") or "")),
-            "snippet": sanitize_tool_result_for_log(str(item.get("body") or item.get("snippet") or "")),
-        } for item in results]
-        answer = "\n".join(
-            f"- {item['title']}: {item['snippet']} ({item['url']})"
-            for item in sources
-            if item["url"] or item["snippet"]
-        )
-        return json.dumps({
-            "answer": answer or "(no answer)",
-            "sources": sources,
-            "backend": "ddgs",
-        }, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"DDGS web search failed ({type(exc).__name__}): {detail}") from exc
+            with DDGS() as ddgs_client:
+                results = list(ddgs_client.text(query, max_results=10))
+            sources = [{
+                "url": sanitize_tool_result_for_log(str(item.get("href") or item.get("url") or "")),
+                "title": sanitize_tool_result_for_log(str(item.get("title") or "")),
+                "snippet": sanitize_tool_result_for_log(str(item.get("body") or item.get("snippet") or "")),
+            } for item in results]
+            answer = "\n".join(
+                f"- {item['title']}: {item['snippet']} ({item['url']})"
+                for item in sources
+                if item["url"] or item["snippet"]
+            )
+            return json.dumps({
+                "answer": answer or "(no answer)",
+                "answer_type": "summary",
+                "sources": sources,
+                "backend": "ddgs",
+            }, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            last_exc = exc
+            name = type(exc).__name__.casefold()
+            msg = str(exc).casefold()
+            transient = ("ratelimit" in name or "ratelimit" in msg or "429" in msg
+                         or "202" in msg or "timeout" in name)
+            if transient and attempt + 1 < _max_attempts:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+    detail = sanitize_tool_result_for_log(str(last_exc))[:500]
+    raise RuntimeError(f"DDGS web search failed ({type(last_exc).__name__}): {detail}") from last_exc
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -282,8 +300,38 @@ def _web_search(
     reasoning_effort: str = "",
     _attempt: int = 0,
 ) -> str:
+    # Backend pin: force ONE backend regardless of which provider keys are present.
+    # A fixed-model run pins 'ddgs' so web_search is pure-retrieval (no second LLM
+    # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
+    # (no cascade — see _fallbacks). 'auto'/'' keep the default OpenAI-first cascade
+    # below. This is a config gate on TRANSPORT, not on agent behaviour (P5-safe).
+    pinned = (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+    if pinned in ("ddgs", "openrouter", "anthropic"):
+        try:
+            if pinned == "ddgs":
+                return _web_search_ddgs(query)
+            if pinned == "openrouter":
+                return _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size)
+            return _web_search_anthropic(ctx, query, model=model)
+        except Exception as exc:
+            detail = sanitize_tool_result_for_log(str(exc))[:500]
+            return json.dumps(
+                {"error": f"pinned web_search backend '{pinned}' failed: {detail}", "backend": pinned},
+                ensure_ascii=False, indent=2,
+            )
+
     def _fallbacks(previous_errors: list[str] | None = None) -> str:
         errors = list(previous_errors or [])
+        if pinned == "openai":
+            # 'openai' is a TRUE pin: hard-fail rather than cascading to other backends,
+            # so a fixed/repro run cannot silently fall back to a different transport.
+            detail = "; ".join(errors) if errors else (
+                "no official OPENAI_API_KEY (without OPENAI_BASE_URL) configured"
+            )
+            return json.dumps(
+                {"error": f"pinned web_search backend 'openai' unavailable: {detail}", "backend": "openai"},
+                ensure_ascii=False, indent=2,
+            )
         for backend in (
             lambda: _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size),
             lambda: _web_search_anthropic(ctx, query, model=model),
@@ -312,7 +360,11 @@ def _web_search(
 
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        from ouroboros.config import get_websearch_timeout_sec
+        # Explicit transport timeout (v6.54.3, D): without it the streaming SDK
+        # call had NO client bound, so the ToolEntry 540s outer thread-kill was
+        # the only stop for a wedged stream.
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=get_websearch_timeout_sec())
 
         # --- Streaming path: emit progress while the search runs ---
         stream = client.responses.create(
@@ -414,7 +466,7 @@ def _web_search(
             except Exception:
                 log.debug("Failed to emit web_search cost event", exc_info=True)
 
-        return json.dumps({"answer": text or "(no answer)", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
+        return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
         detail = sanitize_tool_result_for_log(str(e))[:500]
         # One retry on a genuine timeout before cascading: web search timeouts are
@@ -443,7 +495,10 @@ def get_tools() -> List[ToolEntry]:
                 "Override any parameter per-call if needed (LLM-first: you decide). "
                 "For a COMPOUND question (several distinct facts/entities/time ranges in one ask), "
                 "issue one focused web_search per sub-question instead of one broad query — "
-                "narrow queries return sharper sources. These read-only searches run in parallel."
+                "narrow queries return sharper sources. These read-only searches run in parallel. "
+                "The returned `answer` is a SUMMARY/lead (answer_type=summary), not a primary source: "
+                "confirm load-bearing facts by opening the returned sources (browse_page) before "
+                "relying on them."
             ),
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "A single focused search query (split compound asks into separate calls)."},

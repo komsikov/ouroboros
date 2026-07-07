@@ -94,6 +94,8 @@
  * @property {boolean=} accepted
  * @property {number=} active_subagent_count
  * @property {number=} max_active_subagents
+ * @property {boolean=} queued_behind_active_cap
+ * @property {string[]=} required_capabilities
  * @property {string=} write_surface
  * @property {string=} model_lane
  * @property {string=} requested_model_lane
@@ -104,7 +106,9 @@
  * @property {string=} status
  * @property {number=} cost_usd
  * @property {string=} result
+ * @property {boolean=} result_truncated
  * @property {string=} trace_summary
+ * @property {boolean=} trace_summary_truncated
  * @property {string=} error
  * @property {string=} artifact_status
  * @property {Object=} artifact_bundle
@@ -216,6 +220,34 @@
  */
 
 /**
+ * @typedef {Object} OwnerSafetyModeResponse
+ * @property {boolean} ok
+ * @property {string} safety_mode  // full | light | off (v6.54.3)
+ */
+
+/**
+ * @typedef {Object} InstalledSkill
+ * @property {string} name
+ * @property {string} type
+ * @property {string=} version
+ * @property {string=} description
+ * @property {boolean=} enabled
+ * @property {string=} source
+ * @property {string=} payload_root
+ * @property {string=} review_status
+ * @property {boolean=} review_stale
+ * @property {Object=} review_gate
+ * @property {boolean=} executable_review
+ * @property {string=} review_profile
+ * @property {boolean=} official_hub_verified
+ * @property {boolean=} owner_attestable
+ * @property {{visible: boolean, disabled: boolean, reason: string}=} submit_hub
+ * @property {boolean=} is_self_authored
+ * @property {Object=} grants
+ * @property {string[]=} permissions
+ */
+
+/**
  * @typedef {Object} SkillGrantResponse
  * @property {boolean} ok
  * @property {string} skill
@@ -251,8 +283,10 @@
  * @property {"forked"|"empty"|"shared"=} memory_mode
  * @property {string=} project_id Per-project facts scope id (else derived from the workspace path).
  * @property {Object[]=} attachments
+ * @property {Object[]=} acceptance_claims Advisory Observable Acceptance Claims (`claim`/`surface`/`support`/`priority`).
  * @property {Object=} allowed_resources
  * @property {Object=} resource_policy
+ * @property {string[]=} disabled_tools Declarative tool-policy denylist: tool names withheld from the agent (independent of allowed_resources).
  * @property {ExecutorRef=} executor_ref
  * @property {"stop"|"keep"=} service_teardown Task service finalization policy; `keep` is for external verifiers/owners that need live services after task completion. POSIX-only: on Windows a cancel/hard-timeout tree-kills all task processes, so `keep` is not preserved there.
  * @property {string=} deadline_at
@@ -343,4 +377,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.40.0';
+export const GATEWAY_CONTRACT_VERSION = '6.56.0';

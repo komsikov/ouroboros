@@ -72,6 +72,11 @@ export const apiClient = {
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
+    /** @returns {Promise<import('./api_types.js').OwnerScopeReviewFloorResponse>} */
+    ownerScopeReviewFloor: (floor) => jsonPost('/api/owner/scope-review-floor', { floor }),
+    /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
+    ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
+    ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),
     extensions: () => fetchJson('/api/extensions', { cache: 'no-store' }),
@@ -82,5 +87,8 @@ export const apiClient = {
     }),
     skillGrants: (skill, items) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, { items }),
     chatHistory: (limit = 1000) => fetchJson(`/api/chat/history?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
-    projectFromTask: (taskId, id, name) => jsonPost('/api/projects/from-task', { task_id: taskId, id, name }),
+    projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
+    updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
+    updatePreflight: () => jsonPost('/api/update/preflight', {}),
+    updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),
 };

@@ -156,16 +156,6 @@ def test_vlm_query_honors_protected_artifact_policy(monkeypatch, tmp_path):
 
 
 # --- WA3 round-3: multi-scope review must not NameError on ScopeReviewResult ---
-def test_parallel_review_imports_scope_review_result():
-    """v6.36.0 round-3 finding: parallel_review._run_scope constructs
-    ScopeReviewResult in the multi-scope branch AND its own exception handler — the
-    symbol must resolve at module scope or both paths NameError, turning a valid
-    review into SCOPE_REVIEW_BLOCKED."""
-    import ouroboros.tools.parallel_review as pr
-    from ouroboros.tools.scope_review import ScopeReviewResult as SRR
-    assert getattr(pr, "ScopeReviewResult", None) is SRR
-
-
 # --- claudexor round: acceptance re-review must not be poisoned by stale verdict -
 def test_superseded_pre_revision_review_does_not_poison_objective():
     """claudexor finding (E/M): the objective reducer is worst-of-all-runs, so a
@@ -203,6 +193,25 @@ def test_sole_superseded_review_is_not_erased_without_replacement():
     axis = _review_axis(trace)
     assert axis["status"] == "fail"            # the sole (unreplaced) FAIL still counts
     assert axis["run_count"] == 1
+
+
+def test_review_axis_preserves_agent_acceptance_disposition():
+    from ouroboros.outcomes import _review_axis
+
+    axis = _review_axis({
+        "acceptance_decision": {
+            "status": "rejected",
+            "source": "agent_task_acceptance_review_tool",
+            "rationale": "Scope drift.",
+            "agent_disposition": "rejected",
+            "agent_rationale": "Scope drift.",
+        }
+    })
+
+    decision = axis["acceptance_decision"]
+    assert decision["status"] == "rejected"
+    assert decision["agent_disposition"] == "rejected"
+    assert decision["agent_rationale"] == "Scope drift."
 
 
 def test_provider_unavailable_no_salvage_path_does_not_raise(monkeypatch):

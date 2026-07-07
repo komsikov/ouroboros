@@ -22,6 +22,9 @@ def test_render_prompt_requires_outcome_tier_and_independence():
     assert "outcome_tier" in keys_line and "completion_coach" in keys_line
     assert "EVIDENCE INDEPENDENCE" in prompt
     assert "ENVIRONMENT vs DELIVERABLE" in prompt
+    assert "FULL goal/spec narrative" in prompt
+    assert "affected components/surfaces" in prompt
+    assert "per-criterion evidence" in prompt
 
     # A non-tier surface keeps the lean key list (no tier keys).
     plain = _render_prompt(
@@ -173,7 +176,11 @@ def test_degraded_actor_does_not_poison_acceptance_capsule(tmp_path):
     """v6.36.0 (scope review finding): aggregate_outcome_tier / build_improvement_
     capsule must draw tier/coach/findings ONLY from actors that contributed to the
     aggregate verdict — a single parse-degraded slot carrying a BLOCKED tier must
-    not inject a blocking improvement note into an otherwise-clean quorum PASS."""
+    not inject a blocking improvement note into an otherwise-clean quorum PASS.
+    v6.55.0 (codex/fable-5 cumulative review): a DELIBERATE minority DEGRADED
+    verdict carrying a concrete recommendation now surfaces as ONE labeled
+    non-veto [DISSENT] line (the GAIA 3cef3a44 class) — while the mainline
+    capsule (tier / coach / bullets) stays unpoisoned exactly as before."""
     from ouroboros.review_substrate import aggregate_outcome_tier, build_improvement_capsule
     slots = [ReviewSlot(slot_id=f"s{i}", model=f"m-{i}") for i in range(3)]
     req = ReviewRequest(
@@ -182,12 +189,16 @@ def test_degraded_actor_does_not_poison_acceptance_capsule(tmp_path):
     )
     res = run_review_request(req, slots=slots, drive_root=tmp_path, llm=PoisonDegradedSlotLLM())
     assert res.aggregate_signal == "PASS"
-    # The degraded '-2' slot's BLOCKED tier / coach / finding must NOT surface.
+    # The degraded '-2' slot's BLOCKED tier / coach must NOT surface.
     assert aggregate_outcome_tier(res) == "solved"
     capsule = build_improvement_capsule(res)
-    assert "do not ship this" not in capsule
     assert "STOP everything" not in capsule
     assert "blocked" not in capsule.lower()
+    # ...but its deliberate DEGRADED verdict + concrete recommendation IS the
+    # dissent class: one labeled line, never a mainline bullet.
+    assert "[DISSENT — s2 said DEGRADED]" in capsule
+    assert "do not ship this" in capsule
+    assert "- do not ship this" not in capsule
 
 
 class ContractDegradedPassLLM:
@@ -272,7 +283,11 @@ def test_single_configured_reviewer_marks_no_diversity(tmp_path):
 def test_required_outcome_tier_is_enforced_at_quorum(tmp_path):
     """T1 (v6.35.0): with classify_outcome_tier policy, a PASS WITHOUT a valid
     outcome_tier cannot count toward a clean quorum — the required-tier contract
-    is enforced at the parser/quorum level, not just asked for in the prompt."""
+    is enforced at the parser/quorum level, not just asked for in the prompt.
+
+    v6.46.0 (Q7): on the ADVISORY task-acceptance surface, a SOLVED deliverable has
+    no tier-up step, so an empty completion_coach must NOT demote a solved PASS to
+    DEGRADED. A tier-LESS PASS is still non-responsive."""
     slots = [ReviewSlot(slot_id=f"s{i}", model=f"m-{i}") for i in range(3)]
 
     def _req():
@@ -282,10 +297,11 @@ def test_required_outcome_tier_is_enforced_at_quorum(tmp_path):
         )
 
     no_tier = run_review_request(_req(), slots=slots, drive_root=tmp_path, llm=PassNoTierLLM())
-    assert no_tier.aggregate_signal == "DEGRADED"  # tier-less PASS is non-responsive
+    assert no_tier.aggregate_signal == "DEGRADED"  # tier-less PASS is still non-responsive
 
+    # Advisory carve-out: a SOLVED PASS without a coach is RESPONSIVE (nothing to improve).
     no_coach = run_review_request(_req(), slots=slots, drive_root=tmp_path, llm=PassTierNoCoachLLM())
-    assert no_coach.aggregate_signal == "DEGRADED"  # tier without completion_coach is non-responsive
+    assert no_coach.aggregate_signal == "PASS"
 
     with_tier = run_review_request(_req(), slots=slots, drive_root=tmp_path, llm=PassWithTierLLM())
     assert with_tier.aggregate_signal == "PASS"
@@ -351,7 +367,7 @@ def test_acceptance_review_evidence_diff_is_host_owned(monkeypatch, tmp_path):
 
     captured = {}
 
-    monkeypatch.setattr(re_mod, "collect_turn_diff", lambda ctx: "HOST_DIFF_REAL")
+    monkeypatch.setattr(re_mod, "collect_turn_diff", lambda ctx, **kw: "HOST_DIFF_REAL")
 
     def _fake_run(request, **kwargs):
         captured["evidence"] = dict(request.evidence)
@@ -363,8 +379,10 @@ def test_acceptance_review_evidence_diff_is_host_owned(monkeypatch, tmp_path):
     ctx = NS(drive_root=str(tmp_path), task_id="t")
     _handle_task_acceptance_review(ctx, claim="done", evidence={"repo_diff": "STALE_AGENT_DIFF"})
 
+    # v6.51.0: host repo_diff stays host-owned; the agent value is demoted (not promoted) under
+    # the clearly-tagged `agent_supplied` block (was a top-level key pre-v6.51.0).
     assert captured["evidence"]["repo_diff"] == "HOST_DIFF_REAL"
-    assert captured["evidence"]["agent_supplied_repo_diff"] == "STALE_AGENT_DIFF"
+    assert captured["evidence"]["agent_supplied"]["agent_supplied_repo_diff"] == "STALE_AGENT_DIFF"
 
 
 def test_acceptance_review_empty_host_diff_does_not_fall_back_to_agent(monkeypatch, tmp_path):
@@ -378,7 +396,7 @@ def test_acceptance_review_empty_host_diff_does_not_fall_back_to_agent(monkeypat
     from ouroboros.tools.review import _handle_task_acceptance_review
 
     captured = {}
-    monkeypatch.setattr(re_mod, "collect_turn_diff", lambda ctx: "")
+    monkeypatch.setattr(re_mod, "collect_turn_diff", lambda ctx, **kw: "")
 
     def _fake_run(request, **kwargs):
         captured["evidence"] = dict(request.evidence)
@@ -390,9 +408,52 @@ def test_acceptance_review_empty_host_diff_does_not_fall_back_to_agent(monkeypat
     ctx = NS(drive_root=str(tmp_path), task_id="t")
     _handle_task_acceptance_review(ctx, claim="done", evidence={"repo_diff": "FABRICATED_AGENT_DIFF"})
 
-    # repo_diff stays the (empty) host fact; the agent value is only the labeled key.
+    # repo_diff stays the (empty) host fact; the agent value is only the demoted, tagged key
+    # under `agent_supplied` (v6.51.0 relocation — was top-level).
     assert captured["evidence"]["repo_diff"] == ""
-    assert captured["evidence"]["agent_supplied_repo_diff"] == "FABRICATED_AGENT_DIFF"
+    assert captured["evidence"]["agent_supplied"]["agent_supplied_repo_diff"] == "FABRICATED_AGENT_DIFF"
+
+
+def test_acceptance_review_records_agent_disposition(monkeypatch, tmp_path):
+    from types import SimpleNamespace as NS
+
+    import ouroboros.review_evidence as re_mod
+    import ouroboros.review_substrate as rs
+    from ouroboros.tools.review import _handle_task_acceptance_review
+
+    captured = {}
+    monkeypatch.setattr(re_mod, "collect_turn_diff", lambda ctx, **kw: "")
+
+    def _fake_run(request, **kwargs):
+        captured["evidence"] = dict(request.evidence)
+        return NS(aggregate_signal="PASS", actors=[], parsed_findings=[])
+
+    monkeypatch.setattr(rs, "run_review_request", _fake_run)
+    monkeypatch.setattr(rs, "reviewer_slots", lambda **k: [ReviewSlot(slot_id="a", model="m")])
+    monkeypatch.setattr(rs, "build_improvement_capsule", lambda _result: "")
+
+    ctx = NS(drive_root=str(tmp_path), task_id="t")
+    raw = _handle_task_acceptance_review(
+        ctx,
+        claim="done",
+        agent_disposition="rejected",
+        rationale="Reviewer asked for a benchmark-specific workaround; I reject it as scope drift.",
+    )
+    payload = json.loads(raw)
+
+    assert captured["evidence"]["agent_supplied"]["agent_decision"]["disposition"] == "rejected"
+    assert payload["agent_decision"]["disposition"] == "rejected"
+    assert "scope drift" in payload["agent_decision"]["rationale"]
+
+
+def test_task_acceptance_review_schema_exposes_agent_disposition():
+    from ouroboros.tools.review import get_tools
+
+    tool = next(entry for entry in get_tools() if entry.name == "task_acceptance_review")
+    props = tool.schema["parameters"]["properties"]
+
+    assert props["agent_disposition"]["enum"] == ["accepted", "rejected", "partial", "deferred"]
+    assert "rationale" in props
 
 
 def test_collect_turn_diff_redacts_secrets(tmp_path):

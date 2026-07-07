@@ -647,19 +647,17 @@ def call_llm_with_retry(
     use_local: bool = False,
     deadline_ts: Optional[float] = None,
     attempt_cap: Optional[int] = None,
+    allow_server_web_search: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], float]:
     """Call LLM with retry logic, usage tracking, and event emission.
 
     Retry budgets are per failure class: transient provider failures
     (finish_reason=null, 429/5xx/overloaded) may use up to
-    ``transient_retry_max(max_retries)`` same-model attempts; every other retryable
-    class keeps the caller's ``max_retries``. ``deadline_ts`` (epoch seconds) bounds
-    backoff sleeps so retries never eat the remaining task deadline. ``attempt_cap``
-    (F1 fallback candidates only) caps the whole loop. No cross-model fallback here.
+    ``transient_retry_max(max_retries)`` same-model attempts; other retryable classes
+    keep ``max_retries``. ``deadline_ts`` bounds backoff sleeps; ``attempt_cap`` caps
+    fallback candidates. No cross-model fallback here.
 
-    Returns:
-        (response_message, cost) on success
-        (None, 0.0) on failure after the class's attempt budget
+    Returns `(response_message, cost)` or `(None, 0.0)` after the attempt budget.
     """
     msg = None
     drive_root = pathlib.Path(drive_logs).parent
@@ -672,6 +670,24 @@ def call_llm_with_retry(
         llm_call_id = new_call_id("llm")
         request_ref: Dict[str, Any] = {}
         try:
+            send_messages = messages
+            try:
+                from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+                send_messages = prepare_messages_for_send(
+                    messages,
+                    routing=VisionRoutingContext(
+                        model=model,
+                        llm=llm,
+                        accumulated_usage=accumulated_usage,
+                        drive_root=drive_root,
+                        task_id=task_id,
+                        event_queue=event_queue,
+                        use_local=use_local,
+                    ),
+                )
+            except Exception:
+                log.debug("vision routing preparation failed; falling back to canonical messages", exc_info=True)
             _emit_live_log(event_queue, {
                 "type": "llm_round_started",
                 "task_id": task_id,
@@ -686,11 +702,12 @@ def call_llm_with_retry(
                 "use_local": bool(use_local),
             })
             kwargs = {
-                "messages": messages,
+                "messages": send_messages,
                 "model": model,
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
                 "use_local": use_local,
+                "allow_server_web_search": bool(allow_server_web_search),
             }
             if tools:
                 kwargs["tools"] = tools
@@ -702,11 +719,13 @@ def call_llm_with_retry(
                     call_type="llm_request",
                     payload={
                         "messages": messages,
+                        "send_messages": send_messages,
                         "tools": tools or [],
                         "model": model,
                         "reasoning_effort": effort,
                         "max_tokens": MAIN_LOOP_MAX_TOKENS,
                         "use_local": bool(use_local),
+                        "allow_server_web_search": bool(allow_server_web_search),
                     },
                     manifest={
                         "execution_id": execution_id,

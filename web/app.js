@@ -5,6 +5,7 @@ import { initFiles } from './modules/files.js';
 import { initMatrixRain, loadVersion } from './modules/utils.js';
 import { createWS } from './modules/ws.js';
 
+import { initActivity } from './modules/activity.js';
 import { apiFetch } from './modules/api_client.js';
 import { initCosts } from './modules/costs.js';
 import { initDashboard } from './modules/dashboard.js';
@@ -12,6 +13,7 @@ import { initEvolution } from './modules/evolution.js';
 import { initLogs } from './modules/logs.js';
 import { initSettings } from './modules/settings.js';
 import { initSkills } from './modules/skills.js';
+import { initUpdateStatus } from './modules/update_status.js';
 import { initUpdates } from './modules/updates.js';
 import { escapeHtmlAttr, escapeHtmlText } from './modules/utils.js';
 import { initWidgets } from './modules/widgets.js';
@@ -366,9 +368,11 @@ dashboardControls = initDashboard(ctx);
 initLogs({ ...ctx, mount: document.getElementById('dashboard-panel-logs'), embedded: true, hostPage: 'dashboard', hostSubtab: 'logs' });
 initEvolution({ ...ctx, mount: document.getElementById('dashboard-panel-evolution'), embedded: true, hostPage: 'dashboard', hostSubtab: 'evolution', chartOnly: true });
 initUpdates({ ...ctx, mount: document.getElementById('dashboard-panel-updates'), hostPage: 'dashboard', hostSubtab: 'updates' });
+initActivity({ ...ctx, mount: document.getElementById('dashboard-panel-activity'), embedded: true, hostPage: 'dashboard', hostSubtab: 'activity' });
 initCosts({ ...ctx, mount: document.getElementById('dashboard-panel-costs'), embedded: true, hostPage: 'dashboard', hostSubtab: 'costs' });
 initSkills(ctx);
 initWidgets(ctx);
+initUpdateStatus(ctx);
 
 initOnboardingOverlay();
 

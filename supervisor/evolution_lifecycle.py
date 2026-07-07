@@ -15,6 +15,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, Optional
 
+from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 
@@ -76,6 +77,8 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner") -> D
             "updated_at": now,
             "cycles_done": 0,
             "absorbed_cycles_done": 0,
+            "objective_repeat_counts": {},  # BUG3: fp -> non-absorbing-cycle count
+            "dropped_objective_fps": [],  # BUG3 Layer B: attempted-and-dropped objective fps
             "budget_spent_usd": 0.0,
             "last_task_id": "",
             "progress_notes": "",
@@ -92,7 +95,14 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner") -> D
 
 
 def pause_evolution_campaign(reason: str = "") -> Dict[str, Any]:
-    """Pause the active evolution campaign without deleting its state."""
+    """Pause the active evolution campaign without deleting its state.
+
+    RESUMABLE: a later ``/evolve start`` resumes the SAME campaign in place
+    (start_evolution_campaign treats ``paused`` as resumable). Used by the system
+    breakers (light mode, consecutive failures, objective-repeat cap, budget reserve,
+    restart-blocked) — NOT by an owner stop. For an owner stop use
+    ``complete_evolution_campaign`` (terminal).
+    """
     campaign = _read_evolution_campaign()
     if campaign:
         campaign["status"] = "paused"
@@ -100,6 +110,62 @@ def pause_evolution_campaign(reason: str = "") -> Dict[str, Any]:
         campaign["pause_reason"] = str(reason or "")
         _write_evolution_campaign(campaign)
     return campaign
+
+
+def complete_evolution_campaign(
+    reason: str = "", *, status: str = "stopped", cleanup_worktree: bool = True
+) -> Dict[str, Any]:
+    """Terminally CLOSE the active campaign — the OWNER-stop counterpart of the
+    resumable pause. ``status`` is non-{active,paused}, so a later ``/evolve start``
+    mints a FRESH campaign instead of resurrecting this one. Archives + pops any
+    in-flight ``active_transaction`` (and ``post_task_backlog_id``) so a terminally
+    stopped campaign carries no dangling commit for a boot reconcile to absorb. The
+    durable gate against autonomous re-arm is the ``evolution_owner_stopped`` state
+    flag set at the owner-stop sites (read by ``apply_pending_request``); this terminal
+    status is the observability/audit marker plus a clean campaign. Never raises.
+
+    ``cleanup_worktree`` (default True) runs the deterministic per-cycle worktree reset
+    for an in-flight transaction. PANIC passes ``False``: the Emergency Stop Invariant
+    (BIBLE) forbids delaying panic, so panic must NOT run git stash/reset work before its
+    hard exit — the panic flag + boot reconcile own that recovery instead."""
+    try:
+        campaign = _read_evolution_campaign()
+        if not campaign:
+            return campaign or {}
+        now = utc_now_iso()
+        tx = campaign.get("active_transaction")
+        if isinstance(tx, dict):
+            tx = {**tx, "cycle_outcome": tx.get("cycle_outcome") or "owner_stopped"}
+            # Owner stop mid-cycle: this terminal 'stopped' status makes
+            # update_evolution_campaign_after_task early-return when the cancelled task's
+            # (async) task_done later fires, so the normal per-cycle worktree cleanup would
+            # be SKIPPED — leaking the abandoned, unreviewed evolution edits into the live
+            # repo. Run that same deterministic cleanup here before popping the tx. It is
+            # self-guarded (skips with a recorded reason while a task still holds the shared
+            # worktree — hence owner-stop sites cancel the running cycle BEFORE this close —
+            # kill-switch-able, never raises). SKIPPED under panic (cleanup_worktree=False):
+            # the Emergency Stop Invariant forbids any git work before the panic hard-exit.
+            if cleanup_worktree:
+                try:
+                    _cleanup_worktree_after_cycle(tx, str(tx.get("task_id") or ""))
+                except Exception:
+                    pass
+            try:
+                append_unique_transaction(campaign, tx)
+            except Exception:
+                pass
+            campaign.pop("active_transaction", None)
+        campaign.pop("post_task_backlog_id", None)
+        campaign.pop("pause_reason", None)
+        campaign["status"] = str(status or "stopped")
+        campaign["updated_at"] = now
+        campaign["completed_at"] = now
+        campaign["completion_reason"] = str(reason or "")
+        _write_evolution_campaign(campaign)
+        return campaign
+    except Exception:
+        log.debug("complete_evolution_campaign failed", exc_info=True)
+        return {}
 
 
 def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,6 +186,10 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         "campaign_id": str((campaign or {}).get("id") or ""),
         "task_id": str(task_id or ""),
         "cycle": int(cycle or 0),
+        # BUG3: capture the objective this cycle will run, at cycle START, as the SSOT
+        # per-cycle fingerprint. Read here (not at outcome time) because campaign["objective"]
+        # can be overwritten by a later promotion before the outcome is recorded.
+        "objective_fp": canonical_objective_fingerprint(str((campaign or {}).get("objective") or "")),
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "base_head": base_head,
@@ -143,6 +213,47 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         current["updated_at"] = utc_now_iso()
         _write_evolution_campaign(current)
     return transaction
+
+
+def _bump_objective_repeat_count(campaign: Dict[str, Any], tx: Dict[str, Any]) -> None:
+    """BUG3: count one non-absorbing cycle against its objective fingerprint.
+
+    Cumulative PER-FINGERPRINT (not a consecutive streak), so a blocked objective that is
+    re-proposed NON-consecutively (interleaved with other no_op work) still accumulates toward
+    the pause gate. ``setdefault`` tolerates campaigns persisted before this field existed; a
+    transaction without an ``objective_fp`` (e.g. a tx-less idle cycle) is skipped, never
+    bucketed under the empty key.
+    """
+    fp = str((tx or {}).get("objective_fp") or "")
+    if not fp:
+        return
+    counts = campaign.setdefault("objective_repeat_counts", {})
+    counts[fp] = int(counts.get(fp, 0) or 0) + 1
+    # Layer B: also mark this objective attempted-and-dropped so the chooser (Layer A) can be
+    # told not to re-propose it. This is a campaign-local signal, NOT a backlog status flip:
+    # the backlog item stays "open" (the work is genuinely unsolved), we only stop FEEDING it
+    # back to the evolution objective chooser.
+    dropped = campaign.setdefault("dropped_objective_fps", [])
+    if fp not in dropped:
+        dropped.append(fp)
+
+
+def _clear_objective_repeat_count(campaign: Dict[str, Any], tx: Dict[str, Any]) -> None:
+    """BUG3: a genuine absorb clears ONLY this objective's repeat tally and dropped flag.
+
+    Called at every site that sets ``cycle_outcome == "absorbed"`` (task-done here, plus the
+    two durable boot/restart-verify absorb sites in agent_startup_checks). Keyed on the same
+    SSOT fingerprint as the bump so success on the looping objective resets exactly its bucket
+    and un-drops it (it landed, so it is no longer do-not-re-propose).
+    """
+    fp = str((tx or {}).get("objective_fp") or "")
+    if not fp:
+        return
+    counts = campaign.setdefault("objective_repeat_counts", {})
+    counts.pop(fp, None)
+    dropped = campaign.setdefault("dropped_objective_fps", [])
+    if fp in dropped:
+        dropped.remove(fp)
 
 
 def update_evolution_transaction(task_id: str, **updates: Any) -> None:
@@ -324,12 +435,15 @@ def update_evolution_campaign_after_task(
                 campaign["absorbed_cycles_done"] = int(campaign.get("absorbed_cycles_done") or 0) + 1
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
+                _clear_objective_repeat_count(campaign, tx)  # BUG3: genuine progress clears this fp
             elif has_rescue:
                 tx["cycle_outcome"] = "abandoned"
                 tx["abandoned_reason"] = "rescue_ref_present"
                 _cleanup_worktree_after_cycle(tx, str(task_id or ""))
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
+                campaign.pop("post_task_backlog_id", None)  # BUG3 Layer B: detach (was missing on abandoned)
+                _bump_objective_repeat_count(campaign, tx)  # BUG3: non-absorbing cycle counts
             elif not has_commit:
                 tx["cycle_outcome"] = "no_op"
                 tx["restart_required"] = False
@@ -338,6 +452,7 @@ def update_evolution_campaign_after_task(
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
                 campaign.pop("post_task_backlog_id", None)
+                _bump_objective_repeat_count(campaign, tx)  # BUG3: non-absorbing cycle counts
             else:
                 tx["cycle_outcome"] = "waiting_for_restart"
                 tx["recovery_hint"] = tx.get("recovery_hint") or (

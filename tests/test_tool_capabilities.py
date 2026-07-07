@@ -118,6 +118,31 @@ def test_search_code_has_result_limit():
     assert "claude_code_edit" in FOREGROUND_MUTATIVE_TOOLS
 
 
+def test_extract_video_frames_visible_where_media_siblings_are_visible():
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES,
+        CORE_TOOL_NAMES,
+        LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+    )
+
+    for tool_set in (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES):
+        assert {"ocr_pdf", "youtube_transcript", "extract_video_frames"} <= tool_set
+
+
+def test_extract_video_frames_visible_to_workspace_tasks(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    repo.mkdir()
+    workspace.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(ToolContext(repo_dir=repo, drive_root=data, workspace_root=workspace, workspace_mode="external"))
+
+    assert registry.get_schema_by_name("extract_video_frames") is not None
+
+
 # ---------------------------------------------------------------------------
 # search_code tool behavior tests
 # ---------------------------------------------------------------------------
@@ -410,6 +435,70 @@ def test_schedule_subagent_in_initial_schemas():
     registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
     names = {s["function"]["name"] for s in initial_tool_schemas(registry)}
     assert "schedule_subagent" in names
+    schedule_schema = next(s for s in initial_tool_schemas(registry) if s["function"]["name"] == "schedule_subagent")
+    props = schedule_schema["function"]["parameters"]["properties"]
+    assert "required_capabilities" in props
+    assert "shell" in props["required_capabilities"]["items"]["enum"]
+
+
+def test_schedule_subagent_required_capabilities_fail_fast_for_readonly(tmp_path):
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    ctx.repo_dir.mkdir(parents=True)
+    ctx.drive_root.mkdir(parents=True)
+    result = _schedule_task(
+        ctx,
+        objective="Need git diff",
+        expected_output="diff summary",
+        required_capabilities=["shell", "vcs"],
+        write_surface="read_only",
+    )
+    assert "SUBAGENT_CAPABILITY_MISMATCH" in result
+
+
+def test_schedule_subagent_required_delegate_capability_is_satisfied_for_readonly(tmp_path):
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+
+    events = []
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    ctx.repo_dir.mkdir(parents=True)
+    ctx.drive_root.mkdir(parents=True)
+    ctx.pending_events = events
+    ctx.task_id = "parent1"
+    result = _schedule_task(
+        ctx,
+        objective="Delegate deeper readonly work",
+        expected_output="child id",
+        required_capabilities=["delegate"],
+        write_surface="read_only",
+    )
+    assert "SUBAGENT_CAPABILITY_MISMATCH" not in result
+    assert events and events[0]["type"] == "schedule_subagent"
+    assert events[0]["required_capabilities"] == ["delegate"]
+
+
+def test_schedule_subagent_required_vcs_capability_is_satisfied_for_readonly(tmp_path):
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+
+    events = []
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    ctx.repo_dir.mkdir(parents=True)
+    ctx.drive_root.mkdir(parents=True)
+    ctx.pending_events = events
+    ctx.task_id = "parent1"
+    result = _schedule_task(
+        ctx,
+        objective="Inspect git status in readonly child",
+        expected_output="status summary",
+        required_capabilities=["vcs"],
+        write_surface="read_only",
+    )
+    assert "SUBAGENT_CAPABILITY_MISMATCH" not in result
+    assert events and events[0]["required_capabilities"] == ["vcs"]
 
 
 def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
@@ -573,6 +662,7 @@ def test_local_readonly_subagent_allows_enabled_extension_tool(tmp_path, monkeyp
 
 
 def test_allowed_resources_block_web_and_external_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     from ouroboros import extension_loader
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.tools.registry import ToolContext, ToolRegistry
@@ -604,8 +694,12 @@ def test_allowed_resources_block_web_and_external_tools(tmp_path, monkeypatch):
         )
         assert task_contract["allowed_resources"] == {"web": False, "network": False}
         assert "RESOURCE_CONSTRAINT_BLOCKED" in registry.execute("web_search", {"query": "x"})
-        # vlm_query is a VLM/network tool — web=false must block it like analyze_screenshot.
-        assert "RESOURCE_CONSTRAINT_BLOCKED" in registry.execute("vlm_query", {"prompt": "x"})
+        # VLM tools are first-class vision tools, not web egress. Benchmark isolation
+        # withholds them by name via disabled_tools instead of relying on web=false.
+        assert "RESOURCE_CONSTRAINT_BLOCKED" not in registry.execute("vlm_query", {"prompt": "x"})
+        assert "RESOURCE_CONSTRAINT_BLOCKED" in registry.execute(
+            "vlm_query", {"prompt": "x", "image_url": "https://example.com/a.png"}
+        )
         assert registry.get_schema_by_name(tool_name) is None
         assert tool_name not in {schema["function"]["name"] for schema in registry.schemas()}
         assert any(item.get("surface") == "extensions" and item.get("reason") == "resource_blocked" for item in registry.capability_omissions())

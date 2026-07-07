@@ -10,7 +10,9 @@ from ouroboros.config import (
     get_scope_review_models,
     get_task_review_mode,
     get_context_mode,
-    reviews_disabled,
+    get_image_input_mode,
+    get_vision_caption_timeout_sec,
+    get_vision_model,
 )
 
 
@@ -74,8 +76,33 @@ def test_review_enforcement_default_in_config():
 
 
 def test_scope_review_and_task_review_defaults_in_config():
-    assert SETTINGS_DEFAULTS.get("OUROBOROS_SCOPE_REVIEW_MODELS") == "openai/gpt-5.5"
+    assert SETTINGS_DEFAULTS.get("OUROBOROS_SCOPE_REVIEW_MODELS") == "anthropic/claude-fable-5"
     assert SETTINGS_DEFAULTS.get("OUROBOROS_TASK_REVIEW_MODE") == "auto"
+
+
+def test_vision_settings_defaults_and_setup_contract(monkeypatch):
+    from ouroboros.settings_setup_contract import build_setup_contract
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "openai/gpt-5.5")
+    monkeypatch.delenv("OUROBOROS_MODEL_VISION", raising=False)
+    monkeypatch.delenv("OUROBOROS_IMAGE_INPUT_MODE", raising=False)
+    assert get_vision_model() == "openai/gpt-5.5"
+    assert get_image_input_mode() == "auto"
+    monkeypatch.setenv("OUROBOROS_MODEL_VISION", "google/gemini-2.5-pro")
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
+    assert get_vision_model() == "google/gemini-2.5-pro"
+    assert get_image_input_mode() == "caption"
+    monkeypatch.setenv("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "17")
+    assert get_vision_caption_timeout_sec() == 17
+    payload = build_setup_contract()
+    steps = {step["id"]: step for step in payload["steps"]}
+    assert steps["models"]["railCopy"] == "model slots"
+    slots = {slot["slot"]: slot for slot in payload["modelSlots"]}
+    assert slots["vision"]["settingKey"] == "OUROBOROS_MODEL_VISION"
+    assert slots["vision"]["settingsToggleId"] == ""
+    import pathlib
+    settings_ui = (pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
+    assert "'s-model-vision', ''," in settings_ui
 
 
 def test_auto_grant_reviewed_skills_default_in_config():
@@ -140,7 +167,7 @@ def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(mo
     2 unique) instead of the legacy [main]*N so both commit triad and
     plan_task have a quorum-safe reviewer list out of the box. The light slot
     picks up the provider default (OPENAI_DIRECT_DEFAULTS['light'] =
-    openai::gpt-5.5-mini) when OUROBOROS_MODEL_LIGHT is not explicitly set."""
+    openai::gpt-5.4-mini) when OUROBOROS_MODEL_LIGHT is not explicitly set."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -158,8 +185,8 @@ def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(mo
 
     assert models == [
         "openai::gpt-5.5",
-        "openai::gpt-5.5-mini",
-        "openai::gpt-5.5-mini",
+        "openai::gpt-5.4-mini",
+        "openai::gpt-5.4-mini",
     ]
 
 
@@ -321,21 +348,6 @@ def test_apply_settings_to_env_includes_context_mode(monkeypatch):
     apply_settings_to_env({"OUROBOROS_CONTEXT_MODE": "low"})
     assert os.environ.get("OUROBOROS_CONTEXT_MODE") == "low"
     os.environ.pop("OUROBOROS_CONTEXT_MODE", None)
-
-
-def test_reviews_disabled_env_overrides_fixed_infra(monkeypatch):
-    monkeypatch.delenv("OUROBOROS_REVIEWS_DISABLED", raising=False)
-    monkeypatch.delenv("OUROBOROS_FIXED_INFRA_MODELS", raising=False)
-    assert reviews_disabled() is False
-
-    monkeypatch.setenv("OUROBOROS_FIXED_INFRA_MODELS", "true")
-    assert reviews_disabled() is True
-
-    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "false")
-    assert reviews_disabled() is False
-
-    monkeypatch.setenv("OUROBOROS_REVIEWS_DISABLED", "true")
-    assert reviews_disabled() is True
 
 
 def test_get_auto_grant_enabled(monkeypatch, tmp_path):

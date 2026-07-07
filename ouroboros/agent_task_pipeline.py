@@ -21,6 +21,7 @@ from ouroboros.outcomes import (
     EXECUTION_FAILED,
     EXECUTION_INFRA_FAILED,
     EXECUTION_OK,
+    apply_receipt_absent_flag,
     artifact_bundle_from_result,
     build_verification_ledger,
     derive_loop_outcome,
@@ -146,6 +147,67 @@ def _apply_reflection_memory_actions(
     except Exception:
         log.debug("Reflection memory action application failed", exc_info=True)
         return 0
+
+
+def _build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Compact derived swarm-efficiency rollup for a task that fanned out subagents.
+
+    Computed from the durable ``swarm_fanout`` telemetry this task already emits
+    (control.py:_emit_swarm_fanout): the number of children, the number of fan-out
+    waves, the summed inter-wave latency, and the set of effective model lanes used.
+    Returns None for a plain task (no fan-out), so the block only appears on real
+    swarms.
+
+    OMITTED (no reliable structured source today): ``observed_max_concurrency`` —
+    child task results carry only ``ts``/``updated_at``, not a per-child running-start
+    vs finish timestamp, so true overlap cannot be derived honestly here — and
+    ``parent_blocked_wait_sec`` (wait_task returns prose, not a typed duration).
+    """
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    if not task_id:
+        return None
+    try:
+        from ouroboros.utils import iter_jsonl_objects
+
+        drive_root = getattr(env, "drive_root", None)
+        if drive_root is None:
+            return None
+        events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
+        child_ids: set[str] = set()
+        wave_count = 0
+        inter_wave_latency_total = 0.0
+        lanes: list[str] = []
+        # Read the FULL per-task events stream (not a tail window): the swarm_fanout
+        # events can occur EARLY in a long fan-out task, so a bounded tail would
+        # silently undercount waves/children (P1 no-silent-loss). This runs once at
+        # finalization (not a hot path) and only for fan-out tasks.
+        for ev in iter_jsonl_objects(events_path):
+            if ev.get("type") != "swarm_fanout":
+                continue
+            if str(ev.get("parent_task_id") or ev.get("task_id") or "") != task_id:
+                continue
+            wave_count += 1
+            for tid in ev.get("task_ids") or []:
+                if str(tid or "").strip():
+                    child_ids.add(str(tid))
+            try:
+                inter_wave_latency_total += float(ev.get("inter_wave_latency_sec") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            for lane in ev.get("effective_model_lanes") or []:
+                if str(lane or "").strip() and str(lane) not in lanes:
+                    lanes.append(str(lane))
+        if not child_ids:
+            return None
+        return {
+            "subagent_count": len(child_ids),
+            "wave_count": wave_count,
+            "inter_wave_latency_sec_total": round(inter_wave_latency_total, 3),
+            "lanes_used": lanes,
+        }
+    except Exception:
+        log.debug("swarm efficiency rollup failed", exc_info=True)
+        return None
 
 
 def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> str:
@@ -289,6 +351,15 @@ def emit_task_results(
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
     loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+    # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
+    # flag HERE — once — so the SAME flagged loop_outcome feeds the task_eval / task_metrics /
+    # task_done event stream (the day-1 monitoring metric reads it) AND the durable
+    # task_result.json. _store_task_result reuses this loop_outcome (single source), so the
+    # flag is no longer applied to a second, independently-derived outcome the events never saw.
+    apply_receipt_absent_flag(
+        loop_outcome, llm_trace, getattr(env, "drive_root", None), str(task.get("id") or ""),
+        expected_output=str(task.get("expected_output") or ""),
+    )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
     reason_code = str(loop_outcome.get("reason_code") or "")
@@ -355,7 +426,7 @@ def emit_task_results(
         log.debug("Failed to collect review evidence", exc_info=True)
 
     if not _ephemeral:
-        _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence)
+        _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence, loop_outcome=loop_outcome)
         stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
     else:
         # No durable task_result file for a transient decision turn; the card still
@@ -528,12 +599,27 @@ def emit_task_results(
 
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
-                       review_evidence: Dict[str, Any] | None = None) -> None:
-    """Store task result for parent task retrieval."""
+                       review_evidence: Dict[str, Any] | None = None,
+                       loop_outcome: Dict[str, Any] | None = None) -> None:
+    """Store task result for parent task retrieval.
+
+    ``loop_outcome``, when supplied by ``emit_task_results``, is the SINGLE already-
+    derived, already-receipt_absent-flagged outcome that also fed the task_eval /
+    task_metrics event stream — so the persisted axes match the events exactly and we
+    do not derive/flag a second time. It is only re-derived here when called without one.
+    """
     try:
         trace_summary = build_trace_summary(llm_trace)
         existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
-        loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+        if loop_outcome is None:
+            loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+            # FR3: inject durable verification receipts into the trace and flag
+            # receipt_absent on a clean-but-unverified effects turn — BEFORE normalize so
+            # the persisted axes and the ledger agree (claudexor lockstep fix).
+            apply_receipt_absent_flag(
+                loop_outcome, llm_trace, env.drive_root, str(task.get("id") or ""),
+                expected_output=str(task.get("expected_output") or ""),
+            )
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
         execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
         reason_code = str(loop_outcome.get("reason_code") or "")
@@ -580,6 +666,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             artifact_axis.update(outcome_axes.get("artifacts") or {})
         artifact_axis["status"] = str(artifact_bundle.get("status") or artifact_axis.get("status") or "not_applicable")
         outcome_axes["artifacts"] = artifact_axis
+        # B1: compact swarm-efficiency rollup, only for a task that actually fanned
+        # out subagents (None for a plain task -> kwarg omitted).
+        swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
             subagent_envelope = build_subagent_envelope(
@@ -647,6 +736,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             verification_ledger=verification_refs.get("inline"),
             artifact_bundle=artifact_bundle,
             artifacts=artifacts,
+            **({"swarm_efficiency": swarm_efficiency} if swarm_efficiency else {}),
             ts=utc_now_iso(),
         )
     except Exception as e:

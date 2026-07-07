@@ -26,15 +26,18 @@ both payload-local `.self_authored.json` and owner-state
 but they still go through the same tri-model skill review before they
 can run.
 
-**Owner attestation (skip review for your own skill).** For an external or
-self-authored skill the OWNER may skip the expensive LLM review via the
+**Owner attestation (skip review for your own or verified official skill).** For
+an external or self-authored skill, and for a hash-verified official
+OuroborosHub payload, the OWNER may skip the expensive LLM review via the
 **⚠️ Skip review** action on the skill card (owner-only
 `POST /api/owner/skills/{skill}/attest-review`). The deterministic preflight +
 manifest-validation floor STILL runs (an invalid or unsafe payload is refused),
-only the tri-model LLM phase is skipped; the verdict is marked `owner-attested`
-(distinct from an LLM-clean badge) and an owner-attested skill cannot be
-published to a public hub — run the full review first. Marketplace/native skills
-are never attestable. The agent cannot self-attest (the marker is owner-state).
+and official-hub payloads are freshly rechecked against the live catalog before
+attestation is persisted. Only the tri-model LLM phase is skipped; the verdict
+is marked `owner-attested` (distinct from an LLM-clean badge) and an
+owner-attested skill cannot be published to a public hub — run the full review
+first. Native, ClawHub, and unverified OuroborosHub payloads are never
+attestable. The agent cannot self-attest (the marker is owner-state).
 
 There are three skill types:
 
@@ -46,7 +49,7 @@ There are three skill types:
 
 The **runtime ownership** of an installed skill is also tagged:
 
-- `native`: bundled with the launcher (e.g. `weather`).
+- `native`: bundled with the launcher (e.g. `unix_computer_use`).
 - `self_authored`: created by Ouroboros itself in the current data
   plane; marked by `.self_authored.json` and reviewed through the
   standard tri-model skill-review path.
@@ -625,8 +628,9 @@ or repair a skill instead of reading a paraphrase here. Review verdicts are
 
 ## Reference skills
 
-The simplest reference for each type lives in `repo/skills/` and
-the OuroborosHub catalog:
+The simplest reference for each type lives in the OuroborosHub catalog
+(`razzant/OuroborosHub`); `unix_computer_use` ships bundled under
+`repo/skills/`:
 
 - `weather` — `type: extension`, declarative form/key-value widget,
   reads no env keys.
@@ -636,7 +640,7 @@ the OuroborosHub catalog:
   `read_settings` for `OPENROUTER_API_KEY`.
 
 You can read their full source under
-`data/skills/native/<name>/` for launcher-seeded examples, under
+`data/skills/ouroboroshub/<name>/` once installed from the hub, under
 `data/skills/external/<name>/` for your own local skills, or by browsing
 `razzant/OuroborosHub` on GitHub.
 

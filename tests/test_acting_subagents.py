@@ -525,6 +525,38 @@ def test_integrate_acting_rejects_foreign_target_root(tmp_path):
     assert (live / "a.txt").read_text(encoding="utf-8") == "hi\n"  # live repo untouched
 
 
+def test_integrate_self_worktree_patch_refused_under_external_workspace(tmp_path):
+    """v6.56.0 fail-closed category guard: a self_worktree child's patch targets the
+    Ouroboros SYSTEM repo; an external-workspace parent must not 3-way-apply it into
+    the task workspace (wrong repository)."""
+    from ouroboros.tools.subagent_integration import _integrate_subagent_patch
+    system_repo = tmp_path / "system_repo"
+    _init_repo(system_repo, {"a.txt": "hi\n"})
+    workspace = tmp_path / "workspace"
+    _init_repo(workspace, {"app.txt": "x\n"})
+    drive = tmp_path / "data"; drive.mkdir()
+    _make_child_patch(system_repo, drive, "childw", "a.txt", "hi\npatched\n", surface="self_worktree")
+    ctx = ToolContext(
+        repo_dir=system_repo, drive_root=drive, task_id="parent1",
+        workspace_root=str(workspace), workspace_mode="external",
+    )
+    out = _integrate_subagent_patch(ctx, task_id="childw")
+    assert "INTEGRATE_SELF_WORKTREE_UNDER_WORKSPACE" in out
+    assert not (workspace / "a.txt").exists()  # nothing applied into the workspace
+    # A nested acting parent integrating into its OWN self_worktree stays allowed
+    # (top-only routing): same child surface, workspace_mode=self_worktree.
+    worktree = tmp_path / "wt"
+    _init_repo(worktree, {"a.txt": "hi\n"})
+    _make_child_patch(worktree, drive, "childn", "a.txt", "hi\nnested\n", parent_task_id="acting_parent", surface="self_worktree")
+    nested_ctx = ToolContext(
+        repo_dir=system_repo, drive_root=drive, task_id="acting_parent",
+        workspace_root=str(worktree), workspace_mode="self_worktree",
+        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(worktree)),
+    )
+    out2 = _integrate_subagent_patch(nested_ctx, task_id="childn")
+    assert "INTEGRATE_SELF_WORKTREE_UNDER_WORKSPACE" not in out2
+
+
 def test_acting_no_workspace_blocks_live_repo_write_and_shell(tmp_path):
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
@@ -1285,3 +1317,18 @@ def test_gc_migration_all_defaults_collapse_to_unified_default(tmp_path, monkeyp
     s = config.load_settings()
     # No customized value -> fall back to first present (worktree 7) == unified default.
     assert s.get("OUROBOROS_GC_RETENTION_DAYS") == 7
+
+
+def test_select_subagent_constraint_read_only_token_is_readonly():
+    """`write_surface='read_only'` resolves to the SAME read-only constraint as
+    omitting the surface — never an acting self_worktree — giving a read-only audit
+    child an explicit, provider-safe way to name its intent (P5 cancel-storm fix)."""
+    from ouroboros.tools.control import _select_subagent_constraint
+
+    baseline = _select_subagent_constraint("", "", False, [], "")  # omit = read-only
+    assert isinstance(baseline, dict)
+    assert baseline.get("mode")
+    for surface in ("read_only", "READ_ONLY", " read_only "):
+        constraint = _select_subagent_constraint(surface, "", False, [], "")
+        assert isinstance(constraint, dict), surface
+        assert constraint == baseline, surface

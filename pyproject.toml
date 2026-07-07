@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "6.40.0"
+version = "6.56.0"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -30,11 +30,13 @@ dependencies = [
     "gigachat>=0.2.1,<0.3",
     "requests",
     "httpx",
+    "ddgs",
     "dulwich",
     "huggingface_hub",
     "starlette",
     "python-multipart",
     "Pillow>=10.0",
+    "pypdf>=4.0",
     "uvicorn[standard]",
     "websockets",
     "pytest>=7.0",
@@ -68,12 +70,6 @@ claude-sdk = ["claude-agent-sdk>=0.1.60"]
 browser = ["playwright", "playwright-stealth"]
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
-telemetry = [
-    "opentelemetry-api>=1.27.0",
-    "opentelemetry-sdk>=1.27.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
-]
-guardrails = ["nemoguardrails>=0.11.0"]
 all = ["claude-agent-sdk>=0.1.60", "playwright", "playwright-stealth", "llama-cpp-python", "huggingface_hub"]
 
 [tool.pytest.ini_options]
@@ -88,6 +84,7 @@ markers = [
     "ui_browser: launches the real Ouroboros web UI in host/direct mode; excluded from default local runs",
     "ui_browser_docker: launches UI smoke checks against Docker runtime; excluded from default local runs",
     "portable_detail: portable/build artifact detail checks; excluded from default local runs",
+    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml)",
 ]
 
 [tool.setuptools]
@@ -104,8 +101,6 @@ web = [
     "*.png",
     "*.jpg",
     "modules/*.js",
-    "icons/*.svg",
-    "icons/*.png",
     "providers/*.svg",
     "providers/*.png",
     "providers/*.ico",

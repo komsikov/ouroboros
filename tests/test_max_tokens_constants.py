@@ -15,6 +15,25 @@ def test_review_query_model_max_tokens():
     raise AssertionError("Expected max_tokens>=65536 in review.py _query_model")
 
 
+def test_project_naming_max_tokens_pinned():
+    """v6.40 drift-guard (DEVELOPMENT #13): the LIGHT project-naming one-shot stays a TINY
+    budget (256) — pinned so it can't silently drift up and matches the ARCHITECTURE
+    'LLM output token budgets' table row."""
+    import ast
+    from pathlib import Path
+
+    src = Path("ouroboros/project_naming.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    found = [
+        node.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.keyword)
+        and node.arg == "max_tokens"
+        and isinstance(node.value, ast.Constant)
+    ]
+    assert 256 in found, f"Expected max_tokens=256 in project_naming.py, got {found}"
+
+
 def test_scope_review_max_tokens():
     """scope_review.py _SCOPE_MAX_TOKENS must be ≥100000."""
     from ouroboros.tools.scope_review import _SCOPE_MAX_TOKENS
@@ -174,7 +193,7 @@ def test_scope_input_budget_reserves_output_within_window():
     )
 
 
-def test_scope_input_limit_is_model_family_calibrated():
+def test_scope_input_limit_is_model_family_calibrated(monkeypatch):
     """Claude-family scope reviewers get a code-density-calibrated input cap.
 
     Regression guard for the deterministic 400 where a 739,508-estimated-token
@@ -196,6 +215,12 @@ def test_scope_input_limit_is_model_family_calibrated():
         _SCOPE_MODEL_CONTEXT_WINDOW,
         _effective_scope_input_limit,
     )
+
+    # This test verifies the model-family CALIBRATION CONSTANT applied at a 1M window,
+    # not the window-resolution policy. Treat the reviewer as >=1M so an off-default
+    # Claude model (fable-5) takes the 1M-calibrated path: since the v6.46.0 false-1M
+    # fix, an off-default model with no Capability Evidence fail-closes to the sub-floor.
+    monkeypatch.setattr("ouroboros.tools.scope_review._scope_reviewer_window", lambda m: 1_000_000)
 
     assert _ANTHROPIC_REAL_TOKENS_PER_ESTIMATED >= 1.58, (
         "calibration ratio must cover the measured 1.58x Claude code density"

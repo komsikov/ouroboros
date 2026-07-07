@@ -8,10 +8,11 @@ migrated to neutral tool names.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
@@ -19,6 +20,44 @@ from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_
 from ouroboros.contracts.skill_payload_policy import resolve_skill_payload_target
 from ouroboros.shell_parse import is_absolute_path_text
 from ouroboros.utils import safe_relpath
+
+
+def _user_files_root() -> pathlib.Path:
+    """Filesystem base for the ``user_files`` resource root.
+
+    Defaults to the owner's real home. A jailed/benchmark runtime can redirect it
+    to a scratch directory via ``OUROBOROS_USER_FILES_ROOT`` so a task physically
+    cannot resolve the owner's real home (e.g. ``~/file1.txt`` secret files). Any
+    unusable value falls back to the real home — fail-safe, never broadens reach.
+    """
+    raw = (os.environ.get("OUROBOROS_USER_FILES_ROOT") or "").strip()
+    if raw:
+        try:
+            return pathlib.Path(raw).expanduser().resolve(strict=False)
+        except Exception:
+            # ANY unusable value (bad path, unknown ``~user`` RuntimeError, odd OS error)
+            # fails safe to the real home — the doc's "any unusable value" contract.
+            pass
+    return pathlib.Path.home().resolve(strict=False)
+
+
+def _deliverables_root() -> pathlib.Path:
+    """Container for UNNAMED user deliverables, JAIL-AWARE: when the user_files home is
+    redirected (``OUROBOROS_USER_FILES_ROOT``) and no explicit
+    ``OUROBOROS_DELIVERABLES_ROOT`` is set, keep unnamed deliverables INSIDE the jail so a
+    bare ``write_file(root='user_files', path='answer.txt')`` stays reachable and in-bounds
+    instead of escaping to the real ``~/Ouroboros/Deliverables`` (which the outside-home
+    check would then reject). Otherwise the global config default applies.
+    """
+    from ouroboros.config import get_deliverables_root
+
+    jail = (os.environ.get("OUROBOROS_USER_FILES_ROOT") or "").strip()
+    explicit = (os.environ.get("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
+    if explicit:
+        return pathlib.Path(explicit).expanduser().resolve(strict=False)
+    if jail and not explicit:
+        return (_user_files_root() / "Deliverables").resolve(strict=False)
+    return pathlib.Path(get_deliverables_root()).expanduser().resolve(strict=False)
 
 
 ToolProfile = Literal[
@@ -45,6 +84,15 @@ Operation = Literal[
     "read",
     "list",
     "search",
+    "write",
+    "edit",
+    "shell",
+    "vcs",
+    "review",
+    "delegate",
+    "service",
+]
+SubagentCapability = Literal[
     "write",
     "edit",
     "shell",
@@ -87,15 +135,36 @@ _USER_FILES_SECRET_COMPONENTS = frozenset({
     ".azure",
     ".config",
     ".docker",
+    ".git",   # v6.52.0: VCS internals hold config + stored credentials
     ".gnupg",
+    ".hg",
     ".kube",
     ".local",
     ".netrc",
     ".ssh",
+    ".svn",
     "library",
 })
 _USER_FILES_SECRET_NAMES = frozenset({
     ".env",
+    # v6.52.0: credential / shell-init / history dotFILES kept blocked AFTER the bare
+    # `startswith('.')` block was dropped (so benign project dotdirs are readable while
+    # secret-bearing dotfiles are not).
+    ".bash_history",
+    ".bash_profile",
+    ".bashrc",
+    ".dockercfg",
+    ".git-credentials",
+    ".gitconfig",
+    ".htpasswd",
+    ".npmrc",
+    ".pgpass",
+    ".profile",
+    ".pypirc",
+    ".python_history",
+    ".zsh_history",
+    ".zprofile",
+    ".zshrc",
     "auth.json",
     "credentials",
     "credentials.json",
@@ -105,6 +174,25 @@ _USER_FILES_SECRET_NAMES = frozenset({
     "tokens.json",
 })
 _USER_FILES_SECRET_RE = re.compile(r"(?:^|[._-])(api[_-]?key|credential|password|secret|token)(?:[._-]|$)", re.I)
+# v6.52.0 (P1): a SMALL allowlist of benign hidden (dot) project components. The dotfile guard
+# is DEFAULT-DENY: a credential blocklist can never be exhaustive (e.g. ~/.terraform.d,
+# ~/.cargo/credentials.toml, ~/.oci/config, ~/.pip/pip.conf, ~/.m2/settings.xml, ~/.*_history all
+# leak under enumeration), so a dotted component is blocked UNLESS it is one of these known-safe
+# project-config dirs/files. This serves the goal (read .github/.vscode/.idea project config)
+# without opening the whole in-home dotfile space.
+_USER_FILES_ALLOWED_DOTNAMES = frozenset({
+    ".github",
+    ".gitlab",
+    ".circleci",
+    ".devcontainer",
+    ".vscode",
+    ".idea",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".dockerignore",
+    ".editorconfig",
+})
 
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
@@ -125,6 +213,10 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         "runtime_data": {"read", "list"},
         "task_drive": {"read", "list", "write", "edit", "shell", "service"},
         "artifact_store": {"read", "list", "write", "shell", "service"},
+        # v6.52.0 (P1): non-external workspace tasks may READ user files (no write/shell) so
+        # an attached/owner file is reachable; the user_files_path_block_reason guard (secret/
+        # control-plane/outside-home) still applies.
+        "user_files": {"read", "list", "search"},
         "subagent_projects": {"read", "list", "search"},
         "deliverables": {"read", "list", "search"},
     },
@@ -180,6 +272,17 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         **{root: {"read", "list", "search"} for root in _READONLY_RESOURCE_ROOTS},
     },
 }
+
+_SUBAGENT_CAPABILITY_TO_OPERATION: dict[str, Operation] = {
+    "write": "write",
+    "edit": "edit",
+    "shell": "shell",
+    "vcs": "vcs",
+    "review": "review",
+    "delegate": "delegate",
+    "service": "service",
+}
+SUBAGENT_CAPABILITIES: tuple[str, ...] = tuple(_SUBAGENT_CAPABILITY_TO_OPERATION.keys())
 
 
 def _is_subagent_ctx(ctx: Any) -> bool:
@@ -254,6 +357,147 @@ def decide_tool_access(
         False,
         reason=f"profile={profile} cannot {operation} root={root}",
         guard=f"{profile}:{root}:{operation}",
+    )
+
+
+def subagent_profile_satisfies(profile: ToolProfile, needs: Iterable[str]) -> tuple[bool, list[str]]:
+    """Return whether a tool profile can satisfy each declared schedule-time need.
+
+    The caller supplies a closed-enum list from the schedule_subagent schema. This
+    function does no prose inference: it maps each declared need to the existing
+    Tool API operation matrix and checks whether the profile can perform that
+    operation on at least one root.
+    """
+
+    ops_by_root = _POLICY.get(profile, {})
+    available_ops = {op for ops in ops_by_root.values() for op in ops}
+    missing: list[str] = []
+    for need in needs or []:
+        normalized = str(need or "").strip().lower()
+        if normalized == "delegate" and profile in {
+            "local_readonly_subagent",
+            "acting_subagent",
+            "workspace_task",
+            "external_workspace_task",
+            "self_modification",
+            "operator_control",
+        }:
+            continue
+        if normalized == "vcs" and profile in {
+            "local_readonly_subagent",
+            "acting_subagent",
+            "workspace_task",
+            "external_workspace_task",
+            "self_modification",
+            "operator_control",
+        }:
+            continue
+        op = _SUBAGENT_CAPABILITY_TO_OPERATION.get(normalized)
+        if not op or op not in available_ops:
+            missing.append(normalized or str(need))
+    return (not missing, missing)
+
+
+def _side_effect_free_process_roots(ctx: Any, operation: Operation) -> list[tuple[str, pathlib.Path]]:
+    """Resolve allowed process cwd roots without creating task/artifact dirs."""
+
+    profile = active_tool_profile(ctx)
+    candidates: list[tuple[ResourceRoot, pathlib.Path]] = [
+        ("active_workspace", resource_root_path(ctx, "active_workspace"))
+    ]
+    if hasattr(ctx, "drive_root"):
+        candidates.extend([
+            ("task_drive", resource_root_path(ctx, "task_drive")),
+            ("artifact_store", resource_root_path(ctx, "artifact_store")),
+        ])
+        meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+        for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
+            if meta.get(key):
+                meta_drive = pathlib.Path(meta[key]).resolve(strict=False)
+                task_id = task_id_for_artifacts(ctx)
+                candidates.extend([
+                    ("task_drive", (meta_drive / "task_drives" / task_id).resolve(strict=False)),
+                    ("artifact_store", task_artifact_dir_path(meta_drive, task_id, create=False).resolve(strict=False)),
+                ])
+    workspace_mode = bool(getattr(ctx, "is_workspace_mode", lambda: False)())
+    if not workspace_mode and hasattr(ctx, "drive_root"):
+        candidates.append(("user_files", resource_root_path(ctx, "user_files")))
+    elif is_external_workspace(ctx) and decide_tool_access(profile=profile, root="user_files", operation=operation).allow:
+        candidates.append(("user_files", resource_root_path(ctx, "user_files")))
+    return [
+        (label, root)
+        for label, root in candidates
+        if decide_tool_access(profile=profile, root=label, operation=operation).allow
+    ]
+
+
+def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, Any]:
+    """A compact, side-effect-free projection of filesystem/tool access affordances.
+
+    This is context for the LLM, not a new policy layer. Every fact is derived
+    from the Tool API v2 matrix and git-shell policy constants so the model can
+    plan inside the same envelope that the dispatcher later enforces.
+    """
+
+    profile = active_tool_profile(ctx)
+    policy = _POLICY.get(profile, {})
+    write_like = {"write", "edit", "shell", "vcs", "service"}
+    writable_roots = sorted(root for root, ops in policy.items() if ops & write_like)
+    readonly_roots = sorted(
+        root for root, ops in policy.items()
+        if ops and not (ops & write_like) and ops <= (_READ_OPS | {"review", "delegate"})
+    )
+    shell_roots = _side_effect_free_process_roots(ctx, "shell")
+    service_roots = _side_effect_free_process_roots(ctx, "service")
+    try:
+        from ouroboros.git_shell_policy import GIT_READONLY_SUBCOMMANDS
+
+        git_readonly_subcommands = sorted(GIT_READONLY_SUBCOMMANDS)
+    except Exception:
+        git_readonly_subcommands = []
+    light_gated_roots: list[str] = []
+    if str(runtime_mode or "").strip().lower() == "light":
+        for root in ("active_workspace", "system_repo"):
+            if root in policy:
+                light_gated_roots.append(root)
+    return {
+        "profile": profile,
+        "writable_roots": writable_roots,
+        "readonly_roots": readonly_roots,
+        "default_shell_cwd": shell_roots[0][0] if shell_roots else "",
+        "allowed_shell_cwd_roots": [label for label, _root in shell_roots],
+        "default_service_cwd": service_roots[0][0] if service_roots else "",
+        "allowed_service_cwd_roots": [label for label, _root in service_roots],
+        "git_readonly_subcommands": git_readonly_subcommands,
+        "light_gated_roots": sorted(light_gated_roots),
+    }
+
+
+def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "shell", error: Exception | None = None) -> str:
+    """Actionable fail-closed message for process cwd resolution failures."""
+
+    try:
+        allowed = _side_effect_free_process_roots(ctx, operation)
+        # Show the RESOLVED path per label (deduped): a bare label left the model
+        # guessing absolute paths and re-tripping this same block (v6.54.3, GAIA).
+        seen: set[str] = set()
+        allowed_entries: list[str] = []
+        for label, root in allowed:
+            entry = f"{label}={root}"
+            if entry not in seen:
+                seen.add(entry)
+                allowed_entries.append(entry)
+    except Exception:
+        allowed_entries = []
+    hint = (
+        "Allowed cwd roots for this tool/profile: " + ", ".join(allowed_entries)
+        if allowed_entries else
+        "No process cwd root is available to this tool/profile."
+    )
+    detail = f" ({type(error).__name__}: {error})" if error is not None else ""
+    return (
+        f"⚠️ SHELL_CWD_BLOCKED: CWD_BLOCKED: cwd {str(cwd or '.')} is outside allowed roots for {operation}{detail}. "
+        f"{hint}. Use one of those exact paths as cwd (or root=task_drive/artifact_store/user_files in file tools)."
     )
 
 
@@ -387,7 +631,7 @@ def light_cognitive_or_root_redirect(tool_name: str, args: dict[str, Any]) -> st
                 candidate = pathlib.Path(path_text).expanduser()
                 if not candidate.is_absolute():
                     continue
-                candidate.resolve(strict=False).relative_to(pathlib.Path.home().resolve(strict=False))
+                candidate.resolve(strict=False).relative_to(_user_files_root())
             except (ValueError, OSError, RuntimeError):
                 continue
             return (
@@ -444,7 +688,7 @@ def user_files_path_block_reason(
     """Return a block reason when candidate is not an external user file."""
 
     resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
-    home = pathlib.Path.home().resolve(strict=False)
+    home = _user_files_root()
     outside_home = not path_is_relative_to(resolved, home) and not _path_is_relative_to_casefold(resolved, home)
     # External-workspace tasks may reach host scratch outside home (/tmp, /build,
     # sibling checkouts). The runtime-overlap and credential guards BELOW still
@@ -487,9 +731,7 @@ def user_files_path_block_reason(
     # open a bypass. The outside-home, credential, and hidden-name checks still apply regardless.
     in_deliverables = False
     try:
-        from ouroboros.config import get_deliverables_root
-
-        _deliverables = pathlib.Path(get_deliverables_root()).expanduser().resolve(strict=False)
+        _deliverables = _deliverables_root()
         _deliverables_safe = not any(
             path_is_relative_to(_deliverables, pr) or _path_is_relative_to_casefold(_deliverables, pr)
             or path_is_relative_to(pr, _deliverables) or _path_is_relative_to_casefold(pr, _deliverables)
@@ -522,8 +764,15 @@ def user_files_path_block_reason(
         if not part:
             continue
         part_lower = part.lower()
-        if part.startswith(".") or part_lower in _USER_FILES_SECRET_COMPONENTS:
-            return "path is hidden or credential-like"
+        # v6.52.0 (P1): DEFAULT-DENY hidden (dot) components. Known secret/credential/VCS dirs
+        # are always blocked; ANY OTHER dotted component is blocked too UNLESS it is in the small
+        # benign allowlist (.github/.vscode/.idea/...). Benign project dotdirs become readable
+        # (the owner's goal) while the in-home dotfile space stays safe-by-default — an enumerated
+        # blocklist would leak credential stores like ~/.terraform.d, ~/.cargo, ~/.pip, etc.
+        if part_lower in _USER_FILES_SECRET_COMPONENTS:
+            return "path is hidden or credential-like (secret/credential directory)"
+        if part.startswith(".") and part_lower not in _USER_FILES_ALLOWED_DOTNAMES:
+            return "path is hidden or credential-like (non-allowlisted hidden component)"
     name = resolved.name
     name_lower = name.lower()
     if (
@@ -541,19 +790,75 @@ def resolve_user_file_path(
     path: str,
     *,
     allow_protected_descendants: bool = False,
+    allow_outside_home: bool = False,
 ) -> pathlib.Path:
-    """Resolve a user_files path under the user's home and outside Ouroboros control-plane roots."""
+    """Resolve a user_files path under the user's home and outside Ouroboros control-plane roots.
+
+    Absolute paths OUTSIDE the user_files home (and the Deliverables container) are
+    rejected EARLY with an actionable error instead of resolving to a foreign root
+    and failing later with an opaque ``relative_to`` crash (v6.54.3 — the TB2.1
+    ``'/app' is not in the subpath of '/root'`` class). ``allow_outside_home=True``
+    (the ``query_code`` external-target caller) skips only this EARLY actionable
+    check; ``user_files_path_block_reason`` below remains the outside-home
+    AUTHORITY, and it permits outside-home only for external-workspace contexts —
+    the mode the documented query_code contract (benchmark ``/app``) runs in.
+    Neither flag expands authority: a non-external context could not reach
+    outside-home before this check existed either."""
 
     raw_text = str(path or ".").strip() or "."
-    raw = pathlib.Path(raw_text).expanduser()
-    home = pathlib.Path.home().resolve(strict=False)
+    try:
+        raw = pathlib.Path(raw_text).expanduser()
+    except Exception:
+        # expanduser() raises RuntimeError for an unknown '~user'; leave it unexpanded —
+        # the '~' branch below maps it into the jail home (raw is only used elsewhere for
+        # absolute paths, where expanduser is a no-op anyway).
+        raw = pathlib.Path(raw_text)
+    home = _user_files_root()
     # is_absolute_path_text gives consistent cross-platform absolute detection
     # (drive-less "/x" roots and "C:\\x"/"\\\\unc" are all absolute) so Windows
     # does not silently treat a rooted path as home-relative.
     if is_absolute_path_text(raw_text):
         candidate = raw.resolve(strict=False)
+        # External-workspace tasks legitimately reach host scratch outside home
+        # (/tmp, /build, sibling checkouts) — for them the generic
+        # user_files_path_block_reason below stays the authority, mirroring its
+        # own is_external_workspace carve-out.
+        if not allow_outside_home and not is_external_workspace(ctx):
+            home_resolved = home.resolve(strict=False)
+            # Case-insensitive-platform parity with the user_files_path_block_reason
+            # authority: a differently-cased safe home path must not be rejected
+            # early where the casefold-aware guard would accept it (review round 7).
+            inside_home = path_is_relative_to(candidate, home_resolved) or _path_is_relative_to_casefold(
+                candidate, home_resolved
+            )
+            inside_deliverables = False
+            if not inside_home:
+                try:
+                    deliverables_resolved = _deliverables_root().resolve(strict=False)
+                    inside_deliverables = path_is_relative_to(
+                        candidate, deliverables_resolved
+                    ) or _path_is_relative_to_casefold(candidate, deliverables_resolved)
+                except (OSError, ValueError):
+                    inside_deliverables = False
+            if not inside_home and not inside_deliverables:
+                raise ValueError(
+                    "user_files path blocked: absolute path "
+                    f"{raw_text!r} is outside the user_files home ({home_resolved}). "
+                    "Use root='active_workspace' for workspace paths, or a "
+                    "home-relative path (e.g. 'Desktop/file.txt') for user files."
+                )
     elif raw_text.startswith("~"):
-        candidate = raw.resolve(strict=False)
+        # '~' / '~user' must expand to the CONFIGURED user_files home (the jail), NOT the
+        # real OS home — otherwise OUROBOROS_USER_FILES_ROOT isolation is bypassed by a
+        # '~/...' path. The jail has a single home, so '~user/sub' maps to '<home>/sub'.
+        _after = raw_text[1:]
+        if _after[:1] in ("/", "\\"):
+            _rel = _after[1:]
+        elif "/" in _after or "\\" in _after:
+            _rel = _after.replace("\\", "/").split("/", 1)[1]
+        else:
+            _rel = ""  # bare '~' or '~user' -> the home directory itself
+        candidate = (home / safe_relpath(_rel)).resolve(strict=False) if _rel else home.resolve(strict=False)
     else:
         # safe_relpath has already normalized any Windows backslash to a POSIX '/', so the
         # directory test below is separator-correct on every platform.
@@ -570,9 +875,7 @@ def resolve_user_file_path(
             # A bare name with no directory that does NOT already exist under home is an unnamed NEW
             # deliverable: route it into the visible Deliverables container instead of cluttering the
             # home root (a later read of the same bare name resolves there too, staying consistent).
-            from ouroboros.config import get_deliverables_root
-
-            candidate = (pathlib.Path(get_deliverables_root()).expanduser() / rel).resolve(strict=False)
+            candidate = (_deliverables_root() / rel).resolve(strict=False)
     reason = user_files_path_block_reason(
         ctx,
         candidate,
@@ -624,6 +927,15 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
     text = str(cwd or "").strip()
     if not text or text in {".", "./"}:
         return ensure_process_cwd(allowed[0][0], allowed[0][1]), allowed[0][0], allowed
+    for label, root in allowed:
+        if text == label:
+            if label == "user_files":
+                root = _deliverables_root()
+                root.mkdir(parents=True, exist_ok=True)
+                reason = user_files_path_block_reason(ctx, root)
+                if reason:
+                    break
+            return ensure_process_cwd(label, root), label, allowed
 
     raw = pathlib.Path(text).expanduser()
     candidates: list[pathlib.Path] = []
@@ -689,15 +1001,13 @@ def resource_root_path(
     if root == "artifact_store":
         return task_artifact_dir_path(pathlib.Path(getattr(ctx, "drive_root")), task_id_for_artifacts(ctx), create=False).resolve(strict=False)
     if root == "user_files":
-        return pathlib.Path.home().resolve(strict=False)
+        return _user_files_root()
     if root == "subagent_projects":
         from ouroboros.config import get_subagent_projects_root
 
         return pathlib.Path(get_subagent_projects_root()).expanduser().resolve(strict=False)
     if root == "deliverables":
-        from ouroboros.config import get_deliverables_root
-
-        return pathlib.Path(get_deliverables_root()).expanduser().resolve(strict=False)
+        return _deliverables_root()
     if root == "skill_payload":
         b = str(bucket or "").strip()
         s = str(skill_name or "").strip()

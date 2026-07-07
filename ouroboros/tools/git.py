@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
-from ouroboros.config import get_runtime_mode, reviews_disabled
+from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
     format_protected_paths,
@@ -243,6 +243,7 @@ def _run_reviewed_stage_cycle(
     goal: str = "",
     scope: str = "",
     review_rebuttal: str = "",
+    came_from_detached_checkout: bool = False,
 ) -> Dict[str, Any]:
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     def _failed(message: str) -> Dict[str, Any]:
@@ -278,6 +279,20 @@ def _run_reviewed_stage_cycle(
     except Exception as exc:
         return _failed(f"⚠️ GIT_ERROR (status): {_sanitize_git_error(str(exc))}")
     if not status.strip():
+        if came_from_detached_checkout:
+            # BUG 2 fix: a clean tree right after a detached-HEAD reconciliation is NOT a
+            # legitimate no-op — it usually means commits/edits were orphaned. Emit a
+            # distinct, actionable diagnostic instead of the generic GIT_NO_CHANGES that
+            # previously misled the agent (it misdiagnosed it as a missing API key).
+            # The token carries the _FAILED marker (loop_tool_execution._FAILURE_MARKERS) and
+            # deliberately does NOT use the "⚠️ GIT_ERROR" prefix, which is carved out to
+            # is_error=False — so this DOES classify as an infra failure (execution=infra_failed)
+            # and counts toward evolution_consecutive_failures instead of resetting it.
+            return _failed(
+                "⚠️ GIT_LOST_WORKTREE_ON_DETACHED_CHECKOUT_FAILED: working tree is clean after "
+                "detached HEAD reconciliation. The detached commits may have been orphaned. "
+                "Inspect `git reflog` and restore if needed."
+            )
         return _failed("⚠️ GIT_NO_CHANGES: nothing to commit.")
 
     try:
@@ -334,41 +349,32 @@ def _run_reviewed_stage_cycle(
             "message": msg,
             "block_reason": "core_protection_blocked",
         }
-    review_disabled = reviews_disabled()
-    if not review_disabled:
-        advisory_err = _check_advisory_freshness(
+    advisory_err = _check_advisory_freshness(
+        ctx,
+        commit_message,
+        skip_advisory_pre_review,
+        paths=advisory_paths,
+    )
+    if advisory_err:
+        run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+        _record_commit_attempt(
             ctx,
             commit_message,
-            skip_advisory_pre_review,
-            paths=advisory_paths,
+            "blocked",
+            block_reason="no_advisory",
+            block_details=advisory_err,
+            duration_sec=time.time() - commit_start,
         )
-        if advisory_err:
-            run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "blocked",
-                block_reason="no_advisory",
-                block_details=advisory_err,
-                duration_sec=time.time() - commit_start,
-            )
-            return {
-                "status": "blocked",
-                "message": advisory_err,
-                "block_reason": "no_advisory",
-            }
-    else:
-        try:
-            ctx.emit_progress_fn(
-                "Reviews disabled by OUROBOROS_REVIEWS_DISABLED/OUROBOROS_FIXED_INFRA_MODELS; skipping advisory, triad, and scope review."
-            )
-        except Exception:
-            pass
+        return {
+            "status": "blocked",
+            "message": advisory_err,
+            "block_reason": "no_advisory",
+        }
 
     _advisory_bypassed = skip_advisory_pre_review or not os.environ.get("ANTHROPIC_API_KEY", "")
     _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
     _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
-    if not review_disabled and _advisory_bypassed and not skip_tests and not _doc_only:
+    if _advisory_bypassed and not skip_tests and not _doc_only:
         try:
             ctx.emit_progress_fn(
                 "Advisory bypassed — running test preflight before triad + scope review..."
@@ -406,7 +412,7 @@ def _run_reviewed_stage_cycle(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
-    elif not review_disabled and _advisory_bypassed:
+    elif _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"
         elif skip_tests:
@@ -450,47 +456,6 @@ def _run_reviewed_stage_cycle(
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="pending",
     )
-
-    if review_disabled:
-        post_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
-        if not post_fingerprint.get("ok"):
-            return {
-                "status": "blocked",
-                "message": _handle_revalidation_failure(
-                    ctx,
-                    commit_message,
-                    commit_start,
-                    pre_fingerprint=pre_fingerprint,
-                    post_fingerprint=post_fingerprint,
-                    kind="fingerprint_unavailable",
-                ),
-                "block_reason": "fingerprint_unavailable",
-                "pre_fingerprint": pre_fingerprint,
-                "post_fingerprint": post_fingerprint,
-            }
-        if post_fingerprint.get("fingerprint") != pre_fingerprint.get("fingerprint"):
-            return {
-                "status": "blocked",
-                "message": _handle_revalidation_failure(
-                    ctx,
-                    commit_message,
-                    commit_start,
-                    pre_fingerprint=pre_fingerprint,
-                    post_fingerprint=post_fingerprint,
-                    kind="revalidation_failed",
-                ),
-                "block_reason": "revalidation_failed",
-                "pre_fingerprint": pre_fingerprint,
-                "post_fingerprint": post_fingerprint,
-            }
-        ctx._review_degraded_reasons = list(getattr(ctx, "_review_degraded_reasons", []) or [])
-        ctx._review_degraded_reasons.append("reviews_disabled")
-        return {
-            "status": "passed",
-            "message": "",
-            "pre_fingerprint": pre_fingerprint,
-            "post_fingerprint": post_fingerprint,
-        }
 
     review_err, scope_result, triad_block_reason, triad_advisory = _run_parallel_review(
         ctx,
@@ -1016,17 +981,11 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "Files are on disk in the active workspace. Do not commit; the headless runner will emit a patch artifact."
         )
     else:
-        if reviews_disabled():
-            result = (
-                f"✅ Written {len(written)} file(s): {summary}\n"
-                "Files are on disk but NOT committed. Run repo_commit when ready. Reviews are disabled by environment."
-            )
-        else:
-            result = (
-                f"✅ Written {len(written)} file(s): {summary}\n"
-                "Files are on disk but NOT committed. Run repo_commit when ready.\n"
-                "⚠️ Advisory pre-review is now stale — run advisory_pre_review before repo_commit."
-            )
+        result = (
+            f"✅ Written {len(written)} file(s): {summary}\n"
+            "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
+            "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        )
     protected_written = [] if ctx.is_workspace_mode() else protected_paths_in(written_paths)
     if protected_written and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice(protected_written)
@@ -1126,6 +1085,16 @@ def _str_replace_editor(
     new_content, _match_err = _str_match_replace(content, old_str, new_str, path, "STR_REPLACE_ERROR")
     if _match_err:
         return _match_err
+    if data_skill_target is not None:
+        # Deferral 5: a data-plane skill payload edited via the active_workspace route gets
+        # the SAME shrink guard as the root=skill_payload editor — no silent >30% truncation
+        # of a payload file. (Intentional large rewrites go through root=skill_payload, which
+        # carries the force escape hatch.)
+        from ouroboros.tools.core import _check_data_shrink_guard
+
+        _shrink_block = _check_data_shrink_guard(target, new_content)
+        if _shrink_block:
+            return _shrink_block
     try:
         write_text(target, new_content)
     except Exception as e:
@@ -1154,15 +1123,9 @@ def _str_replace_editor(
     if data_skill_target is None and ctx.is_workspace_mode():
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
-        if reviews_disabled():
-            result += "\nRun repo_commit when ready. Reviews are disabled by environment."
-        else:
-            result += "\nRun repo_commit when ready.\n⚠️ Advisory pre-review is now stale — run advisory_pre_review before repo_commit."
+        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
     else:
-        if reviews_disabled():
-            result += "\nRun skill_preflight before enabling or declaring this skill ready. Skill review is disabled by environment."
-        else:
-            result += "\nRun review_skill for this skill before enabling or declaring it ready."
+        result += "\nRun skill_review for this skill before enabling or declaring it ready."
     if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice([norm])
     return result
@@ -1190,6 +1153,20 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     if not commit_message.strip():
         return "⚠️ ERROR: commit_message must be non-empty."
     ctx._current_review_commit_message = commit_message
+    # Managed-update merge (P2/SC2): the tx marker authorizes exactly ONE resolution task to
+    # commit while a managed merge is staged in the live tree. The resolved tree commits as a
+    # reviewed 2-parent merge (native MERGE_HEAD), with push/tag suppressed + an inline
+    # pre-restart smoke. Any OTHER task is blocked from committing while the tx is active.
+    from supervisor.update_merge import managed_assisted_tx_for
+
+    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""))
+    if _managed_block:
+        _record_commit_attempt(ctx, commit_message, "blocked",
+                               block_reason="managed_update_in_progress", block_details=_managed_block,
+                               duration_sec=0.0, phase="preflight")
+        return _managed_block
+    if _managed_tx:
+        paths = None  # a managed merge always stages the WHOLE resolved tree (ignore paths)
     overlap_err = _check_overlapping_review_attempt(ctx)
     if overlap_err:
         _record_commit_attempt(
@@ -1216,17 +1193,45 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         block_reason="infra_failure", block_details=msg,
         duration_sec=time.time() - _commit_start), msg)[1]
     try:
-        try:
-            run_cmd(["git", "checkout", ctx.branch_dev], cwd=ctx.repo_dir)
-        except Exception as e:
-            err_msg = _sanitize_git_error(str(e))
-            already_on_target = False
+        is_detached = False
+        came_from_detached_checkout = False
+        if not _managed_tx:
+            # BUG 1 detection: a detached HEAD ahead of the branch must NOT be reconciled with
+            # a plain `git checkout ctx.branch_dev` (it would orphan the in-flight commits). The
+            # managed-merge path keeps a live MERGE_HEAD and does no checkout below, so it never
+            # needs this — only probe HEAD on the normal path.
             try:
                 current_branch = run_cmd(
                     ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                     cwd=ctx.repo_dir,
                 ).strip()
-                already_on_target = (current_branch == ctx.branch_dev)
+                is_detached = (current_branch == "HEAD")
+            except Exception:
+                pass
+        try:
+            # A managed assisted merge has a LIVE MERGE_HEAD + unmerged index (the agent
+            # resolved files but `git add` only happens in the stage cycle). A `git checkout`
+            # of the current branch can refuse on a conflicted index, so skip it — materialize
+            # already pinned HEAD to the branch and managed_assisted_precommit_verify re-checks.
+            if not _managed_tx:
+                if is_detached:
+                    # BUG 1 fix: HEAD detached (e.g. seeded from a tag checkout). A plain
+                    # `git checkout ctx.branch_dev` would jump to the branch's (older) tip and
+                    # silently discard in-flight commits/work-tree edits. Force-move the branch
+                    # to the current HEAD instead, preserving the detached commits and work tree.
+                    run_cmd(["git", "checkout", "-B", ctx.branch_dev, "HEAD"], cwd=ctx.repo_dir)
+                    came_from_detached_checkout = True
+                else:
+                    run_cmd(["git", "checkout", ctx.branch_dev], cwd=ctx.repo_dir)
+        except Exception as e:
+            err_msg = _sanitize_git_error(str(e))
+            already_on_target = False
+            try:
+                current_branch_after = run_cmd(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=ctx.repo_dir,
+                ).strip()
+                already_on_target = (current_branch_after == ctx.branch_dev)
             except Exception:
                 pass
             if not already_on_target:
@@ -1249,6 +1254,12 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                     "the checkout failure as an incidental dirty-tree no-op.\n"
                     f"{unmerged}"
                 )
+        if _managed_tx:
+            from supervisor.update_merge import managed_assisted_precommit_verify
+
+            _mok, _merr = managed_assisted_precommit_verify(_managed_tx)
+            if not _mok:
+                return _fail(_merr)
         outcome = _run_reviewed_stage_cycle(
             ctx,
             commit_message,
@@ -1259,11 +1270,36 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             goal=goal,
             scope=scope,
             review_rebuttal=review_rebuttal,
+            came_from_detached_checkout=came_from_detached_checkout,
         )
         if outcome.get("status") != "passed":
+            if _managed_tx:
+                # A blocked review's index reset can clear the live MERGE_HEAD; re-establish it so
+                # the agent can fix the flagged issues and re-commit (precommit_verify needs it),
+                # rather than stranding the resolution until the watchdog / boot rollback.
+                try:
+                    from supervisor.update_merge import reestablish_merge_head
+
+                    reestablish_merge_head(str(_managed_tx.get("target_sha") or ""))
+                except Exception:
+                    log.debug("reestablish_merge_head after blocked managed review failed", exc_info=True)
             return str(outcome.get("message", "") or "")
         pre_fingerprint = outcome.get("pre_fingerprint", {}) or {}
         post_fingerprint = outcome.get("post_fingerprint", {}) or {}
+
+        if _managed_tx:
+            # PRIMARY conflict-marker leakage gate (a `git add`-ed marker file is a resolved
+            # entry that --diff-filter=U misses), then mark the crash-window phase before the
+            # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
+            # parents — local_snapshot + target).
+            from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
+
+            _mok, _merr = managed_assisted_marker_check()
+            if not _mok:
+                return _fail(_merr)
+            _committing = dict(_managed_tx)
+            _committing["phase"] = "committing_assisted"
+            write_update_tx(_committing)
 
         try:
             run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
@@ -1308,9 +1344,27 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
         ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
         _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
-        tag_info = _auto_tag_on_version_bump(ctx.repo_dir, commit_message)
+        # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
+        # update would otherwise reach origin / create a version tag, and a later rollback would
+        # diverge from origin). The official version tag is handled on the owner's terms.
+        tag_info = "" if _managed_tx else _auto_tag_on_version_bump(ctx.repo_dir, commit_message)
     finally:
         _release_git_lock(lock)
+    if _managed_tx:
+        # Inline pre-restart smoke + tx transition (auto_merge parity); on failure it rolls back
+        # and the agent is told. No push (the merge lands locally; restart + boot finalize seal it).
+        from supervisor.update_merge import managed_assisted_postcommit
+
+        _ok_pc, _msg_pc = managed_assisted_postcommit(_managed_tx, commit_sha)
+        ctx.last_push_succeeded = False
+        if not _ok_pc:
+            # Smoke failed and the merge was rolled back — do NOT advertise an 'OK: committed'
+            # result (callers key on the leading text). Return the failure first + record it.
+            _record_commit_attempt(ctx, commit_message, "failed",
+                                   block_reason="managed_update_smoke_failed", block_details=_msg_pc,
+                                   duration_sec=time.time() - _commit_start)
+            return _msg_pc
+        return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
     push_status = _auto_push(ctx.repo_dir)
     ctx.last_push_succeeded = "[pushed:" in push_status
     if str(ctx.current_task_type or "") == "evolution":
@@ -1607,9 +1661,7 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Commit already-changed files. Requires a fresh advisory_review run first. "
                 "Includes unified pre-commit multi-model review before commit, "
-                "with configurable Advisory/Blocking enforcement, plus blocking scope review. "
-                "When OUROBOROS_REVIEWS_DISABLED=true, or when it is unset and "
-                "OUROBOROS_FIXED_INFRA_MODELS=true, review surfaces are skipped."
+                "with configurable Advisory/Blocking enforcement, plus blocking scope review."
             ),
             "parameters": {"type": "object", "properties": {
                 "commit_message": {"type": "string"},

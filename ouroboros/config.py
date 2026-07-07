@@ -89,6 +89,8 @@ SETTINGS_DEFAULTS = {
     # bulk lane (auto / deep subagents). (HEAVY renamed from the legacy MODEL_CODE.)
     "OUROBOROS_MODEL_HEAVY": "",
     "OUROBOROS_MODEL_LIGHT": "",
+    "OUROBOROS_MODEL_VISION": "",
+    "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon cognitive loop, not a cheap
     # helper lane. Empty means "use OUROBOROS_MODEL".
     "OUROBOROS_MODEL_CONSCIOUSNESS": "",
@@ -135,6 +137,14 @@ SETTINGS_DEFAULTS = {
     # worker threads wait (deadline-bounded) instead of storming one model's rate limit. <=0
     # disables. Default-on, fail-soft (see ouroboros/model_concurrency.py).
     "OUROBOROS_MODEL_MAX_CONCURRENCY": 3,
+    # Hard ceiling (seconds) a provider call waits for a concurrency slot when the task has
+    # NO deadline; past it the call proceeds WITHOUT a slot (never blocks forever). SSOT here.
+    "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC": 180,
+    # Project-naming LIGHT-call waits (v6.40): the provider-call transport timeout and the
+    # gateway's hard wait for the inline turn-into-project name. SSOT here (not magic numbers
+    # in project_naming.py) per DEVELOPMENT "Timeout & Wait Control".
+    "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC": 60,
+    "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
     "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
@@ -153,6 +163,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
     "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
+    "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC": 90,
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
@@ -167,8 +178,28 @@ SETTINGS_DEFAULTS = {
     # overrides the LLM-first promotion). Empty = pure LLM choice.
     "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE": "",
     "OUROBOROS_WEBSEARCH_MODEL": "gpt-5.2",
+    # web_search backend pin: auto (default OpenAI-first cascade) | ddgs (pure
+    # retrieval, no second LLM — for fixed-model runs) | openai | openrouter | anthropic.
+    "OUROBOROS_WEBSEARCH_BACKEND": "auto",
+    # Main-loop OpenRouter server web-search tool. Off by default: provider-
+    # specific capability, not a core provider-independence requirement.
+    "OUROBOROS_MAIN_WEB_SEARCH": "off",
+    "OUROBOROS_MAIN_WEB_SEARCH_ENGINE": "auto",
+    "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS": 10,
+    # OpenRouter provider routing: "" (off) | resilience (same-model failover, cache-warm)
+    # | repro (pin, no failover — fixed-model runs) | a raw JSON `provider` object.
+    "OUROBOROS_OR_PROVIDER": "",
+    # search_code total wall-clock budget (seconds) bounding the rg walk + the fallback walk.
+    "OUROBOROS_SEARCH_CODE_WALL_SEC": "45",
+    # NOTE: OUROBOROS_OBSERVABILITY_KEEP_RAW (writes UNREDACTED secret-bearing payloads to
+    # disk) is intentionally NOT a settings/UI carrier — it is an env-only operator debug
+    # override so a self-change or non-owner save can never enable secret logging.
+    # Generative context-window probe (Max gate): on (default) confirms a route's >=1M
+    # window from a FREE over-window reject; *_CHARS sizes the oversized padding.
+    "OUROBOROS_GENERATIVE_PROBE": "1",
+    "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
-    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.8",
+    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-fable-5",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
@@ -199,8 +230,8 @@ SETTINGS_DEFAULTS = {
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
-    "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.5",
-    "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.5",
+    "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
+    "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-fable-5",
     # Opt-in (default off): in low context mode, after the normal scope-review
     # prompt cannot fit and routes to the non-blocking skip, run a supplemental
     # window-fitting ADVISORY degraded scope review (top-scored touched +
@@ -212,6 +243,44 @@ SETTINGS_DEFAULTS = {
     # never satisfy a required blocking scope gate). See get_scope_review_floor.
     "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     "OUROBOROS_TASK_REVIEW_MODE": "auto",
+    # LLM safety-supervisor coverage (owner-only, like runtime/context mode):
+    #   full (default)  — LLM check on every POLICY_CHECK tool + non-whitelisted
+    #                     POLICY_CHECK_CONDITIONAL shell (today's behavior).
+    #   light           — LLM check ONLY on POLICY_CHECK integration tools;
+    #                     POLICY_CHECK_CONDITIONAL shell/verify fall to the
+    #                     deterministic whitelist + registry guards (no LLM).
+    #   off             — no LLM safety calls at all; the deterministic registry
+    #                     sandbox, protected-path policy, and light-mode guards
+    #                     STAY ON. Every non-full mode emits a durable audit event.
+    "OUROBOROS_SAFETY_MODE": "full",
+    # Safety-supervisor LLM call shaping (v6.54.3 parse-bug fix): a tight output
+    # budget + no reasoning keeps the light model from spending its whole budget on
+    # hidden reasoning and returning a 1-token/empty body that fails JSON parse and
+    # then fail-closed blocks a benign command. Registered numeric SSOT (no inline literals).
+    "OUROBOROS_SAFETY_MAX_TOKENS": 2000,
+    "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC": 60,
+    # v6.54.3 transport-timeout SSOT (deadline package D). web_search: the OpenAI
+    # streaming SDK call ran with NO client timeout, so the ToolEntry 540s outer cap
+    # was the only (thread-kill) bound; 480 keeps the transport failure cleanly
+    # messaged below that cap. LLM no_proxy read/write floor: was a hardcoded 3600s —
+    # 2700 still leaves generous headroom for long silent reasoning (scope review /
+    # deep self-review can think 20-40 min before the first byte) while a dead
+    # socket no longer pins a worker for a full hour.
+    "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
+    "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,
+    # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline, the planning
+    # swarm's wait ceiling is min(configured ceiling, remaining/4); below this floor
+    # planning cannot return anything useful in time, so plan_task SKIPS with a typed
+    # reason + telemetry instead of eating the tail of the budget (TB2.1: plan_task
+    # was structurally irrational under a 900s deadline — ceiling 900s + wrapper 1520s).
+    "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC": 300,
+    # v6.54.4 acceptance-review budget layer (task_pacing SSOT). est_sec: how long
+    # one review/improvement pass roughly takes (gates review launch above the
+    # finalization reserve). max passes default 1 = the historical single bounded
+    # improvement pass. reserve pct: finalization reserve = max(grace, pct×total).
+    "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 90,
+    "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES": 1,
+    "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
     # Reasoning effort per task type: none | low | medium | high
     "OUROBOROS_EFFORT_TASK": "medium",
     "OUROBOROS_EFFORT_EVOLUTION": "high",
@@ -267,6 +336,16 @@ def get_heavy_model() -> str:
     return str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
 
 
+def get_vision_model() -> str:
+    """Return the vision/caption model slot; empty falls back to OUROBOROS_MODEL."""
+    return str(os.environ.get("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
+
+
+def get_image_input_mode() -> str:
+    raw = str(os.environ.get("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
+    return raw if raw in {"auto", "caption", "inline", "off"} else "auto"
+
+
 def parse_fallback_chain() -> list[str]:
     """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
     (resilience walk, pricing categorization, credentialed-model resolution).
@@ -302,6 +381,7 @@ def get_fallback_models(active_model: str = "") -> list[str]:
 # OUROBOROS_MODEL_FALLBACK -> _FALLBACKS.
 _LEGACY_SLOT_RENAMES = (
     ("OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_HEAVY"),
+    ("OUROBOROS_VISION_MODEL", "OUROBOROS_MODEL_VISION"),
     ("USE_LOCAL_CODE", "USE_LOCAL_HEAVY"),
     ("OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_FALLBACKS"),
 )
@@ -330,62 +410,11 @@ def get_consciousness_model() -> str:
         or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
     )
 
-
-def _truthy_env(value: str) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def is_fixed_infra_models() -> bool:
-    """Return True when infra-critical model slots are locked by policy."""
-    return _truthy_env(os.environ.get("OUROBOROS_FIXED_INFRA_MODELS", ""))
-
-
-def get_fixed_infra_model() -> str:
-    """Return the forced model value for infra-critical slots, if configured."""
-    return str(os.environ.get("OUROBOROS_FIX_INFRA_MODEL", "") or "").strip()
-
-
-def get_fixed_infra_baseurl() -> str:
-    """Return the forced OpenAI-compatible base URL, if configured."""
-    return str(os.environ.get("OUROBOROS_FIX_INFRA_BASEURL", "") or "").strip()
-
-
-def get_fixed_infra_apikey() -> str:
-    """Return the forced OpenAI-compatible API key, if configured."""
-    return str(os.environ.get("OUROBOROS_FIX_INFRA_APIKEY", "") or "").strip()
-
-
-_FIXED_INFRA_MODEL_KEYS = (
-    "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_CODE",
-    "OUROBOROS_MODEL_LIGHT",
-    "OUROBOROS_MODEL_FALLBACK",
-)
-
-
-def apply_fixed_infra_model_policy(settings: dict) -> dict:
-    """Apply fixed-infra policy overrides when enabled via env flags."""
-    normalized = dict(settings or {})
-    if not is_fixed_infra_models():
-        return normalized
-    fixed_model = get_fixed_infra_model()
-    if fixed_model:
-        for key in _FIXED_INFRA_MODEL_KEYS:
-            normalized[key] = fixed_model
-    fixed_baseurl = get_fixed_infra_baseurl()
-    if fixed_baseurl:
-        normalized["OPENAI_COMPATIBLE_BASE_URL"] = fixed_baseurl
-    fixed_apikey = get_fixed_infra_apikey()
-    if fixed_apikey:
-        normalized["OPENAI_COMPATIBLE_API_KEY"] = fixed_apikey
-    return normalized
-
 _VALID_EFFORTS = ("none", "low", "medium", "high")
 _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
 # Runtime mode and review enforcement are separate axes.
 VALID_RUNTIME_MODES = ("light", "advanced", "pro")
-_TRUE_SETTING_VALUES = {"1", "true", "yes", "on"}
 
 # Context mode is an independent, owner-controlled working-context size profile
 # (low/max). Unlike runtime mode it is NOT boot-pinned — it is not a privilege
@@ -812,6 +841,18 @@ def get_subagent_projects_root() -> str:
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
 
 
+def get_search_code_wall_sec() -> float:
+    """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
+    directory walk and the batched rg loop so a scan over a very large root cannot run
+    unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
+    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
+           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
+    try:
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return 45.0
+
+
 def get_deliverables_root() -> str:
     """Visible container for UNNAMED user deliverables: a bare filename (no directory) lands here
     instead of cluttering the home root. Sibling of the genesis projects root under ~/Ouroboros,
@@ -828,19 +869,6 @@ def get_task_review_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
     raw = (os.environ.get("OUROBOROS_TASK_REVIEW_MODE", default_val) or default_val).strip().lower()
     return raw if raw in {"off", "auto", "required"} else default_val
-
-
-def reviews_disabled() -> bool:
-    """Return whether every LLM review surface is disabled by environment.
-
-    ``OUROBOROS_REVIEWS_DISABLED`` is the explicit full-review kill switch.
-    When it is unset, fixed-infra mode disables reviews by default.
-    """
-    raw = os.environ.get("OUROBOROS_REVIEWS_DISABLED")
-    if raw is not None and str(raw).strip():
-        return str(raw).strip().lower() in _TRUE_SETTING_VALUES
-    fixed = os.environ.get("OUROBOROS_FIXED_INFRA_MODELS", "")
-    return str(fixed or "").strip().lower() in _TRUE_SETTING_VALUES
 
 
 def get_auto_grant_enabled() -> bool:
@@ -895,6 +923,104 @@ def get_runtime_mode() -> str:
     return normalize_runtime_mode(os.environ.get("OUROBOROS_RUNTIME_MODE", default_val) or default_val)
 
 
+VALID_SAFETY_MODES = ("full", "light", "off")
+
+
+def normalize_safety_mode(value: Any) -> str:
+    """Clamp caller-supplied safety mode to the closed enum (full / light / off)."""
+    default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
+    text = str(value or "").strip().lower()
+    return text if text in VALID_SAFETY_MODES else default_val
+
+
+def get_safety_mode() -> str:
+    """Return the owner-selected LLM-safety-supervisor coverage (full | light | off).
+
+    Owner-only at the write surface (dropped from the agent-reachable /api/settings
+    POST; flows only through the dedicated audited owner endpoint), so the agent
+    cannot lower its own safety coverage. Deterministic registry sandbox, protected
+    paths, and light-mode guards run regardless of this mode (BIBLE P3: the LLM
+    supervisor is a layer, not the floor)."""
+    default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
+    return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
+
+
+def get_safety_max_tokens() -> int:
+    """Output-token budget for safety-supervisor LLM calls (parse-bug fix)."""
+    try:
+        val = int(os.environ.get("OUROBOROS_SAFETY_MAX_TOKENS", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
+    except (TypeError, ValueError):
+        val = int(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
+    return max(256, min(val, 16384))
+
+
+def get_safety_call_timeout_sec() -> float:
+    """Transport timeout for safety-supervisor LLM calls (prevents indefinite hang)."""
+    try:
+        val = float(os.environ.get("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
+    except (TypeError, ValueError):
+        val = float(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
+    return max(5.0, min(val, 600.0))
+
+
+def get_websearch_timeout_sec() -> float:
+    """Transport timeout for the web_search OpenAI streaming call (v6.54.3, D)."""
+    try:
+        val = float(os.environ.get("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
+    except (TypeError, ValueError):
+        val = float(SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
+    return max(30.0, min(val, 3600.0))
+
+
+def get_llm_transport_read_timeout_sec() -> float:
+    """Default httpx read/write timeout for no_proxy LLM clients (v6.54.3, D).
+
+    Generous by design: long silent reasoning (scope review, deep self-review)
+    can take 20-40 min before the first byte. This is the DEAD-SOCKET bound,
+    not a latency target; explicit per-call timeouts always win."""
+    try:
+        val = float(os.environ.get("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
+    except (TypeError, ValueError):
+        val = float(SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
+    return max(60.0, min(val, 7200.0))
+
+
+def get_acceptance_review_est_sec() -> float:
+    """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
+    try:
+        val = float(os.environ.get("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
+    except (TypeError, ValueError):
+        val = float(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
+    return max(10.0, min(val, 3600.0))
+
+
+def get_acceptance_max_improvement_passes() -> int:
+    """Default COUNT cap for acceptance-review improvement passes (v6.54.4)."""
+    try:
+        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
+    except (TypeError, ValueError):
+        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
+    return max(0, min(val, 20))
+
+
+def get_acceptance_reserve_pct() -> int:
+    """Default finalization-reserve percentage of the total budget (v6.54.4)."""
+    try:
+        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_RESERVE_PCT", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
+    except (TypeError, ValueError):
+        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
+    return max(0, min(val, 50))
+
+
+def get_plan_task_deadline_min_sec() -> float:
+    """Minimum useful deadline-scaled planning-swarm window (v6.54.3, 1.5)."""
+    try:
+        val = float(os.environ.get("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
+    except (TypeError, ValueError):
+        val = float(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
+    return max(30.0, min(val, 3600.0))
+
+
 def normalize_context_mode(value: Any) -> str:
     """Clamp caller-supplied context mode to the closed enum (low / max)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
@@ -936,6 +1062,36 @@ def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool
         raise PermissionError(
             "OUROBOROS_CONTEXT_MODE lowering refused: 'max' -> 'low'. "
             "Context mode is owner-controlled — use the dedicated owner endpoint/UI/CLI."
+        )
+
+
+_SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
+
+
+def _settings_file_safety_mode(default: str = "full") -> str:
+    """Read the persisted/current safety mode without normalizing whole settings."""
+    if SETTINGS_PATH.exists():
+        try:
+            disk_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(disk_settings, dict):
+                return normalize_safety_mode(disk_settings.get("OUROBOROS_SAFETY_MODE", default))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default) or default)
+
+
+def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool = False) -> None:
+    """Refuse agent-reachable settings writes that lower LLM-safety coverage.
+
+    ``full -> light -> off`` is a strictly decreasing coverage ladder; any downward
+    step is owner-only (mirrors the context-mode ratchet — the agent must not reduce
+    its own supervision to remove friction, BIBLE P3)."""
+    previous_mode = _settings_file_safety_mode()
+    next_mode = normalize_safety_mode(settings.get("OUROBOROS_SAFETY_MODE", previous_mode))
+    if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
+        raise PermissionError(
+            f"OUROBOROS_SAFETY_MODE lowering refused: {previous_mode!r} -> {next_mode!r}. "
+            "Safety mode is owner-controlled — use the dedicated /api/owner/safety-mode endpoint."
         )
 
 
@@ -1152,7 +1308,7 @@ def load_settings() -> dict:
             if key in loaded and settings.get(key) not in {None, ""}:
                 continue
             settings[key] = _coerce_setting_value(key, raw_env)
-        return apply_fixed_infra_model_policy(settings)
+        return settings
     finally:
         _release_settings_lock(fd)
 
@@ -1174,6 +1330,7 @@ def save_settings(
     fd = _acquire_settings_lock()
     try:
         _guard_context_mode_lowering(settings)
+        _guard_safety_mode_lowering(settings)
         # Baseline order: in-process pin, inherited env pin, on-disk fallback.
         baseline_pinned_in_process = _BOOT_RUNTIME_MODE is not None
         baseline_inherited_from_env = (
@@ -1215,13 +1372,12 @@ def save_settings(
                 f"OUROBOROS_RUNTIME_MODE elevation refused: "
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
-        settings_to_save = apply_fixed_infra_model_policy(settings)
         try:
             tmp = SETTINGS_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(settings_to_save, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
             os.replace(str(tmp), str(SETTINGS_PATH))
         except OSError:
-            SETTINGS_PATH.write_text(json.dumps(settings_to_save, indent=2), encoding="utf-8")
+            SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     finally:
         _release_settings_lock(fd)
 
@@ -1244,6 +1400,14 @@ def get_mcp_tool_timeout_sec() -> int:
     except (TypeError, ValueError):
         parsed = 0
     return parsed if parsed > 0 else int(SETTINGS_DEFAULTS["MCP_TOOL_TIMEOUT_SEC"])
+
+
+def get_vision_caption_timeout_sec() -> int:
+    raw = os.environ.get("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
 
 
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
@@ -1307,7 +1471,6 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
 
 def apply_settings_to_env(settings: dict) -> None:
     """Push settings into environment variables for supervisor modules."""
-    settings = apply_fixed_infra_model_policy(settings)
     env_keys = [
         "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
         "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
@@ -1317,11 +1480,13 @@ def apply_settings_to_env(settings: dict) -> None:
         "GIGACHAT_PROFANITY_CHECK",
         "ANTHROPIC_API_KEY",
         "OUROBOROS_NETWORK_PASSWORD",
-        "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
+        "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
         "OUROBOROS_MODEL_CONSCIOUSNESS",
         "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
         "OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "OUROBOROS_FALLBACK_COOLDOWN_SEC",
         "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY",
+        "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC",
+        "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC",
         "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
         "OUROBOROS_MAX_WORKERS", "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
         "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
@@ -1330,11 +1495,18 @@ def apply_settings_to_env(settings: dict) -> None:
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
         "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
         "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC",
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC",
         "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX",
+        "OUROBOROS_IMAGE_INPUT_MODE",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
-        "OUROBOROS_WEBSEARCH_MODEL",
+        "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND",
+        "OUROBOROS_MAIN_WEB_SEARCH", "OUROBOROS_MAIN_WEB_SEARCH_ENGINE",
+        "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS",
+        "OUROBOROS_OR_PROVIDER",
+        "OUROBOROS_SEARCH_CODE_WALL_SEC",
+        "OUROBOROS_GENERATIVE_PROBE", "OUROBOROS_GENERATIVE_PROBE_CHARS",
         "OUROBOROS_POST_TASK_EVOLUTION", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE",
         "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE",
         "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
@@ -1344,6 +1516,11 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
         "OUROBOROS_SCOPE_REVIEW_DEGRADED", "OUROBOROS_SCOPE_REVIEW_FLOOR",
         "OUROBOROS_TASK_REVIEW_MODE",
+        "OUROBOROS_SAFETY_MODE", "OUROBOROS_SAFETY_MAX_TOKENS", "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC",
+        "OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC",
+        "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC",
+        "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES",
+        "OUROBOROS_ACCEPTANCE_RESERVE_PCT",
         # Unified disposable-artifact GC retention (replaces per-subsystem keys).
         "OUROBOROS_GC_RETENTION_DAYS",
         # Runtime-mode, context-mode, and skills-repo plumbing.

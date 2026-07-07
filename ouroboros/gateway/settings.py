@@ -324,6 +324,11 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             # It flows ONLY through the dedicated audited owner endpoint (api_owner_
             # scope_review_floor); the UI uses that, never the generic settings merge.
             "OUROBOROS_SCOPE_REVIEW_FLOOR",
+            # v6.54.3: LLM-safety-supervisor coverage (full/light/off) is likewise an
+            # immune-system control — a generic settings write must not lower it. It
+            # flows ONLY through the dedicated audited owner endpoint
+            # (api_owner_safety_mode); save_settings additionally ratchets lowering.
+            "OUROBOROS_SAFETY_MODE",
         }:
             continue
         if key not in body:
@@ -406,12 +411,18 @@ def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None
         log.debug("Failed to write owner API audit event", exc_info=True)
 
 
-def _owner_write_settings(settings: Dict[str, Any], *, allow_context_lowering: bool = False) -> None:
+def _owner_write_settings(
+    settings: Dict[str, Any],
+    *,
+    allow_context_lowering: bool = False,
+    allow_safety_lowering: bool = False,
+) -> None:
     """Write owner-controlled settings without applying the runtime-mode ratchet."""
     from ouroboros import config as _config
 
     _config._guard_live_settings_write()
     _config._guard_context_mode_lowering(settings, allow_context_lowering=allow_context_lowering)
+    _config._guard_safety_mode_lowering(settings, allow_safety_lowering=allow_safety_lowering)
     _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _config._acquire_settings_lock()
     try:
@@ -520,6 +531,8 @@ def _active_main_route(
         base_url = str(settings.get("OPENAI_BASE_URL") or "")
     elif provider == "openai-compatible":
         base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
+    elif provider == "cloudru":
+        base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
     elif provider == "gigachat":
         base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
@@ -534,7 +547,7 @@ def _active_main_route(
     return {"provider": provider, "model": model, "base_url": base_url, "use_local": use_local}
 
 
-def _max_context_block(settings: Dict[str, Any]):
+def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = False):
     """Capability-Evidence gate for Max context mode (BIBLE P1/P3): Max requires the
     active main route to carry CONFIRMED/ASSERTED ≥1M evidence, else fail-closed.
     Returns None when Max is permitted, or a plain-language block payload dict:
@@ -546,8 +559,20 @@ def _max_context_block(settings: Dict[str, Any]):
         from ouroboros.config import DATA_DIR
 
         route = _active_main_route(settings)
+        # Thread the in-flight OPENAI_COMPATIBLE_API_KEY into the probe ONLY when the
+        # active route is openai-compatible (first-run onboarding, where the key is not
+        # yet on disk). For any other provider this override would reach
+        # LLMClient.probe_oversized_context and replace that provider's resolved key
+        # with the compatible one on the generative probe path (cross-provider key bleed,
+        # since the generative probe also runs for openai/openrouter/cloudru).
+        compatible_api_key = (
+            (str(settings.get("OPENAI_COMPATIBLE_API_KEY") or "") or None)
+            if route.get("provider") == "openai-compatible"
+            else None
+        )
         ev = probe(DATA_DIR, provider=route["provider"], model=route["model"],
-                   base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True)
+                   base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True,
+                   allow_generative=allow_generative, api_key=compatible_api_key)
         if confirms_at_least(ev, ONE_MILLION):
             return None
         win = int(ev.window_tokens or 0)
@@ -650,7 +675,7 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     current = _owner_read_settings_raw()
     # Hard-block ENABLING max unless the active route's >=1M is confirmed/acked.
     if next_mode == "max" and previous_mode != "max":
-        block = _max_context_block(current)
+        block = _max_context_block(current, allow_generative=True)
         if block is not None:
             return JSONResponse({"ok": False, "context_mode": previous_mode, **block}, status_code=409)
     current["OUROBOROS_CONTEXT_MODE"] = next_mode
@@ -689,6 +714,36 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
         {"scope_review_floor": raw, "previous_scope_review_floor": previous},
     )
     return JSONResponse({"ok": True, "scope_review_floor": raw})
+
+
+async def api_owner_safety_mode(request: Request) -> JSONResponse:
+    """Persist the owner-selected LLM-safety-supervisor coverage (full | light | off).
+
+    Owner-only + audited (v6.54.3): safety coverage is an immune-system control, so
+    it is merge-skipped from the generic /api/settings path and its lowering is
+    ratcheted in save_settings — ONLY this dedicated, audited endpoint may lower it.
+    The deterministic registry sandbox, protected paths, and light-mode guards run
+    in every mode (BIBLE P3: the LLM supervisor is a layer, not the floor)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    from ouroboros import config as _config
+
+    raw_mode = str((body or {}).get("mode") or "").strip().lower()
+    if raw_mode not in set(_config.VALID_SAFETY_MODES):
+        return json_error("'mode' must be one of: full, light, off", 400)
+    current = _owner_read_settings_raw()
+    previous = _config.normalize_safety_mode(current.get("OUROBOROS_SAFETY_MODE"))
+    current["OUROBOROS_SAFETY_MODE"] = raw_mode
+    _owner_write_settings(current, allow_safety_lowering=True)
+    os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
+    _owner_audit(
+        request,
+        "safety_mode",
+        {"safety_mode": raw_mode, "previous_safety_mode": previous},
+    )
+    return JSONResponse({"ok": True, "safety_mode": raw_mode})
 
 
 async def api_acknowledge_capability(request: Request) -> JSONResponse:
@@ -1006,7 +1061,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             except Exception:
                 _route_changed = True  # cannot compare routes -> assume changed, re-gate
             if _route_changed:
-                _block = _max_context_block(current)  # internally fail-closed on error
+                _block = _max_context_block(current, allow_generative=True)  # internally fail-closed on error
                 if _block is not None:
                     if _block.get("probe_failed"):
                         # Owner decision P4: a genuine NO-CONNECTION during the probe

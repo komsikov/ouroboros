@@ -13,8 +13,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
-from ouroboros.config import adaptive_quorum, get_context_mode, get_finalization_grace_sec, get_light_model, get_pacing_interval_sec, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import turn_has_reviewable_effects
+from ouroboros import task_pacing
+from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
+from ouroboros.outcomes import extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import initial_tool_schemas, list_non_core_tools
 from ouroboros.tools.registry import ToolRegistry
@@ -29,7 +30,6 @@ from ouroboros.loop_tool_execution import (
     handle_tool_calls,
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, estimate_cost
-from ouroboros.telemetry import agent_span, chain_span
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
 _call_llm_with_retry = call_llm_with_retry
@@ -246,8 +246,14 @@ def _check_budget_limits(
     task_type: str = "task",
     use_local: bool = False,
     deadline_ts: Optional[float] = None,
+    cost_ceiling_usd: Optional[float] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """Return a final-response tuple when budget limits require stopping."""
+    """Return a final-response tuple when budget limits require stopping.
+
+    ``cost_ceiling_usd`` is the in-task hard-stop resolved ONCE at loop start
+    from ``task_contract.budget_profile.cost_hard_stop_pct``
+    (``task_pacing.resolve_cost_ceiling_usd``); None means no in-task cost stop
+    — the global budget-exhaustion gate below still applies."""
     if budget_remaining_usd is None:
         return None
 
@@ -284,8 +290,6 @@ def _check_budget_limits(
                 log.warning("Failed to extract best-effort answer after budget exhaustion", exc_info=True)
         return finish_reason, accumulated_usage, llm_trace
 
-    budget_pct = task_cost / budget_remaining_usd if budget_remaining_usd > 0 else 1.0
-
     from ouroboros.config import SETTINGS_DEFAULTS as _DEFAULTS
     _per_task_default = str(_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"])
     per_task_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", _per_task_default) or _per_task_default)
@@ -295,8 +299,11 @@ def _check_budget_limits(
             f"[COST NOTE] Task spent ${task_cost:.3f}, which is at or above the per-task soft threshold of ${per_task_limit:.2f}. Continue only if the expected value still justifies the cost.",
         )
 
-    if budget_pct > 0.5:
-        finish_reason = f"Task spent ${task_cost:.3f} (>50% of remaining ${budget_remaining_usd:.2f}). Budget exhausted."
+    if cost_ceiling_usd is not None and task_cost > cost_ceiling_usd:
+        finish_reason = (
+            f"Task spent ${task_cost:.3f} (over the in-task cost ceiling ${cost_ceiling_usd:.2f} "
+            f"of remaining ${budget_remaining_usd:.2f}). Budget exhausted."
+        )
         _append_or_merge_user_message(
             messages,
             f"[BUDGET LIMIT] {finish_reason} Produce your best final answer now from the "
@@ -322,10 +329,19 @@ def _check_budget_limits(
             accumulated_usage["execution_status"] = "failed"
             accumulated_usage["reason_code"] = "budget_exhausted"
             return finish_reason, accumulated_usage, llm_trace
-    elif budget_pct > 0.3 and round_idx % 10 == 0:
-        _append_or_merge_user_message(messages, f"[INFO] Task spent ${task_cost:.3f} of ${budget_remaining_usd:.2f}. Wrap up if possible.")
+    # The old round-gated "[INFO] ... Wrap up if possible" nudge is replaced by
+    # the latched cost milestones in task_pacing (transport: _inject_round_checkpoints).
 
     return None
+
+
+def _resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -> Optional[float]:
+    """The in-task cost hard-stop, resolved ONCE at loop start from the start-of-
+    task budget snapshot + task_contract.budget_profile (cost_hard_stop_pct
+    None -> the historical 50%-of-remaining stop, 0 -> no in-task stop)."""
+    return task_pacing.resolve_cost_ceiling_usd(
+        budget_remaining_usd, task_pacing.resolve_budget_profile(ctx),
+    )
 
 
 def _build_recent_tool_trace(messages: List[Dict[str, Any]], window: int = 15) -> str:
@@ -469,7 +485,9 @@ def _evict_stale_image_blocks(messages: List[Dict[str, Any]], *, incoming: int =
         if caption:
             placeholder += f": {caption}"
         if source_path:
-            placeholder += f"; re-view: vlm_query file_path={source_path}"
+            # view_image re-views the local file natively. VLM tools are vision/local-media
+            # tools, not _WEB_TOOLS; benchmark isolation withholds them by name.
+            placeholder += f"; re-view: view_image path={source_path}"
         placeholder += "]"
         content[b_idx] = {"type": "text", "text": placeholder}
 
@@ -545,6 +563,230 @@ def _task_acceptance_eligible(mode: str, llm_trace: Dict[str, Any], is_direct_ch
     return False, "skipped_auto"
 
 
+def _latch_final_answer_marker(
+    llm_trace: Dict[str, Any],
+    content: str | None,
+    current_tool_calls: list | None = None,
+) -> None:
+    """Anytime capture for explicit FINAL ANSWER markers.
+
+    Marker-only: do not mine prose. The tool-call count stamp preserves the
+    existing stale-answer invariant: later grounding invalidates this fallback
+    unless the model emits a newer marker.
+    """
+    # Opt-in CANDIDATES latch (v6.54.4): when the model enumerates candidate
+    # interpretations/answers with an explicit block ("CANDIDATES:" on its own
+    # line, one "- " item per line), latch them alongside the final answer so the
+    # acceptance reviewer can adjudicate ambiguity. Marker-only, like FINAL
+    # ANSWER — never prose mining; absent block leaves behavior unchanged.
+    text = content or ""
+    try:
+        lines = text.splitlines()
+        marker_idx = next(
+            (i for i, line in enumerate(lines) if line.strip() == "CANDIDATES:"),
+            None,
+        )
+        if marker_idx is not None:
+            # Marker-only, like FINAL ANSWER (adversarial review r2 #4): the block
+            # is the "- " items IMMEDIATELY following the marker line; the first
+            # non-item line ends it. No substring-anywhere trigger, no harvesting
+            # of a distant bullet list after intervening prose.
+            candidates: list = []
+            for line in lines[marker_idx + 1:]:
+                if line.strip().startswith("- "):
+                    candidates.append(line.strip()[2:].strip()[:300])
+                else:
+                    break
+            if candidates:
+                llm_trace["candidate_answers"] = candidates[:8]
+    except Exception:
+        pass
+    answer = extract_final_answer(text)
+    if not answer:
+        return
+    llm_trace["best_valid_final_answer"] = answer
+    del current_tool_calls
+    llm_trace["best_valid_final_answer_tools"] = len(llm_trace.get("tool_calls") or [])
+
+
+def _server_web_allowed_by_task(ctx: Any) -> bool:
+    contract = getattr(ctx, "task_contract", {}) if isinstance(getattr(ctx, "task_contract", {}), dict) else {}
+    resources = contract.get("allowed_resources") if isinstance(contract.get("allowed_resources"), dict) else {}
+    forbidden_names = {"web", "allow_web", "network", "allow_network", "internet", "external_network"}
+    return not any(resources.get(name) is False for name in forbidden_names)
+
+
+def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    previous = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
+    merged = dict(decision)
+    for key in ("agent_disposition", "agent_rationale"):
+        if previous.get(key) and not merged.get(key):
+            merged[key] = previous.get(key)
+    llm_trace["acceptance_decision"] = merged
+
+
+def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> None:
+    """Typed PER-TASK obligations from critical contributing findings (v6.54.4).
+
+    Active only on the required+blocking path. Each critical finding WITH a
+    concrete recommendation becomes one open obligation in llm_trace (never the
+    durable commit review_state — that ledger stays a separate SSOT). Clean
+    finalization asks for an agent disposition per obligation via the existing
+    v6.54.0 agent_disposition mechanism; time/pass gates and every forced-
+    finalization escape hatch bound the loop, so a deadline never hangs here."""
+    import hashlib
+
+    from ouroboros.review_substrate import _contributing_actors
+
+    contributing = {str(a.get("slot_id", "")) for a in _contributing_actors(result)}
+    obligations = llm_trace.setdefault("acceptance_obligations", [])
+    seen = {str(o.get("id")) for o in obligations if isinstance(o, dict)}
+    # No contributing actors (all parse-degraded / no quorum) => no authoritative
+    # verdict, so manufacture NO blocking obligations — otherwise a single
+    # parse-degraded slot's critical finding would gate finalization, the same
+    # class the improvement capsule already refuses to let a degraded slot inject
+    # (adversarial review r1). A blocking obligation must ride a CONTRIBUTING slot.
+    if not contributing:
+        return
+    for finding in (getattr(result, "parsed_findings", None) or []):
+        if not isinstance(finding, dict):
+            continue
+        if str(finding.get("severity") or "").strip().lower() != "critical":
+            continue
+        if str(finding.get("slot_id", "")) not in contributing:
+            continue
+        recommendation = " ".join(str(finding.get("recommendation") or "").split()).strip()
+        if not recommendation:
+            continue
+        item = str(finding.get("item") or "finding").strip()
+        oid = "ob-" + hashlib.sha256(f"{item}|{recommendation[:160]}".encode()).hexdigest()[:8]
+        if oid in seen:
+            continue
+        seen.add(oid)
+        obligations.append({
+            "id": oid,
+            "item": item[:120],
+            "recommendation": recommendation[:500],
+            "status": "open",
+            "disposition": "",
+            "disposition_reason": "",
+        })
+
+
+def _open_acceptance_obligations(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        o for o in (llm_trace.get("acceptance_obligations") or [])
+        if isinstance(o, dict) and not str(o.get("disposition") or "").strip()
+    ]
+
+
+def _latest_agent_task_acceptance_run(llm_trace: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The most recent agent-invoked task_acceptance review run, if any."""
+    latest: Optional[Dict[str, Any]] = None
+    for run in (llm_trace.get("review_runs") or []):
+        if not isinstance(run, dict):
+            continue
+        request = run.get("request") if isinstance(run.get("request"), dict) else {}
+        if str(request.get("surface") or "") == "task_acceptance" and str(run.get("aggregate_signal") or "").strip():
+            latest = run
+    return latest
+
+
+def _label_agent_review_open_obligations(llm_trace: Dict[str, Any]) -> None:
+    """Blocking lane: the agent's own task_acceptance_review does not bypass the
+    obligations ledger. FULL parity with the host-review terminal path
+    (adversarial review r1 + r2 #3): a CLEAN PASS agent review disposes the open
+    obligations and records ``accepted`` (the revision resolved them), exactly like
+    the host path's ``_dispose_obligations_on_clean_pass``. Only a NON-clean agent
+    review (DEGRADED / no-quorum / FAIL, or none captured) that still leaves
+    obligations undisposed records the honest ``best_effort`` decision. Inert
+    unless enforcement is blocking and a decision hasn't already surfaced them."""
+    if get_review_enforcement() != "blocking":
+        return
+    run = _latest_agent_task_acceptance_run(llm_trace)
+    if run is not None:
+        # Collection parity with the host path (fable-5 cumulative review F2):
+        # the agent's own captured review SEEDS the typed ledger too, not only
+        # disposes previously-collected obligations — otherwise a critical FAIL
+        # from the agent-called lane leaves the blocking ledger empty and the
+        # no-bypass promise above holds only for disposal.
+        from types import SimpleNamespace
+
+        _collect_acceptance_obligations(llm_trace, SimpleNamespace(
+            actors=run.get("actors") or [],
+            aggregate_signal=str(run.get("aggregate_signal") or ""),
+            parsed_findings=run.get("parsed_findings") or [],
+        ))
+    open_obligations = _open_acceptance_obligations(llm_trace)
+    if not open_obligations or (llm_trace.get("acceptance_decision") or {}).get("open_obligations"):
+        return
+    if (
+        run is not None
+        and str(run.get("aggregate_signal") or "").upper() == "PASS"
+        and not run.get("degraded", False)
+    ):
+        for ob in open_obligations:
+            ob["disposition"] = "addressed"
+            ob["disposition_reason"] = "resolved by revision: the agent's clean re-review returned no findings"
+            ob["status"] = "disposed_by_re_review"
+        _set_acceptance_decision(llm_trace, {
+            "status": "accepted",
+            "source": "agent_task_acceptance_review_tool",
+            "rationale": "Clean PASS agent self-review; open obligations closed by the revision.",
+        })
+        return
+    _set_acceptance_decision(llm_trace, {
+        "status": "best_effort_open_obligations",
+        "source": "agent_task_acceptance_review_tool",
+        "rationale": (
+            f"Agent self-review finalized with {len(open_obligations)} obligation(s) "
+            "left undisposed; finalizing honestly."
+        ),
+        "open_obligations": [str(o.get("id")) for o in open_obligations],
+    })
+
+
+def _dispose_obligations_on_clean_pass(
+    llm_trace: Dict[str, Any],
+    result: Any,
+    open_obligations: List[Dict[str, Any]],
+    dissent_noted: bool,
+) -> bool:
+    """If the re-review is a CLEAN PASS (aggregate PASS and not degraded), close
+    the open obligations as disposed_by_re_review and record the accepted verdict;
+    return True. A DEGRADED/no-quorum run proves nothing → returns False, leaving
+    the honest best-effort labeling to the caller."""
+    if not open_obligations:
+        return False
+    if str(getattr(result, "aggregate_signal", "") or "").upper() != "PASS" or getattr(result, "degraded", False):
+        return False
+    for ob in open_obligations:
+        ob["disposition"] = "addressed"
+        ob["disposition_reason"] = "resolved by revision: the clean re-review returned no findings"
+        ob["status"] = "disposed_by_re_review"
+    _set_acceptance_decision(llm_trace, {
+        "status": "accepted",
+        "source": "task_acceptance_review",
+        "rationale": "Clean PASS re-review; open obligations closed by the revision (dissent, if any, stays advisory).",
+        "dissent_noted": dissent_noted,
+    })
+    return True
+
+
+def _format_obligations_clause(open_obligations: List[Dict[str, Any]]) -> str:
+    if not open_obligations:
+        return ""
+    lines = [
+        "",
+        "OPEN OBLIGATIONS (blocking review policy): give a disposition for each via the "
+        "task_acceptance_review tool's obligation_dispositions (addressed / rejected / deferred + reason) "
+        "or address them directly before your final answer:",
+    ]
+    for o in open_obligations[:5]:
+        lines.append(f"  {o.get('id')}: {o.get('item')} — {o.get('recommendation')}")
+    return "\n".join(lines)
+
+
 def _run_task_acceptance_review_once(
     *,
     tools: ToolRegistry,
@@ -557,6 +799,9 @@ def _run_task_acceptance_review_once(
     emit_progress: Callable[[str], None],
 ) -> bool:
     mode = get_task_review_mode()
+    # Answer-lock: latch the latest typed FINAL ANSWER from a finalizing round so a
+    # later round that drops the marker cannot erase it (see derive_loop_outcome).
+    _latch_final_answer_marker(llm_trace, content)
     if getattr(tools._ctx, "_task_acceptance_reviewed", False):
         return False
     is_direct_chat = bool(getattr(tools._ctx, "is_direct_chat", False))
@@ -574,6 +819,7 @@ def _run_task_acceptance_review_once(
     if agent_called and agent_review_run:
         tools._ctx._task_acceptance_reviewed = True
         llm_trace["review_decision"] = {"eligibility": "already_reviewed", "trigger": "agent_called_tool_result"}
+        _label_agent_review_open_obligations(llm_trace)
         return False
     if agent_called:
         llm_trace["review_decision"] = {"eligibility": "eligible", "trigger": "agent_called_tool"}
@@ -584,16 +830,41 @@ def _run_task_acceptance_review_once(
         }
     if not eligible:
         return False
+    # v6.54.4 budget layer (task_pacing SSOT). Gate 1: a review may start only
+    # when it fits ABOVE the finalization reserve — historically a review could
+    # start two minutes before the deadline and kill the task. Loud typed skip;
+    # finalization proceeds exactly as today.
+    budget_profile = task_pacing.resolve_budget_profile(tools._ctx)
+    budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
+    launch_ok, launch_reason = task_pacing.review_launch_allowed(budget_snapshot)
+    if not launch_ok:
+        tools._ctx._task_acceptance_reviewed = True
+        llm_trace["review_decision"] = {
+            "eligibility": "eligible",
+            "trigger": trigger,
+            "skipped": launch_reason,
+        }
+        _set_acceptance_decision(llm_trace, {
+            "status": launch_reason,
+            "source": "task_pacing",
+            "rationale": (
+                f"Remaining {budget_snapshot.remaining_sec:.0f}s is inside the finalization "
+                f"reserve ({budget_snapshot.reserve_sec:.0f}s); finalizing without review."
+            ),
+        })
+        emit_progress("Task acceptance review skipped: inside the finalization reserve.")
+        return False
     try:
         from ouroboros.review_substrate import (
             HARDNESS_ADVISORY_VISIBLE,
             ReviewRequest,
             build_improvement_capsule,
+            dissent_findings,
             reviewer_slots,
             run_review_request,
         )
 
-        from ouroboros.review_evidence import collect_turn_diff
+        from ouroboros.review_evidence import build_task_acceptance_evidence
 
         # A commit only "happened this turn" when it actually LANDED. A
         # REVIEW_BLOCKED / GIT_ERROR commit attempt is intentionally NOT a
@@ -607,13 +878,19 @@ def _run_task_acceptance_review_once(
             and str(c.get("status") or "") == "ok"
             for c in (llm_trace.get("tool_calls") or [])
         )
-        evidence = {
-            "task_id": task_id,
-            "task_type": task_type,
-            "tool_calls": llm_trace.get("tool_calls") or [],
-            "reasoning_notes": llm_trace.get("reasoning_notes") or [],
-            "repo_diff": collect_turn_diff(tools._ctx, include_recent_commit=committed_this_turn),
-        }
+        # v6.51.0 idea-2: process-aware evidence packet — full contract + first-class
+        # verification_summary (RED receipts surfaced; the authoritative evidence in
+        # dig-direct mode where repo_diff cannot capture the external /app target) +
+        # bounded/redacted tool-call trajectory + leak-safe artifacts + provenance tags,
+        # under a disclosed-truncation budget. The reviewer audits outcome AND process.
+        evidence = build_task_acceptance_evidence(
+            tools._ctx,
+            llm_trace=llm_trace,
+            drive_root=drive_root,
+            task_id=task_id,
+            task_type=task_type,
+            include_recent_commit=committed_this_turn,
+        )
         slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
         min_successful = adaptive_quorum(len(slots))
         request = ReviewRequest(
@@ -664,8 +941,28 @@ def _run_task_acceptance_review_once(
         run_record = result.__dict__
         llm_trace.setdefault("review_runs", []).append(run_record)
         capsule = build_improvement_capsule(result)
-        capsule_already_injected = bool(getattr(tools._ctx, "_task_acceptance_capsule_injected", False))
-        if capsule and not capsule_already_injected:
+        dissent = dissent_findings(result)
+        # v6.54.4 obligations layer: ONLY under required mode + blocking
+        # enforcement (the owner's benchmark/blocking lane); advisory users see
+        # today's behavior + dissent. Critical contributing findings with a
+        # concrete recommendation become typed per-task obligations.
+        enforcement_blocking = get_review_enforcement() == "blocking"
+        if enforcement_blocking:
+            _collect_acceptance_obligations(llm_trace, result)
+        open_obligations = _open_acceptance_obligations(llm_trace) if enforcement_blocking else []
+        # Gate 2 (v6.54.4): improvement passes bounded by TWO independent axes —
+        # a pass counter AND the time-above-reserve window — so an endless loop is
+        # structurally impossible. Default (no budget_profile, no deadline) is
+        # exactly the historical single bounded pass.
+        passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
+        # Re-snapshot AFTER the review ran: a long review can itself consume the
+        # window, and gate 2 must see the REAL remaining time, not a stale
+        # pre-review value (review round 2).
+        budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
+        pass_ok, pass_reason = task_pacing.improvement_pass_allowed(
+            budget_snapshot, passes_done, budget_profile,
+        )
+        if capsule and pass_ok:
             # ONE bounded improvement pass: inject the capsule and re-loop. Bound the
             # CAPSULE (not the review) — we do NOT set _task_acceptance_reviewed here,
             # so the REVISED final deliverable is reviewed once more and ITS verdict
@@ -676,7 +973,15 @@ def _run_task_acceptance_review_once(
             # across runs) does not let the stale FAIL poison the re-reviewed verdict;
             # the run is kept in the trace for forensics.
             run_record["superseded_by_revision"] = True
-            tools._ctx._task_acceptance_capsule_injected = True
+            _set_acceptance_decision(llm_trace, {
+                "status": "revision_requested",
+                "source": "task_acceptance_review",
+                "rationale": "A compact advisory improvement capsule was fed back for one bounded revision pass.",
+                "dissent_noted": bool(dissent),
+            })
+            tools._ctx._task_acceptance_improvement_passes = passes_done + 1
+            if open_obligations:
+                capsule = capsule + _format_obligations_clause(open_obligations)
             # Preserve the model's just-produced final answer in the transcript
             # before the capsule, like the sibling re-loop paths — so the revise
             # round can actually revise its OWN deliverable, not reconstruct it.
@@ -689,9 +994,74 @@ def _run_task_acceptance_review_once(
         # a prior pass. Record THIS (final-deliverable) verdict and finalize so the
         # objective axis reflects the shipped answer, not a stale pre-revision one.
         tools._ctx._task_acceptance_reviewed = True
-        if capsule:
+        # A CLEAN PASS re-review is evidence the revision addressed the obligations —
+        # dispose them regardless of a dissent-only capsule (a lone advisory dissent
+        # bullet makes the capsule non-empty but must NOT block disposal or mislabel
+        # a clean pass as best_effort; adversarial review r1). Checked up front so the
+        # capsule-based branches below cannot pre-empt it.
+        if _dispose_obligations_on_clean_pass(llm_trace, result, open_obligations, bool(dissent)):
+            emit_progress(f"Task acceptance review: {result.aggregate_signal} (clean pass; obligations closed).")
+            return False
+        # Answer integrity is preserved monotonically by the best_valid_final_answer
+        # latch (set above + tool-count-stamped): a revise that DROPS the marker is
+        # recovered, while a deliberate post-review FINAL ANSWER marker (a genuine
+        # correction) is always respected. No pre-answer override of an explicit marker.
+        if capsule and open_obligations:
+            # Time/pass gates exhausted with obligations still open: HONEST
+            # best-effort finalization — obligations stay visible in the outcome,
+            # never a hang (v6.54.4; forced-finalization hatches bypass entirely).
+            _set_acceptance_decision(llm_trace, {
+                "status": "best_effort_open_obligations",
+                "source": "task_acceptance_review",
+                "rationale": (
+                    f"Improvement gates exhausted ({pass_reason or 'passes spent'}) with "
+                    f"{len(open_obligations)} open obligation(s); finalizing honestly."
+                ),
+                "dissent_noted": bool(dissent),
+                "open_obligations": [str(o.get("id")) for o in open_obligations],
+            })
+            emit_progress(
+                f"Task acceptance review: {result.aggregate_signal} — finalizing with "
+                f"{len(open_obligations)} open obligation(s) ({pass_reason or 'passes spent'})."
+            )
+        elif capsule:
+            _set_acceptance_decision(llm_trace, {
+                "status": "finalized_after_capsule",
+                "source": "task_acceptance_review",
+                # Honest observability (fable-5 cumulative review F3): when gate 2
+                # closed before ANY pass ran, the capsule was never fed back — do
+                # not claim it was "spent".
+                "rationale": (
+                    f"Improvement window closed before any capsule pass ({pass_reason})."
+                    if not passes_done and pass_reason
+                    else "The bounded acceptance-review capsule was already spent; finalizing with the current answer."
+                ),
+                "dissent_noted": bool(dissent),
+            })
             emit_progress(f"Task acceptance review: {result.aggregate_signal} (improvement note already fed back; finalizing).")
         else:
+            # A clean PASS with open obligations already disposed + returned above.
+            # Reaching here with obligations still open means the re-review was NOT
+            # a clean PASS (DEGRADED/no-quorum/FAIL) — they stay open and the
+            # finalization is honestly labeled (v6.54.4 rounds 1+3).
+            if open_obligations:
+                _set_acceptance_decision(llm_trace, {
+                    "status": "best_effort_open_obligations",
+                    "source": "task_acceptance_review",
+                    "rationale": (
+                        f"Re-review was not a clean PASS ({result.aggregate_signal}); "
+                        f"{len(open_obligations)} obligation(s) stay open — finalizing honestly."
+                    ),
+                    "dissent_noted": bool(dissent),
+                    "open_obligations": [str(o.get("id")) for o in open_obligations],
+                })
+            else:
+                _set_acceptance_decision(llm_trace, {
+                    "status": "accepted",
+                    "source": "task_acceptance_review",
+                    "rationale": "No actionable task-acceptance changes were suggested.",
+                    "dissent_noted": bool(dissent),
+                })
             emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
         return False
     except Exception as exc:
@@ -919,70 +1289,42 @@ def _maybe_inject_time_budget_milestone(
     round_idx: int = 0,
     accumulated_usage: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Inject deadline-awareness at 50/25/10% remaining, never per-round.
-
-    With no deadline_at (headless/benchmark runs), fall back to intrinsic
-    self-pacing: surface the agent's OWN elapsed wall-clock / rounds / cost at a
-    fixed cadence so it can decide when to wrap up. Both are ADVISORY — the model
-    judges when to finalize; neither is a deterministic stop gate (P5)."""
-    meta = getattr(tools._ctx, "task_metadata", {})
-    if not isinstance(meta, dict):
-        return False
-    created = parse_deadline_ts(meta.get("created_at") or meta.get("started_at"))
-    if created is None:
-        created = getattr(tools._ctx, "_time_budget_started_at", None)
-        if created is None:
-            created = utc_now()
-            tools._ctx._time_budget_started_at = created
-    now = utc_now()
-    deadline = parse_deadline_ts(meta.get("deadline_at"))
-    if deadline is None:
-        return _maybe_inject_intrinsic_pacing(
-            messages, tools, created=created, now=now, round_idx=round_idx,
-            accumulated_usage=accumulated_usage, event_queue=event_queue,
-            task_id=task_id, drive_logs=drive_logs,
-        )
-    total = max(1.0, (deadline - created).total_seconds())
-    remaining = (deadline - now).total_seconds()
-    fraction_remaining = 0.0 if remaining <= 0 else remaining / total
-    thresholds = ((0.50, "50%"), (0.25, "25%"), (0.10, "10%"))
-    seen = getattr(tools._ctx, "_time_budget_milestones_seen", None)
-    if not isinstance(seen, set):
-        seen = set()
-        tools._ctx._time_budget_milestones_seen = seen
-    # Fire the TIGHTEST crossed milestone, not the coarsest. Starting a task
-    # already past 50% (or 25%/10%) remaining must announce the real urgency
-    # immediately instead of labelling it "50%" and cascading one threshold per
-    # round (which lags reality and can pass the deadline before "10%" fires).
-    # Mark every crossed label seen so coarser ones never fire redundantly.
-    crossed = [(value, label) for value, label in thresholds if fraction_remaining <= value]
-    unseen_crossed = [(value, label) for value, label in crossed if label not in seen]
-    if not unseen_crossed:
-        return False
-    selected_label = unseen_crossed[-1][1]  # thresholds are coarse→fine
-    for _value, label in crossed:
-        seen.add(label)
-    elapsed = max(0.0, (now - created).total_seconds())
-    remaining_clamped = max(0.0, remaining)
-    deadline_text = deadline.isoformat().replace("+00:00", "Z")
-    _append_or_merge_user_message(
-        messages,
-        (
-            f"[TIME BUDGET — {selected_label} remaining crossed]\n"
-            f"Elapsed: ~{elapsed/60:.1f} min | Remaining: ~{remaining_clamped/60:.1f} min | "
-            f"Deadline: {deadline_text}\n"
-            "Use this as planning context, not as a command to stop. If a passing artifact "
-            "or service already exists, prefer preserving and verifying it over speculative "
-            "improvements. If not, focus on the shortest path to a verifiable result."
-        ),
+    """Thin transport over the task_pacing SSOT (v6.54.4): the milestone content,
+    thresholds, and seen-state live in ouroboros/task_pacing.py; this wrapper only
+    appends the note and emits the checkpoint event."""
+    note = task_pacing.build_time_budget_note(
+        tools._ctx, round_idx=round_idx, accumulated_usage=accumulated_usage,
     )
-    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-        "checkpoint_kind": "time_budget_milestone",
-        "milestone": selected_label,
-        "elapsed_sec": round(elapsed, 3),
-        "remaining_sec": round(remaining_clamped, 3),
-        "deadline_at": deadline_text,
-    })
+    if note is None:
+        return False
+    _append_or_merge_user_message(messages, note.text)
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
+    return True
+
+
+def _maybe_inject_cost_budget_milestone(
+    messages: List[Dict[str, Any]],
+    tools: ToolRegistry,
+    *,
+    budget_remaining_usd: Optional[float],
+    cost_ceiling_usd: Optional[float],
+    accumulated_usage: Optional[Dict[str, Any]],
+    event_queue: Optional[queue.Queue] = None,
+    task_id: str = "",
+    drive_logs: Optional[pathlib.Path] = None,
+) -> bool:
+    """Thin transport over the task_pacing cost axis (v6.56.0): content,
+    thresholds, and latch state live in ouroboros/task_pacing.py."""
+    note = task_pacing.build_cost_budget_note(
+        tools._ctx,
+        start_remaining_usd=budget_remaining_usd,
+        cost_ceiling_usd=cost_ceiling_usd,
+        task_cost=float((accumulated_usage or {}).get("cost") or 0.0),
+    )
+    if note is None:
+        return False
+    _append_or_merge_user_message(messages, note.text)
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
     return True
 
 
@@ -997,6 +1339,8 @@ def _inject_round_checkpoints(
     event_queue: Optional[queue.Queue],
     task_id: str,
     drive_logs: Optional[pathlib.Path],
+    budget_remaining_usd: Optional[float] = None,
+    cost_ceiling_usd: Optional[float] = None,
 ) -> bool:
     """Inject the per-round self-check and the time-budget / intrinsic-pacing
     milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
@@ -1010,55 +1354,13 @@ def _inject_round_checkpoints(
         messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
         round_idx=round_idx, accumulated_usage=accumulated_usage,
     )
-    return bool(checkpoint or time_budget)
-
-
-def _maybe_inject_intrinsic_pacing(
-    messages: List[Dict[str, Any]],
-    tools: ToolRegistry,
-    *,
-    created,
-    now,
-    round_idx: int,
-    accumulated_usage: Optional[Dict[str, Any]],
-    event_queue: Optional[queue.Queue],
-    task_id: str,
-    drive_logs: Optional[pathlib.Path],
-) -> bool:
-    """No deadline: surface the agent's OWN elapsed / rounds / cost periodically.
-
-    ADVISORY only — this gives the one mind awareness so IT can choose to wrap up.
-    There is deliberately no deterministic time/round/cost stop here: finalization
-    is P5-named semantic behavior and stays the model's judgment."""
-    interval = get_pacing_interval_sec()
-    if interval <= 0:
-        return False
-    elapsed = max(0.0, (now - created).total_seconds())
-    bucket = int(elapsed // interval)
-    if bucket <= 0:
-        return False
-    last_bucket = getattr(tools._ctx, "_pacing_bucket_seen", 0)
-    if bucket <= last_bucket:
-        return False
-    tools._ctx._pacing_bucket_seen = bucket
-    cost = float((accumulated_usage or {}).get("cost") or 0.0)
-    _append_or_merge_user_message(
-        messages,
-        (
-            f"[PACING — ~{elapsed/60:.0f} min elapsed]\n"
-            f"Rounds so far: {round_idx} | Elapsed: ~{elapsed/60:.1f} min | Cost so far: ~${cost:.2f}\n"
-            "Planning context, not a command to stop. Periodically confirm you are still on the "
-            "shortest path to a verifiable result; if a passing artifact or service already exists, "
-            "prefer preserving and verifying it over speculative improvements."
-        ),
+    cost_budget = _maybe_inject_cost_budget_milestone(
+        messages, tools,
+        budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd,
+        accumulated_usage=accumulated_usage,
+        event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
-    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-        "checkpoint_kind": "intrinsic_pacing",
-        "elapsed_sec": round(elapsed, 3),
-        "rounds": int(round_idx),
-        "cost": round(cost, 4),
-    })
-    return True
+    return bool(checkpoint or time_budget or cost_budget)
 
 
 def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
@@ -1117,6 +1419,10 @@ def seal_task_transcript(
 
     candidate = messages[seal_candidate_idx]
     plain_text = str(candidate.get("content", ""))
+    if not plain_text.strip():
+        # Anthropic 400s on cache_control attached to an empty text block; never seal
+        # an empty tool output as the cache anchor (turns the whole task unanswerable).
+        plain_text = "(no tool output)"
     candidate["content"] = [
         {
             "type": "text",
@@ -1456,7 +1762,12 @@ def _maybe_deadline_local_finalize(
     if deadline is None:
         return None
     remaining = (deadline - utc_now()).total_seconds()
-    if remaining > float(get_finalization_grace_sec()):
+    # v6.55.0: the plain finalization GRACE emit-window (task_pacing SSOT), NOT
+    # the pct reserve — this path fires just before the kill to emit one answer,
+    # so a percentage-of-total reserve would amputate the working tail (a 6h task
+    # would self-finalize ~54 min early on a 15% profile). The pct reserve is an
+    # acceptance-review gate concept only.
+    if remaining > task_pacing.effective_finalization_reserve_sec(tools._ctx):
         return None
     prompt = (
         f"[DEADLINE] The task deadline ({meta.get('deadline_at')}) is ~{max(0.0, remaining)/60:.1f} min away "
@@ -1478,28 +1789,20 @@ def _maybe_early_finalize(
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
 
-def _build_round_limit_context(
-    *, messages, llm, active_model, active_effort, max_retries, drive_logs, task_id,
-    round_idx, event_queue, accumulated_usage, task_type, active_use_local, max_rounds,
-    tools, drive_root,
-) -> "_RoundLimitContext":
-    """Construct the per-round limit context, resolving the STATUS/budget drive root +
-    root task id from the live ToolContext (child results live under the parent budget
-    drive, not the forked drive_root). Extracted from run_llm_loop to keep it within the
-    method size gate."""
+def _finalize_limit_ctx(ctx: "_RoundLimitContext", tools: Any) -> "_RoundLimitContext":
+    """Resolve the deadline + STATUS/budget drive root + root task id from the live
+    ToolContext onto an already-constructed round-limit context (child results live under
+    the parent BUDGET drive, not the forked drive_root). The dataclass itself bundles the
+    13 per-round fields (so no >8-param builder function is needed — DEVELOPMENT param
+    rule); this fills only the 3 ctx-derived fields. Returns the same (mutated) ctx."""
     meta = getattr(tools._ctx, "task_metadata", {}) if isinstance(getattr(tools._ctx, "task_metadata", {}), dict) else {}
-    status_root = pathlib.Path(
+    ctx.deadline_ts = _task_deadline_epoch(tools)
+    ctx.status_drive_root = pathlib.Path(
         str(meta.get("budget_drive_root") or getattr(tools._ctx, "budget_drive_root", "") or "")
-        or (drive_root if drive_root is not None else pathlib.Path(drive_logs).parent)
+        or (ctx.drive_root if ctx.drive_root is not None else pathlib.Path(ctx.drive_logs).parent)
     )
-    return _RoundLimitContext(
-        messages, llm, active_model, active_effort, max_retries,
-        drive_logs, task_id, round_idx, event_queue,
-        accumulated_usage, task_type, active_use_local, max_rounds,
-        deadline_ts=_task_deadline_epoch(tools), drive_root=drive_root,
-        status_drive_root=status_root,
-        root_task_id=str(meta.get("root_task_id") or task_id),
-    )
+    ctx.root_task_id = str(meta.get("root_task_id") or ctx.task_id)
+    return ctx
 
 
 def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = True) -> str:
@@ -1558,6 +1861,90 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         )
     except Exception:
         return ""
+
+
+def _running_undecided_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
+    try:
+        status_root = ctx.status_drive_root or ctx.drive_root or pathlib.Path(ctx.drive_logs).parent
+        if status_root is None or not ctx.task_id:
+            return []
+        from ouroboros.task_results import STATUS_RUNNING
+        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks
+
+        children = find_child_tasks(
+            pathlib.Path(status_root),
+            parent_task_id=ctx.task_id,
+            root_task_id=str(ctx.root_task_id or ctx.task_id),
+            exclude_task_id=ctx.task_id,
+        )
+        out: list[Dict[str, Any]] = []
+        for child in children:
+            if str(child.get("parent_decision") or "").strip().lower() in ("discarded", "cancelled"):
+                continue
+            status = str(child.get("status") or "").strip().lower()
+            if status in FINAL_STATUSES or status != STATUS_RUNNING:
+                continue
+            out.append(child)
+        return out
+    except Exception:
+        return []
+
+
+def _task_may_delegate(tools: ToolRegistry) -> bool:
+    try:
+        ctx = tools._ctx
+        contract = getattr(ctx, "task_contract", {}) if isinstance(getattr(ctx, "task_contract", {}), dict) else {}
+        metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+        if not contract and isinstance(metadata.get("task_contract"), dict):
+            contract = metadata.get("task_contract")
+        if not contract:
+            return False
+        budget = contract.get("delegation_budget") if isinstance(contract.get("delegation_budget"), dict) else {}
+        return bool(budget.get("may_delegate", True) or budget.get("may_fan_out", True))
+    except Exception:
+        return False
+
+
+def _maybe_enforce_child_absorption_gate(
+    tools: ToolRegistry,
+    limit_ctx: _RoundLimitContext,
+    content: Any,
+    messages: List[Dict[str, Any]],
+    emit_progress: Callable[[str], None],
+    llm_trace: Dict[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]] | str]:
+    if not _task_may_delegate(tools):
+        return None
+    undecided = _running_undecided_children(limit_ctx)
+    if not undecided:
+        return None
+    if not getattr(tools._ctx, "_child_absorption_reminded", False):
+        tools._ctx._child_absorption_reminded = True
+        if content and str(content).strip():
+            messages.append({"role": "assistant", "content": content})
+        listed = "; ".join(str(c.get("task_id") or c.get("id") or "?") for c in undecided[:10])
+        reminder = (
+            "[CHILD_ABSORPTION_REQUIRED]\n"
+            "You still have RUNNING child task(s) in this task tree: "
+            f"{listed}. Before a clean final answer, wait/inspect them with wait_task/get_task_result, "
+            "or make an explicit decision with cancel_task / discard_child_result. This is a "
+            "bounded reminder; ignoring it will finalize best_effort, not clean."
+        )
+        _append_or_merge_user_message(messages, reminder)
+        emit_progress("Child absorption reminder injected before final response.")
+        llm_trace["reasoning_notes"].append("Child absorption reminder injected before final response.")
+        return "continue"
+    text, usage, _discarded_trace = _forced_final_answer(
+        limit_ctx,
+        prompt=(
+            "[FINALIZE_WITH_UNABSORBED_CHILDREN]\n"
+            "You still have running child tasks and already received one child-absorption reminder. "
+            "Produce an honest best-effort final answer now; name unabsorbed children explicitly."
+        ),
+        fallback_text="⚠️ Finalized best-effort with unabsorbed running child tasks.",
+        reason_code="children_unabsorbed",
+    )
+    return text, usage, llm_trace
 
 
 def _no_tool_final_answer(content, limit_ctx, llm_trace, accumulated_usage):
@@ -1705,53 +2092,197 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
             emit_progress(display_reasoning)
 
 
-def run_llm_loop(
-    messages: List[Dict[str, Any]],
-    tools: ToolRegistry,
-    llm: LLMClient,
-    drive_logs: pathlib.Path,
+def _maybe_inject_finalization_nudges(
+    tools: ToolRegistry, drive_root: Optional[pathlib.Path], task_id: str,
+    llm_trace: Dict[str, Any], content: Optional[str], messages: List[Dict[str, Any]],
     emit_progress: Callable[[str], None],
-    incoming_messages: queue.Queue,
-    task_type: str = "",
-    task_id: str = "",
-    budget_remaining_usd: Optional[float] = None,
-    event_queue: Optional[queue.Queue] = None,
-    initial_effort: str = "medium",
-    drive_root: Optional[pathlib.Path] = None,
-    session_id: str = "",
-    user_id: str = "",
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Run the LLM-with-tools loop under a single root trace (one per task).
-
-    ``session_id`` is stamped as the OpenInference ``session.id`` attribute on
-    the agent span and propagated to every child span via OTel baggage so the
-    whole task groups into one session in Phoenix / Arize. When omitted, the
-    ``task_id`` is used as a fallback session identifier.
-    """
-    with agent_span(
-        name="agent.task",
-        task_id=task_id,
-        task_type=task_type,
-        session_id=session_id,
-        user_id=user_id,
-    ):
-        return _run_llm_loop_impl(
-            messages=messages,
-            tools=tools,
-            llm=llm,
-            drive_logs=drive_logs,
-            emit_progress=emit_progress,
-            incoming_messages=incoming_messages,
-            task_type=task_type,
-            task_id=task_id,
-            budget_remaining_usd=budget_remaining_usd,
-            event_queue=event_queue,
-            initial_effort=initial_effort,
-            drive_root=drive_root,
+) -> bool:
+    """One-shot pre-finalization injections that each re-loop (return True): the skill
+    finalization reminder, then the FR3 verify-before-done nudge. Extracted from
+    run_llm_loop to keep it under the method size gate."""
+    if drive_root is None:
+        return False
+    finalization_msg = _skill_finalization_message(drive_root, llm_trace)
+    if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
+        tools._ctx._skill_finalization_injected = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{finalization_msg}")
+        emit_progress(finalization_msg)
+        llm_trace["reasoning_notes"].append(finalization_msg)
+        return True
+    if not getattr(tools._ctx, "_verify_red_nudged", False):
+        # Red-verification one-shot nudge: the agent's most recent host-attested verify
+        # receipt is RED and unreconciled — finalizing over your own failing check is a
+        # self-contradiction (Bible P3/P12), distinct from the receipt_absent case below
+        # (that is "no grounding"; this is "grounding says FAIL"). Ordered BEFORE the FR3
+        # verify nudge. Binary latch; advisory (the agent may still finalize with reasoning);
+        # forced-finalization paths return earlier and bypass it. Structural — keyed on the
+        # typed receipt status, never content (Bible P5). Benchmark-neutral wording.
+        _failed_receipt = latest_unreconciled_failed_verification(drive_root, task_id)
+        if _failed_receipt is not None:
+            tools._ctx._verify_red_nudged = True
+            _check = str(_failed_receipt.get("check") or "").strip()
+            _rc = _failed_receipt.get("returncode")
+            _on = f" on `{_check}`" if _check else ""
+            _exit = f" (exit {_rc})" if _rc is not None else ""
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(
+                messages,
+                "[SYSTEM REMINDER]\nYour latest host-attested verification is RED" + _on + _exit +
+                ". Before a clean final answer, reconcile it: re-check it, explain why this check is "
+                "not the task's acceptance contract, or fix and re-run verification. This is advisory — "
+                "if you finalize anyway, make the residual risk explicit.",
+            )
+            emit_progress("Red-verification nudge injected before final response.")
+            llm_trace["reasoning_notes"].append("Red-verification nudge injected before final response.")
+            return True
+    if not getattr(tools._ctx, "_verify_masked_nudged", False):
+        # Exit-masking one-shot ADVISORY nudge (v6.52.2): the agent's latest PASSING verify check
+        # can LAUNDER the real exit code (a `| tail`/`grep`/`|| true` pipeline reports exit 0 even
+        # when the underlying runner failed — the false-green tutanota hit). Distinct from the red
+        # nudge (that is "grounding says FAIL"; this is "grounding says PASS but may be laundered").
+        # Ordered AFTER the red nudge. Binary latch; ADVISORY (the agent may still finalize with
+        # reasoning); forced-finalization paths return earlier and bypass it. Flag-driven on the
+        # typed receipt sensor, never content (Bible P5). Benchmark-neutral wording.
+        _masked_receipt = latest_unreconciled_masked_verification(drive_root, task_id)
+        if _masked_receipt is not None:
+            tools._ctx._verify_masked_nudged = True
+            _mcheck = str(_masked_receipt.get("check") or "").strip()
+            _mreasons = ", ".join(str(x) for x in (_masked_receipt.get("check_exit_masking_reasons") or []))
+            _mon = f" on `{_mcheck}`" if _mcheck else ""
+            _mwhy = f" ({_mreasons})" if _mreasons else ""
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(
+                messages,
+                "[SYSTEM REMINDER]\nYour latest passing verification" + _mon + " uses a shell pipe" + _mwhy +
+                " that can hide the real command's exit code, so a failing run could read as exit 0. "
+                "Before a clean final answer, re-ground so the exit reflects the real result (drop the "
+                "masking pipe / use the runner's own pass marker), or explain why it is reliable. This is "
+                "advisory — if you finalize anyway, make the residual risk explicit.",
+            )
+            emit_progress("Masked-verification nudge injected before final response.")
+            llm_trace["reasoning_notes"].append("Masked-verification nudge injected before final response.")
+            return True
+    if not getattr(tools._ctx, "_criterion_source_nudged", False):
+        # Criterion-provenance one-shot ADVISORY nudge (v6.54.4): the latest passing
+        # verification used an AGENT-DEFINED criterion with no stated basis — the check
+        # is green, but the success criterion itself was synthesized. One reminder to
+        # confirm equivalence with the task's real requirement (or state the basis via
+        # criterion_basis). Ordered AFTER the masked nudge, BEFORE FR3. Flag-driven on
+        # the typed receipt field, never content (P5); forced paths bypass earlier.
+        _agent_defined = latest_agent_defined_verification(drive_root, task_id)
+        if _agent_defined is not None:
+            tools._ctx._criterion_source_nudged = True
+            _acheck = str(_agent_defined.get("check") or "").strip()
+            _aon = f" (`{_acheck}`)" if _acheck else ""
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(
+                messages,
+                "[SYSTEM REMINDER]\nYour latest passing verification" + _aon + " uses a success "
+                "criterion YOU defined, not one the task states. Before finalizing, double-check the "
+                "criterion is equivalent to what the task actually asks for (format, units, scope) — "
+                "re-run verify_and_record with criterion_basis stating why it suffices, or adjust the "
+                "check. Advisory only — if you finalize anyway, make the assumption explicit.",
+            )
+            emit_progress("Criterion-provenance nudge injected before final response.")
+            llm_trace["reasoning_notes"].append("Criterion-provenance nudge injected before final response.")
+            return True
+    if not getattr(tools._ctx, "_verify_nudged", False) and should_nudge_verification(llm_trace, drive_root, task_id):
+        # FR3 one-shot verify-before-done nudge: real effects, no host-attested grounding
+        # yet. Binary latch (not a tunable counter), sibling BEFORE the acceptance-review
+        # gate so it reaches both required and auto. Forced finalization paths return
+        # earlier and bypass it (they land best_effort).
+        tools._ctx._verify_nudged = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nBefore finalizing: you produced a real deliverable but recorded no "
+            "machine verification. Call verify_and_record — run your test/command (explicit_command/"
+            "explicit_metric/visible_verifier), confirm the artifact exists (artifact_observation), or "
+            "honestly declare no_visible_machine_contract — so the result is grounded, then continue.",
         )
+        emit_progress("Verify-before-done nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
+        return True
+    # A3 one-shot no-op nudge: a declared deliverable (non-empty expected_output) but the
+    # turn made NO tool calls, produced NO reviewable effects, and carries NO FINAL ANSWER
+    # marker — a structural about-to-finalize-without-attempting signal (same condition
+    # family as the M2 expected_output_ungrounded flag). Own latch, ordered AFTER the verify
+    # nudge; never forces acceptance review; forced-finalization paths return earlier and
+    # bypass it. Structural facts only (no refusal-text matching).
+    if (
+        not getattr(tools._ctx, "_noop_attempt_nudged", False)
+        and str(_contract_expected_output(tools._ctx)).strip()
+        and not (llm_trace.get("tool_calls") or [])
+        and not turn_has_reviewable_effects(llm_trace)
+        and not extract_final_answer(content or "")
+    ):
+        tools._ctx._noop_attempt_nudged = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nThis task declares an expected output, but you are about to finalize "
+            "without having attempted it — no tool calls, no reviewable effects, no FINAL ANSWER. "
+            "Actually attempt the task now (do the work / produce the deliverable / derive the answer), "
+            "then finalize. If it is genuinely blocked, say so with the concrete blocker and evidence.",
+        )
+        emit_progress("No-op attempt nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
+        return True
+    # P2 one-shot final-answer-marker nudge: the turn produced REAL work (tool calls or
+    # reviewable effects) AND visible prose, but carries NO FINAL ANSWER marker — so the
+    # typed extractor would drop it and a forced/deadline finalization would score empty
+    # even though the answer is sitting in the prose. We strengthen the BEHAVIOR (ask the
+    # agent to mark its OWN answer) rather than mining prose into a claimed answer (Bible P5;
+    # codex-confirmed that prose-mining in core would harm ordinary users). Own latch,
+    # ordered AFTER verify/red/A3 (verification grounding outranks formatting); mutually
+    # exclusive with the A3 no-op nudge (which is the no-work case). Forced-finalization
+    # paths return earlier and bypass it. Structural facts only (no content matching).
+    if (
+        not getattr(tools._ctx, "_final_marker_nudged", False)
+        and content and content.strip()
+        and str(_contract_expected_output(tools._ctx)).strip()
+        and not extract_final_answer(content or "")
+        and ((llm_trace.get("tool_calls") or []) or turn_has_reviewable_effects(llm_trace))
+    ):
+        tools._ctx._final_marker_nudged = True
+        messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nYou have done the work but have not marked a final answer. If you "
+            "are done, end your response with a single line, exactly: FINAL ANSWER: <answer> — the "
+            "bare deliverable only (a number / a few words / a short list), so it is captured even if "
+            "the run is cut short. If you are not done, keep working.",
+        )
+        emit_progress("Final-answer marker nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("Final-answer marker nudge injected before final response.")
+        return True
+    return False
 
 
-def _run_llm_loop_impl(
+def _contract_expected_output(ctx: Any) -> str:
+    """Read the declared expected_output (as carried on the task contract/metadata for the
+    running ctx — the same declared field the M2 ungrounded flag keys on), for the A3 no-op nudge gate."""
+    contract = getattr(ctx, "task_contract", {})
+    if isinstance(contract, dict) and str(contract.get("expected_output") or "").strip():
+        return str(contract.get("expected_output") or "")
+    metadata = getattr(ctx, "task_metadata", {})
+    if isinstance(metadata, dict):
+        if str(metadata.get("expected_output") or "").strip():
+            return str(metadata.get("expected_output") or "")
+        meta_contract = metadata.get("task_contract")
+        if isinstance(meta_contract, dict):
+            return str(meta_contract.get("expected_output") or "")
+    return ""
+
+
+def run_llm_loop(
     messages: List[Dict[str, Any]],
     tools: ToolRegistry,
     llm: LLMClient,
@@ -1807,6 +2338,7 @@ def _run_llm_loop_impl(
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
     max_retries = 3
+    cost_ceiling_usd = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     from ouroboros.tools import tool_discovery as _td
     _td.set_registry(tools)
 
@@ -1826,20 +2358,9 @@ def _run_llm_loop_impl(
         MAX_ROUNDS = _max_rounds_default
         log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to %s", _max_rounds_default)
     round_idx = 0
-    # Per-round CHAIN span. Opened at the top of each iteration and closed at
-    # the start of the next one (and in the finally), so each round nests its
-    # LLM/tool spans under one chain, all under the task's agent span.
-    _round_span_cm = None
     try:
         while True:
             round_idx += 1
-
-            # Per-round OTEL CHAIN span (fork telemetry): close the previous
-            # round's span and open this one so its LLM/tool spans nest under it.
-            if _round_span_cm is not None:
-                _round_span_cm.__exit__(None, None, None)
-            _round_span_cm = chain_span(name=f"round.{round_idx}")
-            _round_span_cm.__enter__()
 
             ctx = tools._ctx
             _prev_active_model = active_model
@@ -1860,12 +2381,12 @@ def _run_llm_loop_impl(
 
             # One forced-wrap-up context per round: consumed by the round-limit
             # path and the supervisor finalize_now control path below.
-            limit_ctx = _build_round_limit_context(
-                messages=messages, llm=llm, active_model=active_model, active_effort=active_effort,
-                max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
-                event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
-                active_use_local=active_use_local, max_rounds=MAX_ROUNDS, tools=tools, drive_root=drive_root,
+            limit_ctx = _RoundLimitContext(
+                messages, llm, active_model, active_effort, max_retries, drive_logs,
+                task_id, round_idx, event_queue, accumulated_usage, task_type,
+                active_use_local, MAX_ROUNDS, drive_root=drive_root,
             )
+            _finalize_limit_ctx(limit_ctx, tools)
             if round_idx > MAX_ROUNDS:
                 text, accumulated_usage, _ = _handle_round_limit(limit_ctx)
                 return text, accumulated_usage, llm_trace
@@ -1880,10 +2401,9 @@ def _run_llm_loop_impl(
                 return text, accumulated_usage, llm_trace
 
             _checkpoint_injected = _inject_round_checkpoints(
-                round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages,
-                accumulated_usage=accumulated_usage, emit_progress=emit_progress, tools=tools,
-                event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-            )
+                round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
+                emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
+                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd)
 
             messages, _compaction_usage = _run_round_compaction(
                 messages,
@@ -1915,7 +2435,6 @@ def _run_llm_loop_impl(
                     _compaction_usage.get("prompt_cache_ttl"))
                 emit_llm_usage_event(event_queue, task_id, _cm, _compaction_usage, _cc, "compaction")
 
-            # Provider cache boundary; unsupported providers strip cache_control in llm.py.
             seal_task_transcript(messages)
 
             msg, cost = call_llm_with_retry(
@@ -1923,6 +2442,7 @@ def _run_llm_loop_impl(
                 max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
                 use_local=active_use_local,
                 deadline_ts=_task_deadline_epoch(tools),
+                allow_server_web_search=_server_web_allowed_by_task(tools._ctx),
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
@@ -1942,6 +2462,7 @@ def _run_llm_loop_impl(
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
             if not tool_calls:
                 if _force_plan_required(tools._ctx, llm_trace):
                     attempts = int(getattr(tools._ctx, "_force_plan_reminder_count", 0) or 0)
@@ -1972,14 +2493,13 @@ def _run_llm_loop_impl(
                     emit_progress("Subagent handoff status refreshed before final response.")
                     llm_trace["reasoning_notes"].append("Subagent handoff status refreshed before final response.")
                     continue
-                finalization_msg = _skill_finalization_message(drive_root, llm_trace) if drive_root is not None else ""
-                if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
-                    tools._ctx._skill_finalization_injected = True
-                    if content and content.strip():
-                        messages.append({"role": "assistant", "content": content})
-                    _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{finalization_msg}")
-                    emit_progress(finalization_msg)
-                    llm_trace["reasoning_notes"].append(finalization_msg)
+                if (absorption_result := _maybe_enforce_child_absorption_gate(tools, limit_ctx, content, messages, emit_progress, llm_trace)) == "continue":
+                    continue
+                if absorption_result is not None:
+                    return absorption_result
+                if _maybe_inject_finalization_nudges(
+                    tools, drive_root, task_id, llm_trace, content, messages, emit_progress
+                ):
                     continue
                 if _run_task_acceptance_review_once(
                     tools=tools,
@@ -2011,17 +2531,11 @@ def _run_llm_loop_impl(
                 budget_remaining_usd, accumulated_usage, round_idx, messages,
                 llm, active_model, active_effort, max_retries, drive_logs,
                 task_id, event_queue, llm_trace, task_type, active_use_local,
-                deadline_ts=_task_deadline_epoch(tools),
-            )
+                deadline_ts=_task_deadline_epoch(tools), cost_ceiling_usd=cost_ceiling_usd)
             if budget_result is not None:
                 return budget_result
 
     finally:
-        if _round_span_cm is not None:
-            try:
-                _round_span_cm.__exit__(None, None, None)
-            except Exception:
-                log.debug("Failed to close round chain span", exc_info=True)
         if stateful_executor:
             try:
                 from ouroboros.tools.browser import cleanup_browser

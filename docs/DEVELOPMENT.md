@@ -169,7 +169,11 @@ per-feature nicety:
   single provider has no 1M-context model, BIBLE P3's AUDITED, owner-opt-in degraded
   advisory scope review (`OUROBOROS_SCOPE_REVIEW_DEGRADED`) is the disclosed fallback;
   the ≥1M floor is never lowered as a code default and the blocking triad still
-  reviews the staged diff in full.
+  reviews the staged diff in full. Since v6.55.0 the no-evidence 1M sentinel keys on
+  the shipped default reviewer (claude-fable-5), so an OpenAI-only install — whose
+  designated scope reviewer stays `openai/gpt-5.5` — runs in the visible sub-floor
+  advisory window until Capability Evidence lands (generative probe or
+  `/api/owner/capability-ack`); the blocking triad is unaffected.
 - **Documented exceptions.** A few provider-specific extras are deliberately NOT
   universal: `web_search` (OpenAI Responses, OpenRouter server tool, Anthropic
   server tool, optional ddgs) and the Claude Agent SDK tools (Anthropic). These
@@ -184,7 +188,7 @@ per-feature nicety:
 Derived from P7 (Minimalism): entire codebase fits in one context window.
 
 - Module target: ~1000 lines. Crossing that line is P7 pressure and should trigger extraction or an explicit justification.
-- Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py`, `server.py`, temporary v5.7.1 debt `git.py`, and temporary v6.15/v6.16 debt `extension_loader.py` (OOP extension parity plus worker->server companion reconcile crossed the gate; the registry-coupled `PluginAPIImpl`/loader split is the deferred follow-up), and v6.20.0 acting-subagents debt `registry.py` / `events.py` (the acting authority/gating grew the tool dispatcher and the supervisor schedule handler past the 1600 gate; extracting their safety-critical dispatch/event internals is the deferred follow-up), and v6.33.0 reliability debt `loop.py` / `shell.py` / `core.py` (deadline-aware finalization, the brace-group `sh -c` hint, single-file search, and the re-read-awareness nudge crossed three hot tool/loop modules whose helpers are tightly coupled to internals — a clean split fights the function-size gate and risks import cycles, so it is tracked debt) — split deferred until each surface stabilises, with `git.py` expected to pay down in the next tools pass. The authoritative grandfathered set is `GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`.
+- Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py`, `server.py`, temporary v5.7.1 debt `git.py`, and temporary v6.15/v6.16 debt `extension_loader.py` (OOP extension parity plus worker->server companion reconcile crossed the gate; the registry-coupled `PluginAPIImpl`/loader split is the deferred follow-up), and v6.20.0 acting-subagents debt `registry.py` / `events.py` (the acting authority/gating grew the tool dispatcher and the supervisor schedule handler past the 1600 gate; extracting their safety-critical dispatch/event internals is the deferred follow-up), v6.33.0 reliability debt `loop.py` / `shell.py` / `core.py` (deadline-aware finalization, the brace-group `sh -c` hint, single-file search, and the re-read-awareness nudge crossed three hot tool/loop modules whose helpers are tightly coupled to internals — a clean split fights the function-size gate and risks import cycles, so it is tracked debt), and v6.50.0 reconciliation-layer debt `control.py` / `workers.py` (typed schedule admission, cap serialization, and parent-side advisory reconciliation grew the existing scheduling surfaces; splitting before the new contract stabilizes would add indirection around the critical path) — split deferred until each surface stabilises. The authoritative grandfathered set is `GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`.
 - Method target: <150 lines. Crossing that line is a decomposition signal, not an automatic failure by itself.
 - Method hard gate: 300 lines in `tests/test_smoke.py`.
 - Runtime-code function-count hard gate: enforced by `tests/test_smoke.py` against the value defined in `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (single source of truth — bump the constant when adding a feature with an explicit comment justifying the increase). Tracked `devtools/` operator code is excluded from this runtime health gate, but touched `devtools/` files are still fully reviewed. Precedent (2026-06-10, owner decision): the first consolidation paydown removed ~60 dead/duplicate/trivial-wrapper functions and the cap moved to 3500 with deliberate headroom — the gate exists to force acknowledged growth, not to sit at zero slack and churn on every small fix.
@@ -278,14 +282,6 @@ engineering standards, you MUST:
 ---
 
 ## Review & Commit Protocol
-
-When `OUROBOROS_REVIEWS_DISABLED=true`, all LLM review surfaces are skipped:
-advisory pre-review, commit triad, scope review, plan review, deep self-review,
-skill review, and hub install/update reviews. If that variable is unset,
-`OUROBOROS_FIXED_INFRA_MODELS=true` applies the same default; explicit
-`OUROBOROS_REVIEWS_DISABLED=false` keeps reviews enabled in fixed-infra mode.
-Deterministic safety checks such as load errors, permission grants, dependency
-installation, and staged-fingerprint revalidation still run.
 
 Reviewed commits now have an explicit **two-step gate**:
 
@@ -411,7 +407,7 @@ Before every commit, verify the following:
 - [ ] No gratuitous abstract layers (Bible P7)
 
 #### Structural Rules
-- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, AND an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones). Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and the `test_tool_policy_covers_all_builtin_tools` invariant will fail.
+- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones), AND the intended visibility is declared in `ouroboros/tool_capabilities.py` (`CORE_TOOL_NAMES`, local-readonly/acting subagent allowlists, parallel/truncation sets as appropriate). If workspace tasks should see the tool, update the workspace allowlist in `tools/registry.py` too. Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and without the capability/allowlist wiring a packaged/visible tool can still be unreachable to subagents or workspace tasks.
 - [ ] New Gateway (if extracted)? Contains no business logic, only transport.
 - [ ] New memory/data files? Should they appear in LLM context (`context.py`)?
 
@@ -431,6 +427,7 @@ Before every commit, verify the following:
 
 #### Task Contract Resource Policy
 - When a task contract declares `resource_policy.protected_artifacts`, enforce it as a typed affordance policy in every runtime mode: execute-only black-box references may be run, but byte reads, copy/hash/static introspection, tracing, and debugging against declared paths are blocked. Do not add benchmark-specific command gates.
+- Observable Acceptance Claims (`task_contract.acceptance_claims`) are advisory, task-general criteria (`claim` / `surface` / `support` / `priority`). The `support` text names expected evidence only; reviewers may credit actual support only from host-built `support_refs`; v1 links these refs through verification receipts by `criterion_id` and carries receipt-attested details such as `matched`, `artifact_lifecycle`, and missing-after facts. Standalone artifact/source refs without a claim-linked receipt are a deferred v2, not evidence by themselves. Do not turn these claims into a hard task-acceptance gate or a benchmark-specific enum taxonomy.
 
 #### Devtools And Benchmark Tooling
 - `devtools/` is tracked operator code, not runtime core. It may contain benchmark harness adapters, smoke runners, and reproducibility helpers that should be versioned with Ouroboros, but runtime modules under `ouroboros/`, `server.py`, web modules, and build scripts must not import it.
@@ -438,10 +435,13 @@ Before every commit, verify the following:
 - `devtools/` is not an immune-system bypass. If a commit touches `devtools/`, triad/scope reviewers inspect those touched files fully. Unrelated `devtools/` files use the Atlas `excluded_dir` disposition and stay coverage-manifest-only in broad packs so benchmark harness code does not drown normal core reviews.
 - Benchmark adapters must preserve official task instructions, official scoring/evaluation commands, and official artifact formats. They may build predictions, launch official runners, normalize logs, or aggregate official outputs, but must not implement benchmark-specific prompt hacks, routing hacks, or replacement scoring.
 - Generated benchmark runs, datasets, container outputs, logs, predictions, and submissions belong under `/Users/anton/Ouroboros/bench_runs/` or another explicit output root outside `repo/`, never under `devtools/`.
+- SWE-bench Pro patch capture must be provenance-based, not filename-pattern-based: pre-existing base-untracked files may be excluded from `model_patch` by a base snapshot, while genuinely new agent-created files must remain included. Keep diagnostic status artifacts honest about whether they are pre-filter or post-filter.
+- SWE-bench Pro install transports must fail fast with typed infra reasons for permanent environment failures (for example musl pyexpat/pip/server-import failures) instead of retrying them as provider/network transients.
 
 #### Light Mode External Deliverables
 - `runtime_mode=light` is a self-modification boundary, not an OS sandbox. User-visible deliverables are allowed when they are outside the Ouroboros repo/control-plane.
 - Preferred flow: `task_drive` for scratch, `artifact_store` for canonical deliverables, and `user_files` for the owner's visible copy (for example `Desktop/report.html`). `write_file(root=user_files)` and declared process `outputs` must register/copy canonical task artifacts. Rewrites of the same user-visible source keep the previous canonical artifact in non-manifest history with last-5 retention; history is for recovery, not a second deliverable list.
+- `run_command`/`run_script` `scratch=[...]` (v6.52.2) is a DISTINCT channel from `outputs=[...]`: it declares EPHEMERAL in-workspace verification files (a throwaway test the agent writes, runs, and deletes — e.g. an in-package test that must live in the repo to compile). Scratch is exempt from the undeclared-output guard, never registered as an artifact, confined to the cwd, honored for NEW files and (v6.56.0) for ADOPTED existing untracked in-cwd files — adoption records the file's sha at declaration time through the SSOT `artifacts.record_task_scratch`, so the patch exclusion applies only while the content still matches (tracked files, paths outside the cwd, and paths outside a git worktree stay blocked; a real edit can never hide behind a scratch declaration) — and excluded from the workspace patch via `.scratch_manifest.json` (`headless.write_workspace_patch_artifacts`). Re-declaring a manifest path is idempotent. The undeclared-output guard verifies candidates POST-exec by stat (exists + mtime ≥ start−slack), so a mere path MENTION (import strings, CLI flags, heredoc bodies) is not a write. Use `outputs` for deliverables, `scratch` for throwaway verification — never overload one for the other.
 - `run_command`/`run_script`/`start_service` may use cwd under `active_workspace`, task-scoped `task_drive`, task-scoped `artifact_store`, and external `user_files` where the active profile permits it. In light direct tasks, omitted `run_script.cwd` defaults to task scratch instead of the Ouroboros repo; long-running services in light must use an explicit external/task/artifact cwd. Declared service `outputs` are copied into the task artifact store when the service stops.
 - `run_script` temporary files are created under the active workspace when the task is workspace/executor-backed, then removed after execution. Do not run workspace scripts from the system repo temp path; relative imports, generated files, and toolchain discovery must observe the same cwd the user requested.
 - Declared process outputs may be files or directories. Directory outputs are copied to the canonical artifact store as a bounded manifest plus zip archive; hidden/control/credential-shaped files, excessive file counts, and excessive byte sizes fail closed instead of leaking through artifact registration.
@@ -476,7 +476,9 @@ Before every commit, verify the following:
   Its public schema is strict: `objective` and `expected_output` are required;
   `role`, `context`, `constraints`, `memory_mode`, `model_lane`, and the typed
   delegation-budget grants `delegation_intent`, `may_mutate`, `may_fan_out`, and
-  `max_children` (v6.37.0 C3.1) are optional. The booleans `may_mutate`/`may_fan_out`
+  `max_children` (v6.37.0 C3.1) are optional; v6.50.0 adds a closed-enum
+  `required_capabilities` list as schedule-time admission data (not a frozen
+  task-contract field). The booleans `may_mutate`/`may_fan_out`
   are parsed with the strict `normalize_bool` (the string `"false"` is NOT truthy),
   and the child's budget only ever NARROWS within the parent's
   (`_narrow_child_delegation_budget`): recursion authority (delegate/fan-out/
@@ -532,10 +534,26 @@ Before every commit, verify the following:
   drive-scoped repo git lock.
 - `task_constraint` boolean parsing must be strict; strings such as `"false"`
   are false, never truthy through Python's `bool("false")`.
+- The effective delegation budget is a pure admission reducer: declared
+  `delegation_budget`, explicit `required_capabilities`, and unresolved
+  structured non-advisory `delegation_constraint` rows are reconciled before a
+  child runs. Scheduler back-pressure rows may be advisory telemetry (for
+  example `queued_behind_active_cap`) and must not block later queued children
+  below the hard ceiling.
+  Do not infer child needs from objective prose; the LLM declares them via the
+  closed enum. Do not add fields to `contracts/task_contract.py` for this.
+- `delegation_constraint` is a typed task-tree beacon with a structured payload
+  (`constraint_id`, directive, scope, rationale). Consumers must read the payload,
+  never parse the text. Overrides require an explicit reason and are recorded as
+  decision rows.
 - Subagent changes must keep writes, commits, review mutation, runtime control,
   tool expansion, skills lifecycle, and shell blocked — except bounded task-tree
-  coordination via `tree_note`/`tree_read` (the one permitted local-write path for
-  swarm beacons/shared-frame reads, not state mutation). Nested readonly
+  coordination via `tree_note`/`tree_read`, parent-only
+  `override_delegation_constraint`, and bounded media projection such as
+  `extract_video_frames` writing derived frames only under the task artifact store
+  (`artifact_store/video_frames`) through a host-owned command shape (the permitted
+  local coordination/projection paths; not arbitrary workspace or repo mutation).
+  Nested readonly
   `schedule_subagent` recursion is allowed only within configured depth/cap
   limits; descendants deeper than the configured capability depth
   (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`) are coerced to the light lane. Enabled/reviewed extension tools and enabled MCP tools may remain
@@ -578,6 +596,10 @@ Before every commit, verify the following:
   untruncated child handoff belongs to `get_task_result`, `wait_task`, and
   `wait_tasks`. Do not add shared ledgers, automatic memory merges, or new
   settings/endpoints unless the accepted plan explicitly calls for them.
+- A delegating parent must not produce a clean no-tool final answer while direct
+  children are still running and undecided. One bounded absorption reminder is
+  allowed; after that, finalization is best-effort (`children_unabsorbed`) rather
+  than clean. This is an outcome-honesty rule, not a new wait loop.
 
 #### Page Header Layout
 - Top-level page chrome (`renderPageHeader`, tab strips, primary actions) must sit outside the scrolling content region.
@@ -1071,6 +1093,29 @@ Default local pytest excludes costly or environment-dependent lanes:
 When adding a new opt-in lane, register the marker in `pyproject.toml`, add
 a collect-only zero-test guard in CI, and keep the default local addopts
 token-safe and Docker-safe.
+
+### Parallel CI and the `serial` marker
+
+CI runs the full default suite **in parallel** — `pytest -m "not serial" -n auto --dist loadscope
+--max-worker-restart=0` (~5× faster than serial) — followed by a short serial pass for `-m serial`
+(`.github/workflows/ci.yml`, jobs `quick-test` / `full-test`). Two rules keep new tests from breaking
+that:
+
+- **Mark real-process / real-port / process-global tests `@pytest.mark.serial`.** A test that spawns
+  a real OS process, binds a real port, or mutates a module-level registry is not parallel-safe:
+  under `-n` it flakes on kill/reap or port-reclaim timing, or it crashes its worker — which (with
+  `--max-worker-restart=0`) fails that worker's WHOLE co-located batch and shows up as spurious
+  failures in unrelated files. Mark such a test `@pytest.mark.serial` (or add its file to
+  `_SERIAL_TEST_FILES` in `tests/conftest.py`) so it runs in the serial pass instead.
+- **Keep every other test parallel-safe** so it stays in the fast pass: use `tmp_path` (never a fixed
+  path like `/tmp/foo.pid`); use `monkeypatch.setenv` / `monkeypatch.setattr` (never a bare
+  `os.environ[...] = ...`, which leaks to other tests on the same worker); never assume execution
+  order; and if you must mutate a module global, reset it around the test (pattern:
+  `tests/conftest.py::_isolate_workspace_executor_globals`).
+
+The per-commit preflight GATE stays **serial** regardless — never add `-n` to `pyproject.toml`
+`addopts` or to `ouroboros/preflight_runner.py` (a flaky parallel fail-closed gate manufactures
+non-deterministic `TESTS_FAILED` indistinguishable from a real immune rejection).
 
 ### GitHub Actions: secrets in step-level `if:` conditions
 

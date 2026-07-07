@@ -845,7 +845,7 @@ export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDa
             // The owner's request that spawned this card (main, non-subagent only),
             // used to name a project on "turn into project" when the server has no
             // title/objective yet (P1, direct-chat conversion). One-shot handoff.
-            objectiveHint: '',
+            objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
             // Cluster B: the proactively-coined LLM project name; when set it becomes
             // the card title (the activity headline keeps rendering in the lines below).
             suggestedName: '',

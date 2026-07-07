@@ -616,8 +616,6 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     "transport": transport,
                     "chat_id": chat_id,
                 })
-        # Atomic owner-binding + activity stamp: the old load→(log/broadcast)→save
-        # span could overwrite concurrent budget/state writers with stale data.
         def _stamp_owner_activity(live: dict) -> None:
             if live.get("owner_id") is None and external_identity_present:
                 live["owner_id"] = user_id
@@ -633,10 +631,6 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if not external_identity_present:
                 ctx.send_with_budget(chat_id, "⚠️ Command ignored: this transport did not provide owner identity.")
                 continue
-            # External transports authorize slash commands against a SEPARATE
-            # owner-external slot, so the local web owner (1/1) can never lock out
-            # a real Telegram owner. The first external slash binds it (TOFU) and
-            # asks for a resend instead of executing.
             owner_ext_id = st.get("owner_external_id")
             owner_ext_chat_id = st.get("owner_external_chat_id")
             if owner_ext_id is None:
@@ -724,24 +718,26 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             st2["evolution_mode_enabled"] = bool(turn_on)
             if turn_on:
                 st2["evolution_consecutive_failures"] = 0
+            # Owner stop is AUTHORITATIVE against the post-task promotion pipeline: the
+            # durable evolution_owner_stopped flag (read by apply_pending_request) blocks an
+            # autonomous re-arm until the owner /evolve starts again. Set True on stop,
+            # cleared (False) on turn_on — the only owner-authorized clear.
+            st2["evolution_owner_stopped"] = (not turn_on)
             # Owner-initiated evolution must not inherit a stale post-task one-shot
             # autostop, which would disable the owner's campaign after one cycle.
             st2["post_task_autostop"] = False
             ctx.save_state(st2)
-            try:
-                from supervisor.evolution_lifecycle import pause_evolution_campaign, start_evolution_campaign
-
-                if turn_on:
-                    start_evolution_campaign(objective, source="owner_chat")
-                else:
-                    pause_evolution_campaign("disabled via owner chat")
-            except Exception:
-                log.warning("Failed to update evolution campaign state", exc_info=True)
             if not turn_on:
-                # Cancel the live evolution worker too — pruning PENDING alone
-                # leaves a mid-cycle task running (and eligible for retry).
+                # Cancel the live evolution worker BEFORE the terminal campaign close below:
+                # complete_evolution_campaign runs the per-cycle worktree cleanup, which skips
+                # while a task still holds the shared worktree — so the running cycle must be
+                # gone first (pruning PENDING alone leaves a mid-cycle task running).
                 from supervisor.queue import cancel_running_evolution_tasks
+                from ouroboros.post_task_evolution import drop_pending_request
 
+                # Fast path: drop any queued post-task promotion so it cannot re-arm on
+                # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
+                drop_pending_request(ctx.DRIVE_ROOT)
                 cancelled = cancel_running_evolution_tasks("disabled via owner chat")
                 ctx.PENDING[:] = [t for t in ctx.PENDING if str(t.get("type")) != "evolution"]
                 ctx.sort_pending()
@@ -751,7 +747,19 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                         chat_id,
                         f"🛑 Cancelled running evolution task(s): {', '.join(cancelled)}",
                     )
-            ctx.send_with_budget(chat_id, f"🧬 Evolution campaign: {'ON' if turn_on else 'OFF'}")
+            try:
+                from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+
+                if turn_on:
+                    start_evolution_campaign(objective, source="owner_chat")
+                else:
+                    # Terminal close (not a resumable pause): /evolve start mints a FRESH
+                    # campaign rather than resurrecting this one.
+                    complete_evolution_campaign("disabled via owner chat", status="stopped")
+            except Exception:
+                log.warning("Failed to update evolution campaign state", exc_info=True)
+            _evo_msg = "ON" if turn_on else "OFF — post-task auto-evolution also paused until /evolve start"
+            ctx.send_with_budget(chat_id, f"🧬 Evolution campaign: {_evo_msg}")
         elif lowered.startswith("/bg"):
             parts = lowered.split()
             action = parts[1] if len(parts) > 1 else "status"
@@ -864,7 +872,18 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     setup_remote_if_configured(settings, log)
 
     if _LAUNCHER_MANAGED:
-        policy = "rescue_and_block" if _has_active_evolution_transaction() else "rescue_and_reset"
+        # An in-flight managed-update assisted merge intentionally leaves MERGE_HEAD + the partly
+        # resolved merge in the live worktree (over pre_update_sha). Use the NON-destructive
+        # rescue_and_block policy so the bootstrap restart does not reset/clean that merge state
+        # away before finalize_managed_update_on_boot / _recover_assisted_on_boot can resume it.
+        try:
+            from supervisor.update_merge import active_update_tx
+
+            _managed_update_active = bool(active_update_tx())
+        except Exception:
+            _managed_update_active = False
+        block = _has_active_evolution_transaction() or _managed_update_active
+        policy = "rescue_and_block" if block else "rescue_and_reset"
         ok, msg = git_ops_module.safe_restart(reason="bootstrap", unsynced_policy=policy)
         if not ok and policy == "rescue_and_block":
             try:
@@ -1464,6 +1483,54 @@ async def lifespan(app):
     else:
         _supervisor_ready.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
+
+    # P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback)
+    # and run a one-shot boot-time update check (check-on-restart) so the main-screen
+    # Update badge reflects availability. Both run OFF the startup critical path and
+    # fail-soft — a missing managed remote / offline boot simply yields no badge.
+    def _boot_managed_update_tasks():
+        try:
+            _supervisor_ready.wait(timeout=60)
+            from supervisor.git_ops import compute_managed_update_status
+            from supervisor.update_merge import finalize_managed_update_on_boot
+
+            # A HEALTHY boot only — _supervisor_ready is also set on supervisor INIT FAILURE
+            # (alongside _supervisor_error), so gate on the error too or finalize would clear a
+            # pending update as "finalized" on a failed boot, defeating the boot-loop rollback.
+            finalize_managed_update_on_boot(
+                supervisor_ready=_supervisor_ready.is_set() and not _supervisor_error
+            )
+            status = compute_managed_update_status(fetch=True)
+            # Persist the boot check-on-restart result so the passive Update pill can show
+            # availability without a network fetch on every poll (P2 2F: boot fetches once,
+            # the badge reads this cache; no periodic polling). A passive
+            # compute_managed_update_status(fetch=False) bails before resolving the official
+            # ref, so without this cache the pill stays hidden after a restart.
+            try:
+                from supervisor.state import update_state
+                from ouroboros.utils import utc_now_iso
+
+                def _cache_update_status(s):
+                    s["managed_update_cache"] = {
+                        "available": bool(status.get("available")),
+                        "safe_to_apply": bool(status.get("safe_to_apply")),
+                        "latest_sha": status.get("latest_sha") or "",
+                        "latest_short_sha": status.get("latest_short_sha") or "",
+                        "latest_message": status.get("latest_message") or "",
+                        "behind": int(status.get("behind") or 0),
+                        "ahead": int(status.get("ahead") or 0),
+                        "checked_at": utc_now_iso(),
+                    }
+
+                update_state(_cache_update_status)
+            except Exception:
+                log.debug("boot managed-update cache failed", exc_info=True)
+        except Exception:
+            log.debug("boot managed-update tasks failed", exc_info=True)
+
+    threading.Thread(
+        target=_boot_managed_update_tasks, daemon=True, name="boot-managed-update",
+    ).start()
 
     if has_local and settings.get("LOCAL_MODEL_SOURCE"):
         from ouroboros.local_model_autostart import auto_start_local_model

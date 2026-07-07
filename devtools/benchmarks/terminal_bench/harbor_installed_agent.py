@@ -36,6 +36,13 @@ except Exception:  # pragma: no cover - exercised when Harbor is absent.
 
 _CONTAINER_SRC = "/opt/ouroboros-src"
 _CONTAINER_VENV = "/opt/ouroboros-venv"
+# Optional host-mounted pip wheel cache (mount a host dir here via Harbor --mounts to make the
+# per-trial Ouroboros pip install offline-fast and resilient to mirror/network drops). Safe by
+# default: if nothing is mounted at this path it is just an ephemeral in-container cache dir, so
+# behavior is unchanged. pip keys cached wheels by (name, version, python-tag, platform-tag), so a
+# single shared cache is correct across heterogeneous task images (py3.11/3.12, different glibc) and
+# concurrency-safe (atomic-rename writes of identical content). See run_tb.py OBO_TB_PIP_CACHE.
+_CONTAINER_PIP_CACHE = "/opt/ouro-pip-cache"
 _CONTAINER_DATA = "/logs/agent/ouroboros-data"
 _CONTAINER_WORKSPACE = "/app"
 _SERVER_URL = "http://127.0.0.1:8765"
@@ -193,10 +200,20 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         openrouter_min_credit_usd = float(kwargs.pop("openrouter_min_credit_usd", os.environ.get("OUROBOROS_BENCH_OPENROUTER_MIN_CREDIT_USD", 5.0)))
         # plan_task needs >=2 workers (planning scouts run as pooled subagents);
         # 1 worker forced the capacity-degraded inline fallback on every run.
-        max_workers = int(kwargs.pop("max_workers", 2))
+        max_workers = int(kwargs.pop("max_workers", 4))  # v6.55.0: 3-4 subagent slots (root takes one); 10 would blow container memory (full python proc per worker)
         runtime_mode = str(kwargs.pop("runtime_mode", "pro"))
-        review_enforcement = str(kwargs.pop("review_enforcement", "advisory"))
+        review_enforcement = str(kwargs.pop("review_enforcement", "blocking"))
+        # Safety mode: configurable (full|light|off). Default light keeps the v6.55.0
+        # scaffold behavior (LLM safety for integration tools only); off disables the
+        # LLM safety pass entirely for a fully-disposable jail. Deterministic guards
+        # are unaffected either way.
+        safety_mode = str(kwargs.pop("safety_mode", "light")).strip().lower()
+        if safety_mode not in ("full", "light", "off"):
+            safety_mode = "light"
         task_review_mode = str(kwargs.pop("task_review_mode", "required"))
+        disable_agent_web = str(kwargs.pop("disable_agent_web", "true")).strip().lower() not in (
+            "0", "false", "no", "off", "",
+        )
         ouroboros_model = str(kwargs.pop("ouroboros_model", ""))
         ouroboros_light_model = str(kwargs.pop("ouroboros_light_model", "google/gemini-3.5-flash"))
         leave_server_running_for_verifier = bool(kwargs.pop("leave_server_running_for_verifier", True))
@@ -223,11 +240,16 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         self.max_workers = int(max_workers)
         self.runtime_mode = runtime_mode
         self.review_enforcement = review_enforcement
+        self.safety_mode = safety_mode
         self.task_review_mode = task_review_mode
+        self.disable_agent_web = bool(disable_agent_web)
         self.ouroboros_model = ouroboros_model
         self.ouroboros_light_model = ouroboros_light_model
         self.leave_server_running_for_verifier = bool(leave_server_running_for_verifier)
         self._run_summary: dict[str, Any] = {}
+        # Monotonic timestamp of run() start, so the deadline we hand the agent accounts for the
+        # install/server time already consumed inside Harbor's external per-task wall-clock cap.
+        self._run_started_monotonic: float | None = None
 
     @staticmethod
     def name() -> str:
@@ -322,7 +344,7 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "GIGACHAT_VERIFY_SSL_CERTS",
             "GIGACHAT_PROFANITY_CHECK",
             "OUROBOROS_MODEL",
-            "OUROBOROS_MODEL_CODE",
+            "OUROBOROS_MODEL_HEAVY",  # v6.39 slot rename (legacy OUROBOROS_MODEL_CODE -> _HEAVY)
             "OUROBOROS_MODEL_LIGHT",
             # OUROBOROS_MODEL_FALLBACK is deliberately NOT forwarded: the
             # benchmark metric must stay single-model (a host-configured
@@ -332,6 +354,7 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_SCOPE_REVIEW_MODELS",
             "OUROBOROS_SCOPE_REVIEW_MODEL",
             "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+            "CLAUDE_CODE_MODEL",
             "OUROBOROS_EFFORT_TASK",
             "OUROBOROS_EFFORT_REVIEW",
             "OUROBOROS_EFFORT_SCOPE_REVIEW",
@@ -355,7 +378,7 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
 
         if self.ouroboros_model:
             env["OUROBOROS_MODEL"] = self.ouroboros_model
-            env["OUROBOROS_MODEL_CODE"] = self.ouroboros_model
+            env["OUROBOROS_MODEL_HEAVY"] = self.ouroboros_model
         if self.ouroboros_light_model:
             env["OUROBOROS_MODEL_LIGHT"] = self.ouroboros_light_model
 
@@ -374,7 +397,13 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             except Exception:
                 fallback_pin = ""
         if fallback_pin:
+            # Pin BOTH the legacy singular AND the current plural key. config.parse_fallback_chain
+            # reads OUROBOROS_MODEL_FALLBACKS (plural) BEFORE the legacy singular, and the container's
+            # SETTINGS_DEFAULTS plural is a DIFFERENT model (the shipped cross-model chain). Leaving
+            # the plural unset lets that default shadow the singular pin and contaminate the
+            # single-model metric, so we pin the plural to the main model too.
             env["OUROBOROS_MODEL_FALLBACK"] = fallback_pin
+            env["OUROBOROS_MODEL_FALLBACKS"] = fallback_pin
 
         env.update(
             {
@@ -390,6 +419,12 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
                 "OUROBOROS_REVIEW_ENFORCEMENT": self.review_enforcement,
                 "OUROBOROS_TASK_REVIEW_MODE": self.task_review_mode,
                 "OUROBOROS_MAX_WORKERS": str(self.max_workers),
+                # v6.55.0: the container is an isolated jail — the LLM safety layer
+                # adds cost/latency without protecting anything the deterministic
+                # guards don't (34% of all LLM calls in the k=5 run); light keeps
+                # the LLM check for integration tools only (Owner decision #14).
+                # Configurable via the safety_mode agent-kwarg (full|light|off).
+                "OUROBOROS_SAFETY_MODE": self.safety_mode,
                 "PYTHONUNBUFFERED": "1",
             }
         )
@@ -462,6 +497,8 @@ PY
               }}
 
               . {_CONTAINER_VENV}/bin/activate
+              export PIP_CACHE_DIR={_CONTAINER_PIP_CACHE}
+              mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
               python -m pip install --upgrade pip setuptools wheel
               python -m pip install -r {_CONTAINER_SRC}/requirements.txt || {{
                 echo "install: requirements install failed; retrying without optional tree-sitter code-intel deps (lazy runtime import, degrades gracefully)"
@@ -469,6 +506,11 @@ PY
                 python -m pip install -r /tmp/ouro_reqs_no_treesitter.txt
               }}
               python -m pip install -e {_CONTAINER_SRC} --no-deps
+              # ffmpeg in the AGENT prefix (v6.56.0, P0-1): task images rarely ship
+              # ffmpeg, so extract_video_frames was dead in TB tasks. The wheel binary
+              # is found by media._resolve_ffmpeg via imageio_ffmpeg.get_ffmpeg_exe();
+              # a mirror hiccup degrades gracefully (typed UNAVAILABLE + cv2 hint).
+              python -m pip install imageio-ffmpeg || echo "install: imageio-ffmpeg failed (extract_video_frames degrades to the cv2 workaround)"
               chmod -R a+rX {_CONTAINER_SRC} {_CONTAINER_VENV} /logs/agent
               {_CONTAINER_VENV}/bin/python -c 'import importlib.metadata; print("ouroboros", importlib.metadata.version("ouroboros"))'
               echo "install: complete"
@@ -646,8 +688,38 @@ PY
         if result.return_code != 0:
             raise RuntimeError(f"container cannot reach configured provider endpoint ({provider_name})")
 
+    def _disabled_tools(self) -> list[str]:
+        # Reward-hacking guard: faithful TB2.1 runs give the task FULL container network
+        # (every task.toml declares allow_internet=true; tasks like build-cython-ext/caffe-cifar-10
+        # require `git clone`), so we must NOT block shell egress. We only withhold the agent's OWN
+        # LLM-powered web/search/browser/VLM tools (which a reference shell agent wouldn't have) via
+        # the declarative `disabled_tools` tool-policy. This leaves allowed_resources at its permissive
+        # default (network/git/pip available) and never trips the web<->network cross-implication in
+        # the registry resource gate. (Previously this set allowed_resources.network=false, which
+        # wrongly blocked `git clone` even though the container had working network.)
+        # The web group mirrors the registry's `_WEB_TOOLS` set (web_search/
+        # browse_page/browser_action/youtube_transcript — the transcript tool joined
+        # `_WEB_TOOLS` in v6.52.1 and the adapter's list had silently drifted until
+        # v6.55.0; a sync test now pins the mirror). On top of it, web-off runs also
+        # withhold the DELEGATED-vision tools (analyze_screenshot/vlm_query): they
+        # route through an LLM/VLM lookup a reference shell agent would not have.
+        # `view_image` is intentionally NOT disabled: it is a LOCAL image-to-model
+        # tool registered OUTSIDE `_WEB_TOOLS` (it injects a local file into the
+        # agent's own model context, no web/second-model call), so local-image tasks
+        # (e.g. financial-document/code-from-image) keep a legitimate vision
+        # affordance a reference agent could also have.
+        # v6.55.0: claude_code_edit is disabled in EVERY bench run regardless of the
+        # web gate — benches measure Ouroboros as a single-model harness; the embedded
+        # Claude-Code delegate is a separate future experiment.
+        disabled = ["claude_code_edit"]
+        if getattr(self, "disable_agent_web", True):
+            disabled = list(self._WEB_TOOLS_MIRROR) + list(self._DELEGATED_VISION_TOOLS) + disabled
+        return disabled
+
     async def _run_ouroboros_task(self, environment: BaseEnvironment, env: dict[str, str]) -> dict[str, Any]:
         workspace_root = json.dumps(self.workspace_dir)
+        disabled_tools_line = f'"disabled_tools": {json.dumps(self._disabled_tools())},'
+
         runner = textwrap.dedent(
             f"""
             import json
@@ -688,8 +760,9 @@ PY
                 "actor_id": "harbor-terminal-bench",
                 "source": "terminal-bench",
                 "metadata": {{"source": "terminal-bench", "delegation_role": "root"}},
+                {disabled_tools_line}
             }}
-            task_timeout = {int(self.task_timeout_sec or 0)}
+            task_timeout = {int(self._effective_task_timeout_sec())}
             if task_timeout > 0:
                 task_body["timeout_sec"] = task_timeout
             created = api("POST", "/api/tasks", task_body)
@@ -762,12 +835,24 @@ PY
             cwd=self.workspace_dir,
             timeout_sec=(self.task_timeout_sec + 60 if self.task_timeout_sec is not None else None),
         )
+        parsed: dict[str, Any] | None = None
+        try:
+            candidate = json.loads((result.stdout or "").strip().splitlines()[-1])
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except Exception:
+            parsed = None
+        # The runner exits 2 (not 0) purely to SIGNAL a terminal `infra_failed` result — the task
+        # still reached a terminal /api/tasks state (status completed/failed). That is a real terminal
+        # outcome, NOT a Harbor wall-clock interruption, so treat it as a returned result (caller sets
+        # reached_terminal_result=True and the captured summary is NOT mislabeled
+        # captured_after_cancellation). Only a nonzero exit that produced NO terminal summary (e.g. a
+        # genuine runner crash / create_failed) is a real failure to raise on.
+        if parsed is not None and str(parsed.get("status") or "") in ("completed", "failed"):
+            return parsed
         if result.return_code != 0:
             raise RuntimeError(f"Ouroboros task runner failed: {result.stdout}\n{result.stderr}")
-        try:
-            return json.loads((result.stdout or "").strip().splitlines()[-1])
-        except Exception:
-            return {"raw_stdout": result.stdout or "", "raw_stderr": result.stderr or ""}
+        return parsed if parsed is not None else {"raw_stdout": result.stdout or "", "raw_stderr": result.stderr or ""}
 
     async def _stop_server(self, environment: BaseEnvironment) -> None:
         await environment.exec(
@@ -790,8 +875,12 @@ PY
             timeout_sec=10,
         )
 
-    async def _capture_current_task_summary(self, environment: BaseEnvironment) -> None:
-        """Persist best-effort task state if Harbor cancels agent.run mid-exec."""
+    async def _capture_current_task_summary(self, environment: BaseEnvironment, interrupted: bool = True) -> None:
+        """Persist best-effort task state. ``interrupted`` records whether Harbor cancelled
+        agent.run mid-exec (True) vs a routine post-terminal snapshot (False); it is written as
+        ``captured_after_cancellation`` so the disclosure ledger can tell a real cancellation
+        apart from a normal terminal finish."""
+        captured_after_cancellation = "True" if interrupted else "False"
         command = textwrap.dedent(
             f"""
             if [ ! -s /logs/agent/ouroboros-current-task-id.txt ]; then
@@ -831,7 +920,7 @@ PY
                 "prompt_tokens": latest.get("prompt_tokens"),
                 "completion_tokens": latest.get("completion_tokens"),
                 "total_rounds": latest.get("total_rounds"),
-                "captured_after_cancellation": True,
+                "captured_after_cancellation": {captured_after_cancellation},
                 "captured_at": time.time(),
             }}
             pathlib.Path("/logs/agent/ouroboros-run-summary.json").write_text(
@@ -839,7 +928,7 @@ PY
                 encoding="utf-8",
             )
             with pathlib.Path("/logs/agent/ouroboros-run.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps({{"type": "final", "task_id": task_id, "result": latest, "captured_after_cancellation": True}}, ensure_ascii=False) + "\\n")
+                f.write(json.dumps({{"type": "final", "task_id": task_id, "result": latest, "captured_after_cancellation": {captured_after_cancellation}}}, ensure_ascii=False) + "\\n")
             PY
             """
         ).strip()
@@ -867,12 +956,98 @@ PY
                 return value
         return None
 
+    # Buffer between the agent's own deadline and Harbor's hard external kill, so the
+    # loop's graceful self-finalize (which itself fires get_finalization_grace_sec before
+    # the deadline) completes and the partial artifact is written before Harbor terminates.
+    # v6.55.0: 30s let gpt2-codegolf overrun the deadline by 26.5s (a 351s
+    # provider-recovery gap + a final round); 105s covers the measured
+    # finalization overhead with margin (owner decision #15, range 90-120).
+    _DEADLINE_SAFETY_SEC = 105
+
+    # Mirror of ouroboros/tools/registry.py::_WEB_TOOLS (the adapter must stay
+    # importable without the runtime package on the harbor host; a sync test in
+    # tests/test_devtools_benchmarks.py pins this against the real set).
+    _WEB_TOOLS_MIRROR = ("web_search", "browse_page", "browser_action", "youtube_transcript")
+    _DELEGATED_VISION_TOOLS = ("analyze_screenshot", "vlm_query")
+
+    def _resolve_task_timeout_from_dataset(self, context: Any) -> int | None:
+        """Read the per-task agent wall-clock cap from the cached task.toml.
+
+        Harbor's AgentContext does not expose the task.toml timeout, so derive the task
+        name from the trial path (logs_dir = .../<task>__<trialhash>/agent) or context, then
+        read ``[agent].timeout_sec`` from the cached dataset task.toml. Best-effort: returns
+        None on any failure (agent then runs deadline-blind, as before — safe fallback)."""
+        task_name = ""
+        try:
+            parent = Path(self.logs_dir).resolve().parent.name  # "<task>__<trialhash>"
+            if "__" in parent:
+                task_name = parent.rsplit("__", 1)[0]
+        except Exception:
+            task_name = ""
+        if not task_name:
+            for attr in ("task_id", "task_name", "task", "name"):
+                raw = getattr(context, attr, None)
+                if isinstance(raw, str) and raw.strip():
+                    task_name = raw.strip().split("/")[-1].rsplit("__", 1)[0]
+                    break
+        if not task_name:
+            return None
+        try:
+            import glob as _glob
+            base = Path.home() / ".cache" / "harbor" / "tasks" / "packages" / "terminal-bench" / task_name
+            matches = _glob.glob(str(base / "**" / "task.toml"), recursive=True)
+            if not matches:
+                return None
+            # Pick the newest matching task.toml (avoid a stale cached package version).
+            chosen = max(matches, key=lambda p: os.path.getmtime(p))
+            text = Path(chosen).read_text(encoding="utf-8")
+        except Exception:
+            return None
+        # Parse [agent].timeout_sec without a toml dependency (the field is a simple float/int).
+        import re as _re
+        section = None
+        cap = None
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                section = s[1:-1].strip()
+                continue
+            if section == "agent":
+                m = _re.match(r"timeout_sec\s*=\s*([0-9]+(?:\.[0-9]+)?)", s)
+                if m:
+                    try:
+                        cap = int(float(m.group(1)))
+                    except (TypeError, ValueError):
+                        cap = None
+                    break
+        return cap if (cap and cap > 0) else None
+
+    def _effective_task_timeout_sec(self) -> int:
+        """The deadline (sec from task creation) handed to the agent: the per-task Harbor cap
+        minus the install/server time already consumed and a small safety buffer. 0 means no
+        deadline (agent runs as before). The agent uses this to pace and self-finalize a partial
+        result before Harbor's hard external kill."""
+        cap = self.task_timeout_sec
+        if not cap or int(cap) <= 0:
+            return 0
+        elapsed = 0.0
+        if self._run_started_monotonic is not None:
+            elapsed = max(0.0, time.monotonic() - self._run_started_monotonic)
+        effective = float(int(cap)) - elapsed - float(self._DEADLINE_SAFETY_SEC)
+        # Cap IS known here (guard above returned for unknown caps). If install/server already ate
+        # the budget, hand the agent a 1s deadline so it enters graceful finalization immediately
+        # rather than running blind into Harbor's hard kill with an empty result.
+        return int(effective) if effective > 0 else 1
+
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._run_started_monotonic = time.monotonic()
         if self.task_timeout_sec is None:
             probed = self._context_task_timeout_sec(context)
             if probed:
                 self.task_timeout_sec = probed
+        if self.task_timeout_sec is None:
+            self.task_timeout_sec = self._resolve_task_timeout_from_dataset(context)
         (self.logs_dir / "instruction.txt").write_text(instruction, encoding="utf-8")
         await environment.upload_file(self.logs_dir / "instruction.txt", "/logs/agent/instruction.txt")
 
@@ -889,7 +1064,14 @@ PY
             reached_terminal_result = True
         finally:
             try:
-                await self._capture_current_task_summary(environment)
+                # Only mark the captured summary as a cancellation when run() did NOT reach a
+                # terminal result (i.e. Harbor actually interrupted mid-exec). On a normal terminal
+                # finish this is a routine post-run snapshot, not a cancellation — so the disclosure
+                # ledger does not misread a genuine terminal `provider_unavailable` as a wall-clock
+                # cancellation (run_tb._failure_category keys on captured_after_cancellation).
+                await self._capture_current_task_summary(
+                    environment, interrupted=not reached_terminal_result
+                )
             except Exception as exc:
                 (getattr(self, "logger", None) or log).warning("Failed to capture in-container Ouroboros task summary: %s", exc)
             if not self.leave_server_running_for_verifier or not reached_terminal_result:

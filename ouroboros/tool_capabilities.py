@@ -11,6 +11,9 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "vcs_restore", "vcs_revert", "vcs_pull_ff", "vcs_rollback",
     "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
     "wait_task", "wait_tasks", "get_task_result",
+    # D#7 soft-join child controls (siblings of steer_task): inspect/decide a child's fate
+    # before finalizing (peek = pure read, discard = explicit abandon, cancel = real stop).
+    "cancel_task", "peek_task", "discard_child_result", "override_delegation_constraint",
     # Task-tree coordination must be in the round-one envelope so a parent can publish the
     # shared frame BEFORE fanning out interdependent children (no enable_tools detour).
     "tree_note", "tree_read",
@@ -24,11 +27,12 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "chat_history", "recent_tasks",
     "knowledge_read", "knowledge_write", "knowledge_list",
     "web_search",
-    "browse_page", "browser_action", "analyze_screenshot",
+    "browse_page", "browser_action", "analyze_screenshot", "view_image",
+    "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "send_user_message", "send_photo", "send_video",
     "switch_model",
     "request_restart", "promote_to_stable",
-    "advisory_review", "review_status", "task_acceptance_review",
+    "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
     # Heal mode blocks enable_tools, so repair/review tools must be core.
     "list_skills", "skill_review", "skill_preflight",
     "submit_skill_to_hub",
@@ -52,8 +56,10 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     # Task-tree coordination: a child reads the shared frame and raises beacons. tree_note
     # is a bounded local coordination write (no repo/control-plane mutation), so it is
     # allowed even for read-only subagents — same class as emitting progress.
-    "tree_note", "tree_read",
-    "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query",
+    "tree_note", "tree_read", "override_delegation_constraint",
+    "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
+    # Bounded media projection: writes derived frames only under artifact_store/video_frames.
+    "ocr_pdf", "youtube_transcript", "extract_video_frames",
 })
 
 ACTING_SUBAGENT_MODE: str = "acting_subagent"
@@ -74,9 +80,11 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result",
+    "verify_and_record",
     "knowledge_read", "knowledge_list",
-    "tree_note", "tree_read",
-    "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query",
+    "tree_note", "tree_read", "override_delegation_constraint",
+    "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
+    "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "list_available_tools",
 })
 

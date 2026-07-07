@@ -20,6 +20,49 @@ git -C /obo-repo config user.name  "Ouroboros"          2>/dev/null || true
 git -C /obo-repo config user.email "ouroboros@local.mac" 2>/dev/null || true
 cp /opt/oboros-settings-ro.json /obo-data/settings.json
 
+# --- Transport: install-in-image (musl/Alpine task images that have no prebuilt
+# 'oboros-env-musl' conda volume). Use the task image's system python rather than
+# upgrading it: upgrading python without the exact expat runtime broke pyexpat on
+# real Alpine images. Browser tools are disabled for this benchmark, so remove
+# Playwright from musl requirements instead of forcing unsupported musl wheels.
+if [ "${OBO_INSTALL_IN_IMAGE:-0}" = "1" ]; then
+  echo "[pro] install-in-image transport: installing Ouroboros into the task image" >&2
+  if [ -z "${OBO_INSTALL_READY:-}" ]; then
+    {
+      if command -v apk >/dev/null 2>&1; then
+        PY_BEFORE="$(python3 -V 2>&1 || true)"
+        apk add --no-cache py3-pip expat git curl bash build-base libffi-dev openssl-dev rust cargo
+      elif command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pip git curl bash build-essential
+      fi
+      PYBIN="$(command -v python3 || command -v python)"
+      PY_AFTER="$("$PYBIN" -V 2>&1 || true)"
+      echo "install-in-image: python before apk: ${PY_BEFORE:-unknown}" >&2
+      echo "install-in-image: python after apk:  ${PY_AFTER:-unknown}" >&2
+      "$PYBIN" -c "import xml.parsers.expat, pyexpat" || { echo "SOLVE_INFRA_SUSPECT reason=pyexpat_abi_mismatch" >&2; exit 87; }
+      "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
+      grep -ivE '^(playwright|playwright-stealth)([<=>[:space:]].*)?$' /opt/ouroboros-ro/requirements.txt > /tmp/reqs_musl.txt
+      if ! "$PYBIN" -m pip install --break-system-packages -r /tmp/reqs_musl.txt; then
+        echo "install-in-image: musl requirements failed; retrying without tree-sitter" >&2
+        "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
+        grep -ivE 'tree[-_]sitter' /tmp/reqs_musl.txt > /tmp/reqs_musl_no_ts.txt
+        "$PYBIN" -m pip install --break-system-packages -r /tmp/reqs_musl_no_ts.txt || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
+      fi
+      OBO_INSTALL_READY=1
+    } >/out/install.log 2>&1
+  fi
+  PYBIN="$(command -v python3 || command -v python)"
+  if PYTHONPATH=/obo-repo "$PYBIN" -c "import server" 2>>/out/install.log; then
+    OBO_PY="$PYBIN"
+    echo "[pro] install-in-image OK: OBO_PY=$OBO_PY ($("$OBO_PY" --version 2>&1))" >&2
+  else
+    echo "SOLVE_INFRA_SUSPECT reason=server_import_failed" >&2
+    echo "[pro] install-in-image FAILED (server import) — see /out/install.log" >&2
+    exit 87
+  fi
+fi
+
 touch /obo-data/.ouroboros_isolated_benchmark
 # Seed owner_chat_id BEFORE the budget reset. reset_per_task_budget() does a
 # load-modify-write that creates state.json with ONLY the zeroed budget keys on
@@ -95,6 +138,15 @@ PYEOF
 git -C "$WORK" -c advice.detachedHead=false checkout -q "$OBO_BASE_COMMIT" 2>/dev/null || true
 git -C "$WORK" reset -q --hard "$OBO_BASE_COMMIT" || { echo "[pro] FATAL: reset $WORK failed" >&2; exit 1; }
 
+# --- Gold-history strip (SWE-bench Pro issue #93, OPEN/unpatched): the public
+# jefzda images carry FUTURE git history, so `git show <fix>` / `git log --all` /
+# tags can recover the gold solution. Strip it (warn-only) via the shared helper
+# before the agent starts. OBO_STRIP_GOLD_HISTORY=0 disables it (debugging only).
+if [ "${OBO_STRIP_GOLD_HISTORY:-1}" = "1" ]; then
+  bash /opt/ouroboros-ro/devtools/benchmarks/swe_bench_pro/strip_gold_history.sh "$WORK" "$OBO_BASE_COMMIT" || true
+fi
+git -C "$WORK" ls-files --others --exclude-standard -z > /out/base_untracked.snapshot 2>/dev/null || true
+
 REPO_HEAD0="$(git -C /obo-repo rev-parse HEAD 2>/dev/null)"
 
 export OUROBOROS_SERVER_HOST=127.0.0.1
@@ -124,20 +176,153 @@ echo "[pro] server ready in $(( $(date +%s) - T0 ))s" >&2
 "$OBO_PY" -m ouroboros.cli --url http://127.0.0.1:8765 evolve stop >/dev/null 2>&1 || true
 
 cp /opt/oboros-settings-ro.json /obo-data/settings.json   # Close the short window where the model could be overwritten in settings.
-echo "[pro] ROOT-RUN $IID (self_modification; root digs /app via user_files (HOME=/); post-task evolution=native)" >&2
+# OPTIONAL pre-task self-evolution phase (default OFF). Runs ONLY when the driver
+# passed --pretask-evolution (OBO_PRETASK_EVOLUTION=1); the baseline path skips
+# this entire block and behaves exactly as before.
+if [ "${OBO_PRETASK_EVOLUTION:-0}" = "1" ]; then
+  git config --global --add safe.directory /obo-repo 2>/dev/null || true
+  git config --global --add safe.directory "$WORK" 2>/dev/null || true
+  echo "[pro] PRETASK-EVOLUTION $IID start (task-specific; repo=/app; wait_max=${OBO_PRETASK_EVOLUTION_WAIT_MAX:-0}s; solve_steps=${OBO_SOLVE_STEP_BUDGET:-0})" >&2
+  PRE_EVO_HEAD0="$(git -C /obo-repo rev-parse HEAD 2>/dev/null || echo '')"
+  "$OBO_PY" -m ouroboros.cli --url http://127.0.0.1:8765 evolve start "$(cat /opt/pretask_evolution_prompt.txt)" \
+    >/out/pretask_evolution_start.json 2>/out/pretask_evolution_start.stderr || true
+  "$OBO_PY" - "${OBO_PRETASK_EVOLUTION_WAIT_MAX:-0}" "$PRE_EVO_HEAD0" >/out/pretask_evolution.json 2>/out/pretask_evolution_wait.stderr <<'PYEOF' || printf '{"absorbed":false,"reason":"error","cycles":0}' >/out/pretask_evolution.json
+import json, os, subprocess, sys, time, urllib.request
+MAX = int(sys.argv[1] or 0)
+SHA0 = str(sys.argv[2] or "")
+IDLE_GRACE = 240
+URL = "http://127.0.0.1:8765/api/state"
+CAMP = "/obo-data/state/evolution_campaign.json"
+def camp():
+    try: return json.load(open(CAMP))
+    except Exception: return {}
+def absorbed():
+    try: return int(camp().get("absorbed_cycles_done") or 0)
+    except Exception: return 0
+def cycles_done():
+    try: return int(camp().get("cycles_done") or 0)
+    except Exception: return 0
+def head():
+    try: return subprocess.run(["git", "-C", "/obo-repo", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15).stdout.strip()
+    except Exception: return ""
+def state():
+    try:
+        with urllib.request.urlopen(URL, timeout=5) as r: return json.loads(r.read().decode())
+    except Exception: return {}
+def pending_restart():
+    at = camp().get("active_transaction") or {}
+    return bool(str(at.get("commit_sha") or "").strip() and not at.get("restart_verified"))
+def is_idle(st):
+    return bool(st and st.get("supervisor_ready")
+                and int(st.get("pending_count") or 0) == 0
+                and int(st.get("running_count") or 0) == 0)
+EVO0 = absorbed()
+CYC0 = cycles_done()
+t0 = time.time()
+reason = "timeout"
+while MAX <= 0 or time.time() - t0 < MAX:
+    c = absorbed()
+    sha = head()
+    if c > EVO0 and sha and sha != SHA0:
+        d2 = time.time() + 240
+        while time.time() < d2:
+            st = state()
+            if st.get("supervisor_ready") and int(st.get("workers_total") or 0) > 0:
+                break
+            time.sleep(2)
+        reason = "absorbed"
+        break
+    # A no-commit/degraded evolution cycle may complete without increasing the
+    # absorbed counter and the supervisor can immediately enqueue the same
+    # objective again. For pre-task evolution, one completed cycle is enough:
+    # stop and move to solve instead of spending the whole benchmark repeating.
+    if cycles_done() > CYC0:
+        reason = "degraded" if pending_restart() else ("cycle_completed" if sha and sha != SHA0 else "no_commit_cycle")
+        break
+    st = state()
+    if time.time() - t0 > IDLE_GRACE and is_idle(st):
+        if pending_restart():
+            time.sleep(8)
+            if is_idle(state()) and pending_restart() and absorbed() == EVO0:
+                reason = "degraded"
+                break
+        else:
+            reason = "no_promotion"
+            break
+    time.sleep(5)
+at = camp().get("active_transaction") or {}
+print(json.dumps({
+    "absorbed": reason == "absorbed",
+    "reason": reason,
+    "cycles_before": EVO0,
+    "cycles_after": absorbed(),
+    "campaign_cycles_before": CYC0,
+    "campaign_cycles_after": cycles_done(),
+    "degraded": pending_restart(),
+    "active_tx_commit": str(at.get("commit_sha") or "")[:8],
+    "sha_before": SHA0,
+    "sha_after": head(),
+    "elapsed_sec": round(time.time() - t0, 3),
+    "wait_max_sec": MAX,
+}))
+PYEOF
+  "$OBO_PY" -m ouroboros.cli --url http://127.0.0.1:8765 evolve stop >/out/pretask_evolution_stop.json 2>/out/pretask_evolution_stop.stderr || true
+  "$OBO_PY" - <<'PYEOF' >&2 2>/dev/null || true
+import json
+try: d = json.load(open('/out/pretask_evolution.json'))
+except Exception: d = {}
+print(f"[pro] pretask-evolution: absorbed={d.get('absorbed',False)} cycles={d.get('cycles_after',0)} reason={d.get('reason','?')} degraded={d.get('degraded',False)} elapsed={d.get('elapsed_sec','?')}")
+PYEOF
+  if ! PYTHONPATH=/obo-repo "$OBO_PY" -c "import ouroboros.cli, ouroboros.agent, ouroboros.loop, ouroboros.config, ouroboros.subagent_worktrees, ouroboros.tools.subagent_integration, ouroboros.workspace_executor, ouroboros.contracts.task_constraint, ouroboros.retention, server, supervisor.queue" 2>/out/pretask_health.err; then
+    echo "[pro] PRETASK HEALTH-GATE FAILED - rollback self-edit to $PRE_EVO_HEAD0" >&2
+    sed 's/^/[pro]   pretask health: /' /out/pretask_health.err >&2 2>/dev/null | head -8
+    git -C /obo-repo diff "$PRE_EVO_HEAD0" > /out/pretask_rejected_self_edit.diff 2>/dev/null || true
+    git -C /obo-repo reset -q --hard "$PRE_EVO_HEAD0" 2>/dev/null || true
+    git -C /obo-repo clean -qfd 2>/dev/null || true
+    kill "$SRV" 2>/dev/null || true
+    "$OBO_PY" /obo-repo/server.py >>/out/server.log 2>&1 &
+    SRV=$!
+    T0=$(date +%s); R=0
+    while [ $(( $(date +%s) - T0 )) -lt "$READY_MAX" ]; do
+      if ready_probe; then R=1; break; fi
+      kill -0 "$SRV" 2>/dev/null || { echo "[pro] server died after pretask rollback" >&2; tail -30 /out/server.log >&2; exit 1; }
+      sleep 3
+    done
+    [ "$R" = 1 ] || { echo "[pro] not ready after pretask rollback" >&2; tail -30 /out/server.log >&2; exit 1; }
+  else
+    echo "[pro] pretask health-gate OK" >&2
+  fi
+fi
+if [ "${OBO_SELFIMPROVE:-0}" = "1" ]; then
+  echo "[pro] ROOT-RUN $IID (self_modification; /app as active external workspace; post-task evolution=native)" >&2
+else
+  echo "[pro] ROOT-RUN $IID (self_modification; /app as active external workspace; post-task evolution=disabled baseline)" >&2
+fi
+# Tool denylist + per-task memory mode are passthrough knobs (run_pro --disable-tools / --memory-mode).
+# Defaults preserve the original tool behavior (full web/browser/vision + claude_code_edit disabled).
+OBO_DISABLE_TOOLS="${OBO_DISABLE_TOOLS:-web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit}"
+# Benchmark default is a FRESH child memory drive (v6.56.0): the measured artifact
+# is the harness on this task, not memory accreted across tasks. Explicitly export
+# OBO_MEMORY_MODE=shared/forked to opt back into carried memory.
+OBO_MEMORY_MODE="${OBO_MEMORY_MODE:-empty}"
+# The solve runs with /app as the ACTIVE EXTERNAL WORKSPACE (v6.56.0): contextual
+# repo tools resolve against the task repo and the runtime captures a workspace
+# patch artifact, instead of the legacy rootless "dig /app via user_files" mode.
+# An explicitly exported EMPTY OBO_SOLVE_WORKSPACE_ROOT restores the legacy mode.
+OBO_SOLVE_WORKSPACE_ROOT="${OBO_SOLVE_WORKSPACE_ROOT-/app}"
+SOLVE_ARGS=(
+  --jsonl --result-json-out /out/solve_result.json --timeout "${OBO_SOLVE_TIMEOUT:-3000}"
+  --disable-tools "$OBO_DISABLE_TOOLS"
+  --memory-mode "$OBO_MEMORY_MODE"
+  --task-metadata-json '{"budget_profile": {"improvement_policy": "until_deadline", "cost_hard_stop_pct": 0}}'
+)
+[ -n "$OBO_SOLVE_WORKSPACE_ROOT" ] && SOLVE_ARGS+=(--workspace "$OBO_SOLVE_WORKSPACE_ROOT")
+echo "[pro] solve tools-disabled=[$OBO_DISABLE_TOOLS] memory=[$OBO_MEMORY_MODE] workspace=[${OBO_SOLVE_WORKSPACE_ROOT:-none}]" >&2
 "$OBO_PY" -m ouroboros.cli --url http://127.0.0.1:8765 run \
-  --jsonl --result-json-out /out/solve_result.json --timeout "${OBO_SOLVE_TIMEOUT:-3000}" \
+  "${SOLVE_ARGS[@]}" \
   "$(cat /opt/problem_statement.txt)" >/out/solve_events.jsonl 2>/out/solve.stderr || true
-JUNK_RE='appendonlydir|\.rdb$|\.aof$|\.manifest$|\.log$|\.tmp$|\.pid$|\.sock$|(^|/)node_modules/|__pycache__|\.pyc$|\.pyo$|\.pytest_cache|\.ruff_cache|\.mypy_cache|/\.cache/|/dist/|/build/|\.DS_Store|(^|/)\.coverage$|coverage\.xml$|/htmlcov/'
-git -C "$WORK" add -A 2>/dev/null || true
-git -C "$WORK" status --porcelain >/out/app_status.txt 2>/dev/null || true     # ARCHIVE: what the agent left in /app
-git -C "$WORK" diff --cached --name-only "$OBO_BASE_COMMIT" 2>/dev/null | grep -E "$JUNK_RE" | while IFS= read -r f; do
-  git -C "$WORK" reset -q -- "$f" 2>/dev/null
-done
-git -C "$WORK" diff --cached --numstat "$OBO_BASE_COMMIT" 2>/dev/null | awk -F'\t' '$1=="-" && $2=="-" {print $3}' | while IFS= read -r f; do
-  [ -n "$f" ] && git -C "$WORK" reset -q -- "$f" 2>/dev/null
-done
-git -C "$WORK" diff --cached --binary "$OBO_BASE_COMMIT" >/out/patch.diff 2>/dev/null || true
+bash /opt/ouroboros-ro/devtools/benchmarks/swe_bench_pro/capture_patch.sh "$WORK" "$OBO_BASE_COMMIT" /out/patch.diff /out/base_untracked.snapshot 2>/out/capture_patch.stderr || true
+cp /out/patch.status.txt /out/app_status.txt 2>/dev/null || true     # ARCHIVE: what the agent left in /app
 git -C "$WORK" reset -q 2>/dev/null || true                                    # restore the index (leave the working tree untouched)
 git -C "$WORK" diff --binary "$OBO_BASE_COMMIT" >/out/patch_tracked_only.diff 2>/dev/null || true
 [ "${OBO_ARCHIVE_APP:-0}" = "1" ] && tar czf /out/app_state.tgz -C "$WORK" --exclude=.git --exclude=node_modules . 2>/dev/null || true
@@ -147,8 +332,9 @@ echo "[pro] ROOT-RUN patch=$(wc -c < /out/patch.diff)B events=$SOLVE_EVENTS task
 [ "$SOLVE_EVENTS" -lt 2 ] && echo "[pro] WARNING: SOLVE_INFRA_SUSPECT (too few events - possible server/network failure?)" >&2 || true
 
 ABSORB_MAX="${OBO_ABSORB_MAX:-1800}"
-echo "[pro] wait-for-absorb: max=${ABSORB_MAX}s (native post-task evolution)" >&2
-"$OBO_PY" - "$ABSORB_MAX" >/out/absorb.json 2>/dev/null <<'PYEOF' || printf '{"absorbed":false,"reason":"error","cycles":0}' >/out/absorb.json
+if [ "${OBO_SELFIMPROVE:-0}" = "1" ]; then
+  echo "[pro] wait-for-absorb: max=${ABSORB_MAX}s (native post-task evolution)" >&2
+  "$OBO_PY" - "$ABSORB_MAX" >/out/absorb.json 2>/dev/null <<'PYEOF' || printf '{"absorbed":false,"reason":"error","cycles":0}' >/out/absorb.json
 import json, os, subprocess, sys, time, urllib.request
 MAX = int(sys.argv[1]); IDLE_GRACE = 180; URL = "http://127.0.0.1:8765/api/state"
 CAMP = "/obo-data/state/evolution_campaign.json"
@@ -197,6 +383,9 @@ print(json.dumps({"absorbed": reason == "absorbed", "reason": reason, "cycles": 
                   "degraded": degraded, "active_tx_commit": str(at.get("commit_sha") or "")[:8],
                   "evo_before": EVO0, "sha_before": SHA0, "sha_after": head()}))
 PYEOF
+else
+  printf '{"absorbed":false,"reason":"evolution_disabled","cycles":0,"degraded":false}\n' >/out/absorb.json
+fi
 "$OBO_PY" - <<'PYEOF' >&2 2>/dev/null || true
 import json
 try: d = json.load(open('/out/absorb.json'))
@@ -256,4 +445,28 @@ PYEOF
 echo "[pro] self-edit (obo-repo): HEAD before=$REPO_HEAD0 after=$(git -C /obo-repo rev-parse HEAD 2>/dev/null)" >&2
 git -C /obo-repo status --porcelain 2>/dev/null | head -20 | sed 's/^/[pro]   /' >&2
 echo "[pro] knowledge files: $(find /obo-data/memory/knowledge -type f 2>/dev/null | wc -l | tr -d ' ')" >&2
+
+# B3 (strictly diagnostic, log-only — never affects solve/grading/evolution):
+# detect the web-shadow class deterministically. With PYTHONPATH=/obo-repo, a
+# target top-level package whose name also exists in the Ouroboros repo (`web`,
+# `server`, `tests`, ...) gets shadowed — `import web` in $WORK resolves into
+# Ouroboros, which surfaces as a pytest collection/usage error (exit 4) on the
+# target's own tests. R2 fixes the ROOT (it scrubs /obo-repo from PYTHONPATH for
+# target/user_files commands at runtime); this note just makes the class visible.
+"$OBO_PY" - "$WORK" <<'PYEOF' >&2 2>/dev/null || true
+import pathlib, sys
+work = pathlib.Path(sys.argv[1]); repo = pathlib.Path("/obo-repo")
+def has(base, name):
+    return (base / name).is_dir() or (base / (name + ".py")).exists()
+shadowed = [n for n in ("web", "server", "ouroboros", "supervisor", "tools", "tests", "docs", "scripts")
+            if has(work, n) and has(repo, n)]
+if shadowed:
+    print(f"[pro] WEB_SHADOW_DIAGNOSTIC: target {work} and /obo-repo share top-level name(s) {shadowed}; "
+          f"with /obo-repo on PYTHONPATH an `import {shadowed[0]}` in the target resolves into Ouroboros "
+          f"(manifests as pytest exit=4 / collection error on the target's tests). R2 scrubs /obo-repo from "
+          f"PYTHONPATH for target (user_files) commands so the agent sees the target's own module.")
+else:
+    print(f"[pro] WEB_SHADOW_DIAGNOSTIC: no top-level name collision between {work} and /obo-repo.")
+PYEOF
+
 kill "$SRV" 2>/dev/null || true

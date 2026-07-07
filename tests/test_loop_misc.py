@@ -18,12 +18,15 @@ from types import SimpleNamespace
 import ouroboros.loop as loop_mod
 from ouroboros.loop import (
     _drain_incoming_messages,
+    _latch_final_answer_marker,
     _maybe_inject_self_check,
     _maybe_inject_time_budget_milestone,
     _run_task_acceptance_review_once,
+    _set_acceptance_decision,
     _skill_finalization_message,
     _skill_names_touched_by_trace,
     _task_acceptance_eligible,
+    _server_web_allowed_by_task,
     run_llm_loop,
 )
 from ouroboros.skill_loader import (
@@ -109,7 +112,7 @@ def test_time_budget_milestone_injects_once_per_threshold(monkeypatch):
 
     from datetime import datetime, timezone
 
-    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 5, 1, tzinfo=timezone.utc))
+    monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: datetime(2026, 6, 10, 5, 1, tzinfo=timezone.utc))
 
     injected = _maybe_inject_time_budget_milestone(
         messages,
@@ -135,7 +138,7 @@ def test_intrinsic_pacing_injects_without_deadline(monkeypatch):
 
     monkeypatch.delenv("OUROBOROS_PACING_INTERVAL_SEC", raising=False)
     # 20 min elapsed, default interval 600s -> bucket 2.
-    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 0, 20, tzinfo=timezone.utc))
+    monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: datetime(2026, 6, 10, 0, 20, tzinfo=timezone.utc))
 
     injected = _maybe_inject_time_budget_milestone(
         messages, SimpleNamespace(_ctx=ctx), round_idx=7,
@@ -149,6 +152,88 @@ def test_intrinsic_pacing_injects_without_deadline(monkeypatch):
     assert injected_again is False  # same bucket -> not repeated
     assert "[PACING" in messages[-1]["content"]
     assert "Rounds so far: 7" in messages[-1]["content"]
+    assert "FINAL ANSWER:" in messages[-1]["content"]
+
+
+def test_latch_final_answer_marker_captures_explicit_marker_only():
+    trace = {"tool_calls": [{"tool": "read_file"}]}
+    _latch_final_answer_marker(trace, "analysis\nFINAL ANSWER: 123")
+    assert trace["best_valid_final_answer"] == "123"
+    assert trace["best_valid_final_answer_tools"] == 1
+    _latch_final_answer_marker(trace, "answer-ish prose without marker")
+    assert trace["best_valid_final_answer"] == "123"
+
+
+def test_latch_final_answer_marker_counts_same_turn_tool_calls():
+    trace = {"tool_calls": [{"tool": "read_file"}]}
+    current = [{"function": {"name": "run_command"}}, {"function": {"name": "verify_and_record"}}]
+    _latch_final_answer_marker(trace, "FINAL ANSWER: draft", current_tool_calls=current)
+    assert trace["best_valid_final_answer"] == "draft"
+    # Same-turn tool calls are newer grounding and must invalidate this latch unless
+    # the model re-emits the marker after those tools complete.
+    assert trace["best_valid_final_answer_tools"] == 1
+
+
+def test_server_web_allowed_respects_task_resource_contract():
+    assert _server_web_allowed_by_task(SimpleNamespace(task_contract={})) is True
+    assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"allowed_resources": {"web": False}})) is False
+    assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"allowed_resources": {"network": False}})) is False
+    assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"disabled_tools": ["web_search"]})) is True
+
+
+def test_set_acceptance_decision_preserves_agent_stance():
+    trace = {
+        "acceptance_decision": {
+            "status": "rejected",
+            "agent_disposition": "rejected",
+            "agent_rationale": "Scope drift.",
+        }
+    }
+    _set_acceptance_decision(trace, {
+        "status": "accepted",
+        "source": "task_acceptance_review",
+        "rationale": "No actionable changes.",
+    })
+
+    assert trace["acceptance_decision"]["status"] == "accepted"
+    assert trace["acceptance_decision"]["agent_disposition"] == "rejected"
+    assert trace["acceptance_decision"]["agent_rationale"] == "Scope drift."
+
+
+def test_task_acceptance_review_tool_result_lifts_agent_decision_into_trace():
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    trace = {"tool_calls": []}
+    messages = []
+    result = {
+        "request": {},
+        "actors": [],
+        "parsed_findings": [],
+        "aggregate_signal": "PASS",
+        "agent_decision": {
+            "disposition": "deferred",
+            "rationale": "Waiting for benchmark smoke.",
+            "source": "agent_task_acceptance_review_tool",
+        },
+    }
+
+    process_tool_results(
+        [{
+            "fn_name": "task_acceptance_review",
+            "tool_call_id": "call-1",
+            "result": json.dumps(result),
+            "is_error": False,
+            "args_for_log": {},
+            "tool_args": {},
+            "result_meta": {"status": "ok"},
+        }],
+        messages,
+        trace,
+        emit_progress=lambda _msg: None,
+    )
+
+    assert trace["acceptance_decision"]["agent_disposition"] == "deferred"
+    assert trace["acceptance_decision"]["agent_rationale"] == "Waiting for benchmark smoke."
 
 
 def test_intrinsic_pacing_disabled_when_interval_zero(monkeypatch):
@@ -157,7 +242,7 @@ def test_intrinsic_pacing_disabled_when_interval_zero(monkeypatch):
     from datetime import datetime, timezone
 
     monkeypatch.setenv("OUROBOROS_PACING_INTERVAL_SEC", "0")
-    monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 1, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: datetime(2026, 6, 10, 1, 0, tzinfo=timezone.utc))
 
     assert _maybe_inject_time_budget_milestone(messages, SimpleNamespace(_ctx=ctx), round_idx=3) is False
 
@@ -173,7 +258,8 @@ def test_deadline_local_finalize_gate(monkeypatch):
         return ("BEST EFFORT", {"reason_code": reason_code}, {})
 
     monkeypatch.setattr(loop_mod, "_forced_final_answer", _fake_final)
-    monkeypatch.setattr(loop_mod, "get_finalization_grace_sec", lambda *a, **k: 120)
+    # v6.54.4: the gate consults the task_pacing effective reserve SSOT.
+    monkeypatch.setattr("ouroboros.task_pacing.effective_finalization_reserve_sec", lambda ctx: 120.0)
     monkeypatch.setattr(loop_mod, "utc_now", lambda: datetime(2026, 6, 10, 9, 59, 0, tzinfo=timezone.utc))
 
     # Far from deadline (10:30 vs now 09:59 -> ~31 min left > 120s) -> no finalize.
@@ -277,11 +363,26 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     assert "Do not mention this review" in messages2[-1]["content"]
     # The CAPSULE is bounded (injected once), but the review is NOT yet terminal —
     # so the REVISED final deliverable still gets reviewed (round-4 state-machine fix).
-    assert ctx2._task_acceptance_capsule_injected is True
+    assert getattr(ctx2, '_task_acceptance_improvement_passes', 0) == 1  # v6.54.4: counter replaced the boolean latch
     assert getattr(ctx2, "_task_acceptance_reviewed", False) is False
+    assert trace2["acceptance_decision"]["status"] == "revision_requested"
+
+    # If the revised answer is accepted, the terminal decision overwrites the
+    # earlier revision_requested state rather than leaving stale telemetry.
+    monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
+    trace_ok = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    messages_ok = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    result_ok = _run_task_acceptance_review_once(
+        tools=tools2, content="revised", task_id="t", task_type="task",
+        llm_trace=trace_ok, drive_root=None, messages=messages_ok, emit_progress=lambda _m: None,
+    )
+    assert result_ok is False
+    assert trace_ok["acceptance_decision"]["status"] == "accepted"
+    tools2._ctx._task_acceptance_reviewed = False
 
     # (c) the revised final deliverable IS re-reviewed (verdict on the SHIPPED answer,
     # not the stale pre-revision one), and the one capsule is not injected again.
+    monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: blocked)
     trace3 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages3 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     result3 = _run_task_acceptance_review_once(
@@ -853,6 +954,55 @@ def test_run_llm_loop_appends_orphan_note_when_finalizing_with_unhandled_child(t
     # The agent's prose is preserved AND the loud orphan note is appended (no silent loss).
     assert result.startswith("child1 is still running; I will finalize now.")
     assert "child1" in result and "NOTE: finalized" in result
+
+
+def test_run_llm_loop_forces_best_effort_after_child_absorption_reminder(tmp_path, monkeypatch):
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.registry import ToolRegistry
+
+    write_task_result(
+        tmp_path,
+        "child1",
+        STATUS_RUNNING,
+        parent_task_id="parent1",
+        root_task_id="parent1",
+        delegation_role="subagent",
+        role="reviewer",
+        result="still collecting evidence",
+    )
+    messages = [{"role": "user", "content": "inspect"}]
+    calls = {"count": 0}
+    progress = []
+    tools = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    tools._ctx.task_contract = {"delegation_budget": {"may_delegate": True, "may_fan_out": True}}
+
+    class FakeLLM:
+        def default_model(self):
+            return "test-model"
+
+    def fake_call_llm_with_retry(_llm, _request_messages, *_args, **_kwargs):
+        calls["count"] += 1
+        return {"role": "assistant", "content": f"answer {calls['count']}"}, 0.0
+
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call_llm_with_retry)
+
+    result, usage, trace = run_llm_loop(
+        messages=messages,
+        tools=tools,
+        llm=FakeLLM(),
+        drive_logs=tmp_path,
+        emit_progress=progress.append,
+        incoming_messages=queue.Queue(),
+        task_id="parent1",
+        drive_root=tmp_path,
+    )
+
+    assert usage["reason_code"] == "children_unabsorbed"
+    assert usage["_best_effort_extracted"] is True
+    assert "Child absorption reminder injected" in "\n".join(progress)
+    assert "Child absorption reminder injected" in "\n".join(trace["reasoning_notes"])
+    assert "child task(s) not explicitly absorbed" in result
+    assert calls["count"] == 4
 
 
 def test_run_llm_loop_does_not_include_current_subagent_in_own_handoff(tmp_path, monkeypatch):

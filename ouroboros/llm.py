@@ -3,25 +3,88 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 import os
 import re
 import time
+import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.guardrails_llm import apply_output as _guardrails_apply_output
-from ouroboros.guardrails_llm import enforce_input as _guardrails_enforce_input
 from ouroboros.provider_models import PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity
-from ouroboros.telemetry import llm_span, record_llm_response
 from ouroboros.utils import in_worker_process
 
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3.5-flash"
 _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
+
+
+def supports_message_cache_control(model: str) -> bool:
+    """Providers whose OpenRouter route honors message-level cache_control breakpoints.
+
+    Single source of truth for the prompt-cache family check (was an inline hardcoded
+    ``startswith`` list at the request-build site).
+    """
+    m = str(model or "").strip().lstrip("~")
+    return m.startswith("anthropic/") or m.startswith("google/gemini-")
+
+
+def _reasoning_signature_portable_across_or_providers(model: str) -> bool:
+    """Families whose replayed reasoning signatures SURVIVE an OpenRouter same-model
+    cross-provider failover — so the ``allow_fallbacks=false`` continuity pin is
+    unnecessary and would only defeat rate-limit resilience by stranding a turn on one
+    throttled upstream when a healthy sibling endpoint could serve it.
+
+    Verified live via a same-model replay probe (2026-06: generate reasoning forcing
+    provider A, replay the assistant turn forcing each sibling provider B, observe HTTP
+    200): Anthropic thinking-block signatures port across Anthropic / Bedrock / Vertex /
+    Azure; Gemini reasoning ports across Google Vertex / AI-Studio; OpenAI
+    encrypted-reasoning items port across OpenAI / Azure. Other families (e.g.
+    ``z-ai/glm``, ``deepseek``) are UNVERIFIED and keep the conservative pin; the reactive
+    ``_openrouter_signature_retry_kwargs`` 400 strip-and-retry is the safety net for every
+    family if a cross-provider switch ever rejects a replayed signature."""
+    m = str(model or "").strip().lstrip("~")
+    return (
+        m.startswith("anthropic/")
+        or m.startswith("google/gemini-")
+        or m.startswith("openai/")
+    )
+
+
+_OR_PROVIDER_PRESETS = {
+    # Everyday resilience: fail over to another PROVIDER of the SAME model on a
+    # rate-limit/5xx (the model — and its context window — is unchanged), while the
+    # default sticky provider keeps the prompt cache warm. No throughput hopping.
+    "resilience": {"allow_fallbacks": True},
+    # Reproducibility (fixed-model benchmark runs): pin, no provider failover.
+    "repro": {"allow_fallbacks": False},
+}
+
+
+def _resolve_or_provider() -> Dict[str, Any]:
+    """Resolve ``OUROBOROS_OR_PROVIDER`` (a preset name or a raw JSON object) into an
+    OpenRouter ``provider`` routing dict. Empty/unset/invalid -> ``{}`` (no routing)."""
+    raw = (os.environ.get("OUROBOROS_OR_PROVIDER") or "").strip()
+    if not raw:
+        return {}
+    preset = _OR_PROVIDER_PRESETS.get(raw.lower())
+    if preset is not None:
+        return dict(preset)
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
 _OPTIONAL_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+# Droppable optional request params = sampling + structured-output + effort hint.
+# response_format is request INTENT, not required semantics: every consumer keeps a
+# text-parse fallback (e.g. the safety supervisor's bracket-scan). reasoning_effort
+# is likewise a hint — a provider that names-and-rejects it (e.g. an older model
+# refusing "none") gets the same one-shot strip-and-retry instead of failing the
+# call outright (review round 6: a rejected safety call would fail CLOSED and
+# block benign commands).
+_OPTIONAL_DROPPABLE_PARAMS = _OPTIONAL_SAMPLING_PARAMS + ("response_format", "reasoning_effort")
 
 
 class LocalContextTooLargeError(RuntimeError):
@@ -431,10 +494,10 @@ class LLMClient:
         # errors (e.g. "...that support tool use") do not falsely match.
         if "no endpoints found" in text and (
             "requested parameter" in text
-            or any(param in text for param in _OPTIONAL_SAMPLING_PARAMS)
+            or any(param in text for param in _OPTIONAL_DROPPABLE_PARAMS)
         ):
             return True
-        if not any(param in text for param in _OPTIONAL_SAMPLING_PARAMS):
+        if not any(param in text for param in _OPTIONAL_DROPPABLE_PARAMS):
             return False
         return any(
             marker in text
@@ -483,7 +546,7 @@ class LLMClient:
     ) -> Optional[Dict[str, Any]]:
         if not cls._parameter_rejection_error(exc):
             return None
-        present = {param for param in _OPTIONAL_SAMPLING_PARAMS if param in payload}
+        present = {param for param in _OPTIONAL_DROPPABLE_PARAMS if param in payload}
         if not present:
             return None
         cls._remember_rejected_params(model_id, present)
@@ -491,7 +554,7 @@ class LLMClient:
         for param in present:
             retry_payload.pop(param, None)
         log.warning(
-            "Retrying %s without optional sampling parameter(s): %s",
+            "Retrying %s without optional request parameter(s): %s",
             model_id or "(unknown model)",
             ", ".join(sorted(present)),
         )
@@ -504,30 +567,6 @@ class LLMClient:
             if model_name.startswith(prefix):
                 return provider, model_name[len(prefix):].strip()
         return "openrouter", model_name
-
-    @staticmethod
-    def _resolve_openai_compatible_credentials() -> Tuple[str, str]:
-        """Resolve credentials for OpenAI-compatible routing with dedicated priority."""
-        compatible_key = (os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-        compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-        if compatible_key or compatible_base_url:
-            return compatible_key, compatible_base_url
-
-        legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
-        legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
-        return legacy_key, legacy_base_url
-
-    @staticmethod
-    def _sdk_api_key(target: Dict[str, Any]) -> str:
-        """Return API key value safe for OpenAI SDK initialization."""
-        api_key = str(target.get("api_key") or "")
-        provider = str(target.get("provider") or "")
-        # openai-python rejects empty api_key at client construction time.
-        # Some OpenAI-compatible servers run without auth, so we pass a
-        # placeholder key only to satisfy SDK validation.
-        if not api_key and provider == "openai-compatible":
-            return "compat-no-auth"
-        return api_key
 
     @staticmethod
     def _qualified_model_name(provider: str, resolved_model: str) -> str:
@@ -611,13 +650,16 @@ class LLMClient:
             }
 
         if provider == "openai-compatible":
-            compatible_key, compatible_base_url = self._resolve_openai_compatible_credentials()
+            compatible_key = (os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+            compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
+            legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+            legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
             return {
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": compatible_key,
-                "base_url": compatible_base_url,
+                "api_key": compatible_key or legacy_key,
+                "base_url": compatible_base_url or legacy_base_url,
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -646,7 +688,7 @@ class LLMClient:
 
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
-        api_key = self._sdk_api_key(target)
+        api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
@@ -667,6 +709,58 @@ class LLMClient:
             self._remote_clients[cache_key] = client
         return client
 
+    def probe_oversized_context(
+        self, model: str, content: str, *,
+        base_url: str = "", max_output_tokens: int = 8, timeout: float = 20.0,
+        api_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Capability probe: send ONE deliberately over-window request on the model's
+        OpenAI-compatible route and report the RAW outcome for window classification.
+
+        This is a capability check, NOT a chat turn: it deliberately bypasses the
+        chat/usage/observability path (a probe must not pollute task usage or count as
+        an LLM round) and NEVER raises. The expected free case is a 4xx pre-inference
+        reject whose body carries the limit; a rare 200-accept returns the echo +
+        prompt_tokens (the caller treats it as possibly-paid -> owner-ack, never a
+        silent confirm). When an explicit ``base_url`` is given (Settings save/toggle
+        passes the route being fingerprinted) it overrides the env-resolved one so a
+        route change verifies the NEW endpoint. Returns
+        ``{ok, status_code, body, echoed_text, usage_prompt}``.
+        """
+        try:
+            target = self._resolve_remote_target(model)
+            if str(base_url or "").strip():
+                target = {**target, "base_url": str(base_url).strip()}
+            if api_key is not None:
+                target = {**target, "api_key": api_key}
+            oai = self._get_remote_client(target)
+            # resolved_model is the provider REQUEST model ("gpt-5.5"), not the
+            # slash-qualified usage/tracking name the API would reject.
+            resolved_model = str(target.get("resolved_model") or model.split("::")[-1])
+            provider = str(target.get("provider") or "")
+        except Exception as exc:  # pragma: no cover - setup failure -> fail-closed
+            return {"ok": False, "status_code": None, "body": f"probe setup failed: {type(exc).__name__}",
+                    "echoed_text": "", "usage_prompt": 0}
+        # Direct OpenAI GPT-5/o-series reject ``max_tokens`` and require
+        # ``max_completion_tokens``; other OpenAI-compatible stacks take max_tokens.
+        cap = {"max_completion_tokens": max_output_tokens} if provider == "openai" else {"max_tokens": max_output_tokens}
+        try:
+            resp = oai.with_options(timeout=timeout).chat.completions.create(
+                model=resolved_model, messages=[{"role": "user", "content": content}], temperature=0, **cap,
+            )
+            echoed, usage_prompt = "", 0
+            try:
+                echoed = str(resp.choices[0].message.content or "")
+                usage_prompt = int(getattr(getattr(resp, "usage", None), "prompt_tokens", 0) or 0)
+            except Exception:
+                pass
+            return {"ok": True, "status_code": 200, "body": "", "echoed_text": echoed, "usage_prompt": usage_prompt}
+        except Exception as exc:
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            body = str(getattr(exc, "message", "") or getattr(exc, "body", "") or str(exc))
+            return {"ok": False, "status_code": status if isinstance(status, int) else None,
+                    "body": body, "echoed_text": "", "usage_prompt": 0}
+
     def _get_local_client(self):
         port = int(os.environ.get("LOCAL_MODEL_PORT", "8766"))
         if self._local_client is None or self._local_port != port:
@@ -681,7 +775,7 @@ class LLMClient:
 
     def _get_async_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
-        api_key = self._sdk_api_key(target)
+        api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
@@ -705,8 +799,12 @@ class LLMClient:
     @staticmethod
     def _no_proxy_timeout(read_timeout: Optional[float] = None):
         import httpx
+        from ouroboros.config import get_llm_transport_read_timeout_sec
 
-        read_write = float(read_timeout) if read_timeout and read_timeout > 0 else 3600.0
+        read_write = (
+            float(read_timeout) if read_timeout and read_timeout > 0
+            else get_llm_transport_read_timeout_sec()
+        )
         return httpx.Timeout(connect=30.0, read=read_write, write=read_write, pool=30.0)
 
     @classmethod
@@ -720,7 +818,7 @@ class LLMClient:
             timeout=cls._no_proxy_timeout(timeout),
         )
         oa_client = OpenAI(
-            api_key=cls._sdk_api_key(target),
+            api_key=str(target.get("api_key") or ""),
             base_url=str(target.get("base_url") or ""),
             default_headers=dict(target.get("default_headers") or {}),
             http_client=http_client,
@@ -739,7 +837,7 @@ class LLMClient:
             timeout=cls._no_proxy_timeout(timeout),
         )
         oa_client = AsyncOpenAI(
-            api_key=cls._sdk_api_key(target),
+            api_key=str(target.get("api_key") or ""),
             base_url=str(target.get("base_url") or ""),
             default_headers=dict(target.get("default_headers") or {}),
             http_client=http_client,
@@ -768,7 +866,17 @@ class LLMClient:
             else:
                 for block in content:
                     if isinstance(block, dict):
-                        if allow_message_cache_control and isinstance(block.get("cache_control"), dict):
+                        # Anthropic 400s on cache_control set for an EMPTY text block;
+                        # only cache a text block that actually has text (image/tool
+                        # blocks keep their cache_control). Pure removal of an invalid
+                        # cache_control — never rewrites content, so all lanes are safe.
+                        empty_text = (
+                            block.get("type") == "text"
+                            and not str(block.get("text") or "").strip()
+                        )
+                        if (allow_message_cache_control
+                                and isinstance(block.get("cache_control"), dict)
+                                and not empty_text):
                             block["cache_control"] = {"type": "ephemeral"}
                         else:
                             block.pop("cache_control", None)
@@ -850,6 +958,31 @@ class LLMClient:
             return [{"type": "text", "text": marker}] + out
         return marker + str(content or "")
 
+    @staticmethod
+    def _is_deferrable_image_user_turn(msg: Dict[str, Any]) -> bool:
+        """True for a USER message whose content carries an image block but NO tool_result
+        block and NO tool_call_id — i.e. a mid-round injected image (view_image /
+        native screenshot) that must not split an assistant tool_use from its matching
+        tool_result. A user turn that IS a tool answer (Anthropic-style tool_result content
+        block, or an OpenAI tool message) is never deferred (the negative guard)."""
+        if str(msg.get("role") or "").strip().lower() != "user":
+            return False
+        if msg.get("tool_call_id"):
+            return False
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return False
+        has_image = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "")
+            if btype == "tool_result":
+                return False  # this user turn answers a tool call — never defer it
+            if btype in {"image_url", "image"}:
+                has_image = True
+        return has_image
+
     @classmethod
     def _normalize_system_message_placement(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Demote runtime system notices after conversation start.
@@ -859,6 +992,14 @@ class LLMClient:
         reminders, so they keep recency as user notices. If a notice appears
         between an assistant tool-call message and its tool results, it is
         buffered until after the adjacent tool-result block.
+
+        The same buffer also defers a mid-round image-bearing USER turn (P4a):
+        view_image / native-screenshot injection can append a user(image) message
+        between an assistant tool_use and its tool_result, which violates every
+        provider's tool-call adjacency contract. Buffering it (then flushing after
+        the window closes) keeps the tool_result adjacent to its tool_use. This is
+        the single send-time chokepoint every provider builder funnels through, so
+        the fix covers Anthropic/OpenAI/Gemini/GigaChat at once (Bible P2/P7).
         """
         out: List[Dict[str, Any]] = []
         buffered_notices: List[Dict[str, Any]] = []
@@ -874,6 +1015,14 @@ class LLMClient:
         for original in messages:
             msg = copy.deepcopy(original)
             role = str(msg.get("role") or "").strip().lower()
+
+            # P4a: defer an image-bearing user turn that lands inside an open
+            # tool_use↔tool_result window — BEFORE the generic clear below, so it is
+            # buffered (kept in order with any demoted system notice) rather than
+            # inserted between the tool_calls and their results.
+            if awaiting_tool_results and cls._is_deferrable_image_user_turn(msg):
+                buffered_notices.append(msg)
+                continue
 
             if awaiting_tool_results and role not in {"tool", "system"}:
                 awaiting_tool_results = False
@@ -985,6 +1134,8 @@ class LLMClient:
         self,
         target: Dict[str, Any],
         kwargs: Dict[str, Any],
+        *,
+        allow_portable_reasoning: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Same-model reroute: strip replayed reasoning metadata and drop the
         provider pin (``allow_fallbacks=false``, set only to preserve reasoning
@@ -992,12 +1143,23 @@ class LLMClient:
         model. Shared by the 400 signature-rejection path and the transient
         200-body provider-error path. Returns None when no replayed reasoning is
         present (nothing to strip / no continuity pin to drop — default routing can
-        already fall back across endpoints). NEVER switches model — only endpoint."""
+        already fall back across endpoints). NEVER switches model — only endpoint.
+
+        ``allow_portable_reasoning`` (set ONLY by the transient body-error path): for a
+        family whose reasoning signature is cross-provider portable
+        (``_reasoning_signature_portable_across_or_providers``) the replayed signature
+        survives the same-model sibling-provider switch, so PRESERVE it (retry the same
+        payload and let OpenRouter route to a healthy endpoint) rather than needlessly
+        dropping continuity on the very rate-limit path the failover exists for. The 400
+        signature-REJECTION path never sets this: a 400 means the signature WAS rejected,
+        so it must strip regardless of family."""
         if not target.get("supports_openrouter_extensions"):
             return None
         messages = kwargs.get("messages")
         if not isinstance(messages, list) or not self._has_replayed_reasoning_metadata(messages):
             return None
+        if allow_portable_reasoning and _reasoning_signature_portable_across_or_providers(kwargs.get("model")):
+            return copy.deepcopy(kwargs)
         retry_kwargs = copy.deepcopy(kwargs)
         retry_kwargs["messages"] = self._strip_openrouter_roundtrip_metadata(messages)
         if not self._has_replayed_reasoning_metadata(retry_kwargs["messages"]):
@@ -1077,8 +1239,9 @@ class LLMClient:
         target: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """If an HTTP-200 response actually carries a TRANSIENT provider
-        body-error, return same-model reroute kwargs (provider unpinned,
-        reasoning continuity dropped); None when not applicable."""
+        body-error, return same-model reroute kwargs (provider unpinned; reasoning
+        continuity preserved for cross-provider-portable families, dropped
+        otherwise); None when not applicable."""
         try:
             resp_dict = resp.model_dump()
         except Exception:
@@ -1086,13 +1249,18 @@ class LLMClient:
         err = self._provider_body_error(resp_dict)
         if not err or not self._is_transient_body_error(err):
             return None
-        reroute = self._reroute_same_model_kwargs(target, kwargs)
+        reroute = self._reroute_same_model_kwargs(
+            target, kwargs, allow_portable_reasoning=True
+        )
         if reroute is None:
             return None
         log.warning(
             "OpenRouter same-model reroute after transient provider body-error "
-            "(code=%s); reasoning_continuity_dropped",
+            "(code=%s); reasoning_continuity_%s",
             err.get("code"),
+            "preserved"
+            if _reasoning_signature_portable_across_or_providers(kwargs.get("model"))
+            else "dropped",
         )
         return reroute
 
@@ -1158,28 +1326,18 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
+        allow_server_web_search: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes."""
+        """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes.
+
+        ``response_format`` (e.g. ``{"type": "json_object"}``) is optional request
+        intent on the OpenAI-compatible/OpenRouter lanes: local, Anthropic-native,
+        and GigaChat routes ignore it, and a provider rejection strips it via the
+        optional-parameter retry — callers must keep a text-parse fallback."""
         messages = self._normalize_system_message_placement(messages)
-        invocation_params = {
-            "reasoning_effort": reasoning_effort,
-            "max_tokens": max_tokens,
-            "tool_choice": tool_choice,
-            "temperature": temperature,
-        }
         if use_local:
-            with llm_span(
-                model=model or "local-model",
-                provider="local",
-                messages=messages,
-                invocation_params=invocation_params,
-                tools=tools,
-            ) as span:
-                _guardrails_enforce_input(messages)
-                msg, usage = self._chat_local(messages, tools, max_tokens, tool_choice)
-                msg, usage = _guardrails_apply_output(msg, usage)
-                record_llm_response(span, message=msg, usage=usage)
-                return msg, usage
+            return self._chat_local(messages, tools, max_tokens, tool_choice, timeout=timeout)
 
         # Central worker policy: any LLM call from a worker process is fork-safe
         # by default (no system proxy lookup). This covers the main agent loop,
@@ -1187,24 +1345,13 @@ class LLMClient:
         # call site having to remember no_proxy=True.
         no_proxy = no_proxy or in_worker_process()
         target = self._resolve_remote_target(model)
-        provider = str(target.get("provider") or "")
-        resolved_model = str(target.get("resolved_model") or model)
-        with llm_span(
-            model=resolved_model,
-            provider=provider,
-            messages=messages,
-            invocation_params=invocation_params,
-            tools=tools,
-        ) as span:
-            _guardrails_enforce_input(messages)
-            msg, usage = self._chat_remote(
-                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
-                no_proxy=no_proxy,
-                timeout=timeout,
-            )
-            msg, usage = _guardrails_apply_output(msg, usage)
-            record_llm_response(span, message=msg, usage=usage)
-            return msg, usage
+        return self._chat_remote(
+            target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
+            no_proxy=no_proxy,
+            timeout=timeout,
+            allow_server_web_search=allow_server_web_search,
+            response_format=response_format,
+        )
 
     async def chat_async(
         self,
@@ -1217,6 +1364,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
+        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Async remote chat; no_proxy keeps forked macOS workers off OS proxy APIs."""
         messages = self._normalize_system_message_placement(messages)
@@ -1224,110 +1372,84 @@ class LLMClient:
         if tools:
             raise ValueError("chat_async does not support tool calls")
         target = self._resolve_remote_target(model)
-        provider = str(target.get("provider") or "")
-        resolved_model = str(target.get("resolved_model") or model)
-        invocation_params = {
-            "reasoning_effort": reasoning_effort,
-            "max_tokens": max_tokens,
-            "tool_choice": tool_choice,
-            "temperature": temperature,
-        }
-        with llm_span(
-            model=resolved_model,
-            provider=provider,
-            messages=messages,
-            invocation_params=invocation_params,
-            tools=tools,
-        ) as span:
-            _guardrails_enforce_input(messages)
-            if target.get("provider") == "anthropic":
-                msg, usage = await asyncio.to_thread(
-                    self._chat_anthropic,
-                    target,
-                    messages,
-                    tools,
-                    reasoning_effort,
-                    max_tokens,
-                    tool_choice,
-                    temperature,
-                    no_proxy,
-                    timeout,
+        if target.get("provider") == "anthropic":
+            return await asyncio.to_thread(
+                self._chat_anthropic,
+                target,
+                messages,
+                tools,
+                reasoning_effort,
+                max_tokens,
+                tool_choice,
+                temperature,
+                no_proxy,
+                timeout,
+            )
+        if target.get("provider") == "gigachat":
+            # The gigachat library client is synchronous; offload to a thread
+            # like the Anthropic path so the event loop is never blocked.
+            return await asyncio.to_thread(
+                self._chat_gigachat,
+                target,
+                messages,
+                tools,
+                reasoning_effort,
+                max_tokens,
+                tool_choice,
+                temperature,
+                no_proxy,
+            )
+        if no_proxy:
+            _oa_client, _http_client = self._make_no_proxy_async_client(target, timeout=timeout)
+            try:
+                kwargs = self._build_remote_kwargs(
+                    target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
+                    skip_capability_fetch=True,
+                    allow_server_web_search=allow_server_web_search,
                 )
-                msg, usage = _guardrails_apply_output(msg, usage)
-                record_llm_response(span, message=msg, usage=usage)
-                return msg, usage
-            if target.get("provider") == "gigachat":
-                # The gigachat library client is synchronous; offload to a thread
-                # like the Anthropic path so the event loop is never blocked.
-                msg, usage = await asyncio.to_thread(
-                    self._chat_gigachat,
-                    target,
-                    messages,
-                    tools,
-                    reasoning_effort,
-                    max_tokens,
-                    tool_choice,
-                    temperature,
-                    no_proxy,
+                prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
+                    kwargs.get("messages"),
+                    kwargs.get("tools"),
                 )
-                msg, usage = _guardrails_apply_output(msg, usage)
-                record_llm_response(span, message=msg, usage=usage)
-                return msg, usage
-            if no_proxy:
-                _oa_client, _http_client = self._make_no_proxy_async_client(target, timeout=timeout)
+                resp = await self._create_chat_completion_with_retries_async(
+                    _oa_client.chat.completions.create,
+                    kwargs,
+                    target,
+                )
+                return self._normalize_remote_response(
+                    resp.model_dump(),
+                    target,
+                    skip_cost_fetch=True,
+                    prompt_cache_ttl=prompt_cache_ttl,
+                )
+            finally:
                 try:
-                    kwargs = self._build_remote_kwargs(
-                        target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
-                        skip_capability_fetch=True,
-                    )
-                    prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-                        kwargs.get("messages"),
-                        kwargs.get("tools"),
-                    )
-                    resp = await self._create_chat_completion_with_retries_async(
-                        _oa_client.chat.completions.create,
-                        kwargs,
-                        target,
-                    )
-                    msg, usage = self._normalize_remote_response(
-                        resp.model_dump(),
-                        target,
-                        skip_cost_fetch=True,
-                        prompt_cache_ttl=prompt_cache_ttl,
-                    )
-                    msg, usage = _guardrails_apply_output(msg, usage)
-                    record_llm_response(span, message=msg, usage=usage)
-                    return msg, usage
-                finally:
-                    try:
-                        await _http_client.aclose()
-                    except Exception:
-                        pass
-            client = self._get_async_remote_client(target)
-            kwargs = self._build_remote_kwargs(
-                target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
-            )
-            if timeout and timeout > 0:
-                # Cached clients are built without a timeout; honor the caller's
-                # per-request timeout instead of silently using the SDK default.
-                kwargs["timeout"] = float(timeout)
-            prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-                kwargs.get("messages"),
-                kwargs.get("tools"),
-            )
-            resp = await self._create_chat_completion_with_retries_async(
-                client.chat.completions.create,
-                kwargs,
-                target,
-            )
-            msg, usage = self._normalize_remote_response(
-                resp.model_dump(),
-                target,
-                prompt_cache_ttl=prompt_cache_ttl,
-            )
-            msg, usage = _guardrails_apply_output(msg, usage)
-            record_llm_response(span, message=msg, usage=usage)
-            return msg, usage
+                    await _http_client.aclose()
+                except Exception:
+                    pass
+        client = self._get_async_remote_client(target)
+        kwargs = self._build_remote_kwargs(
+            target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
+            allow_server_web_search=allow_server_web_search,
+        )
+        if timeout and timeout > 0:
+            # Cached clients are built without a timeout; honor the caller's
+            # per-request timeout instead of silently using the SDK default.
+            kwargs["timeout"] = float(timeout)
+        prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
+            kwargs.get("messages"),
+            kwargs.get("tools"),
+        )
+        resp = await self._create_chat_completion_with_retries_async(
+            client.chat.completions.create,
+            kwargs,
+            target,
+        )
+        return self._normalize_remote_response(
+            resp.model_dump(),
+            target,
+            prompt_cache_ttl=prompt_cache_ttl,
+        )
 
     def _prepare_messages_for_local_context(
         self,
@@ -1376,6 +1498,7 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]],
         max_tokens: int,
         tool_choice: str,
+        timeout: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send a chat request to the local llama-cpp-python server."""
         client = self._get_local_client()
@@ -1434,6 +1557,11 @@ class LLMClient:
         if clean_tools:
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
+        if timeout and timeout > 0:
+            # Honor the caller's per-request timeout on the local lane too
+            # (v6.54.3: the safety-supervisor timeout SSOT must bound every
+            # route safety can use, not only the remote ones).
+            kwargs["timeout"] = float(timeout)
 
         last_exc: Optional[Exception] = None
         for attempt in range(3):
@@ -1677,6 +1805,26 @@ class LLMClient:
                 blocks.append(normalized)
         return blocks
 
+    @staticmethod
+    def _sanitize_anthropic_tool_result_content(content: Any) -> Any:
+        """Anthropic rejects empty tool_result content (and 400s on cache_control set
+        for an empty text block). Drop empty text blocks, KEEP non-empty / non-text
+        (image/document/search) blocks, and substitute a single placeholder only when
+        the whole tool result would otherwise be empty (scalar ``""`` or list ``[]``)."""
+        placeholder = "(no tool output)"
+        if isinstance(content, list):
+            cleaned = [
+                b for b in content
+                if not (
+                    isinstance(b, dict)
+                    and str(b.get("type") or "") == "text"
+                    and not str(b.get("text") or "").strip()
+                )
+            ]
+            return cleaned if cleaned else placeholder
+        text = "" if content is None else str(content)
+        return text if text.strip() else placeholder
+
     def _build_anthropic_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -1737,6 +1885,7 @@ class LLMClient:
                     )[0]["content"]
                 else:
                     tool_result_content = self._stringify_anthropic_content(raw_content)
+                tool_result_content = self._sanitize_anthropic_tool_result_content(tool_result_content)
                 self._coalesce_anthropic_message(
                     anthropic_messages,
                     "user",
@@ -1806,6 +1955,26 @@ class LLMClient:
             sanitized_tools.append(tool_copy)
         sanitized_tools.sort(key=lambda tool: str((tool.get("function") or {}).get("name") or ""))
         return sanitized_tools
+
+    @staticmethod
+    def _openrouter_main_web_search_tool() -> Optional[Dict[str, Any]]:
+        mode = str(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH") or "off").strip().lower()
+        if mode not in {"openrouter", "openrouter_server", "server", "on", "true", "1"}:
+            return None
+        engine = str(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE") or "auto").strip() or "auto"
+        parameters: Dict[str, Any] = {}
+        if engine != "auto":
+            parameters["engine"] = engine
+        try:
+            max_total = int(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS", "") or 0)
+        except ValueError:
+            max_total = 0
+        if max_total > 0:
+            parameters["max_total_results"] = max_total
+        tool: Dict[str, Any] = {"type": "openrouter:web_search"}
+        if parameters:
+            tool["parameters"] = parameters
+        return tool
 
     @staticmethod
     def _build_anthropic_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
@@ -1883,6 +2052,12 @@ class LLMClient:
         }
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # Anthropic always returns stop_reason on success; surface it so the empty-
+        # response classifier isn't blind on the direct lane (otherwise every direct
+        # response looks like a finish_reason=null transient glitch).
+        stop_reason = resp_dict.get("stop_reason")
+        if stop_reason:
+            message["stop_reason"] = str(stop_reason)
         return message, usage
 
     def _chat_anthropic(
@@ -1896,6 +2071,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
+        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         import requests
 
@@ -1973,7 +2149,7 @@ class LLMClient:
     # ------------------------------------------------------------------
     # GigaChat (native `gigachat` library — NOT OpenAI-compatible)
     # ------------------------------------------------------------------
-    def _get_gigachat_client(self, target: Dict[str, Any]):
+    def _get_gigachat_client(self, target: Dict[str, Any], timeout: Optional[float] = None):
         """Build (and cache) a GigaChat library client for the given target.
 
         Auth is whatever the env provides: an authorization key (``credentials``
@@ -1982,14 +2158,17 @@ class LLMClient:
         automatically, so caching the client across calls is safe. Any other
         ``GIGACHAT_*`` setting present in the environment (e.g.
         ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself.
-        """
+        A caller-supplied per-request ``timeout`` becomes part of the cache key
+        (the library takes it at construction), so the safety-supervisor timeout
+        SSOT bounds this lane too (v6.54.3)."""
         credentials = str(target.get("api_key") or "")
         user = str(target.get("user") or "")
         password = str(target.get("password") or "")
         scope = str(target.get("scope") or "GIGACHAT_API_PERS")
         base_url = str(target.get("base_url") or "")
         verify = bool(target.get("verify_ssl_certs", True))
-        cache_key = (credentials, user, password, scope, base_url, verify)
+        timeout_key = float(timeout) if timeout and timeout > 0 else None
+        cache_key = (credentials, user, password, scope, base_url, verify, timeout_key)
 
         client = self._gigachat_clients.get(cache_key)
         if client is None:
@@ -2009,6 +2188,8 @@ class LLMClient:
                 kwargs["password"] = password
             if base_url:
                 kwargs["base_url"] = base_url
+            if timeout_key is not None:
+                kwargs["timeout"] = timeout_key
             client = GigaChat(**kwargs)
             self._gigachat_clients[cache_key] = client
         return client
@@ -2196,13 +2377,14 @@ class LLMClient:
         tool_choice: str,
         temperature: Optional[float] = None,
         no_proxy: bool = False,
+        timeout: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         # The gigachat library owns its own httpx transport and proxy handling;
         # no_proxy (a macOS fork-safety flag for the OpenAI/requests paths) does
         # not apply here.
         del no_proxy
 
-        client = self._get_gigachat_client(target)
+        client = self._get_gigachat_client(target, timeout=timeout)
 
         payload: Dict[str, Any] = {
             "model": str(target.get("resolved_model") or ""),
@@ -2298,6 +2480,8 @@ class LLMClient:
         temperature: Optional[float],
         tools: Optional[List[Dict[str, Any]]],
         skip_capability_fetch: bool = False,
+        allow_server_web_search: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
@@ -2338,6 +2522,8 @@ class LLMClient:
                 kwargs["reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
             if temperature is not None:
                 kwargs["temperature"] = temperature
+            if response_format:
+                kwargs["response_format"] = dict(response_format)
             if tools:
                 kwargs["tools"] = [
                     {k: v for k, v in tool.items() if k != "cache_control"}
@@ -2354,10 +2540,7 @@ class LLMClient:
             else str(raw_return_reasoning).strip().lower() not in _FALSE_LIKE_ENV_VALUES
         )
         cache_model = resolved_model.strip().lstrip("~")
-        allow_message_cache = (
-            cache_model.startswith("anthropic/")
-            or cache_model.startswith("google/gemini-")
-        )
+        allow_message_cache = supports_message_cache_control(resolved_model)
         extra_body: Dict[str, Any] = {
             "reasoning": {"effort": effort, "exclude": not return_reasoning},
         }
@@ -2366,10 +2549,42 @@ class LLMClient:
             extra_body["provider"] = {
                 "require_parameters": True,
             }
-        if self._has_openrouter_reasoning_details(messages):
+        # Replayed reasoning is endpoint-bound ONLY for families whose thought-block
+        # signatures do not survive a same-model cross-provider switch. Anthropic, Gemini
+        # and OpenAI reasoning signatures ARE cross-provider portable on OpenRouter
+        # (Anthropic across Anthropic/Bedrock/Vertex/Azure; Gemini across Vertex/AI-Studio;
+        # OpenAI encrypted items across OpenAI/Azure — live same-model replay probe, 2026-06:
+        # each minted signature validated 200 on its sibling providers), so they must stay
+        # failover-eligible. Pinning them would defeat OpenRouter's same-model provider
+        # resilience and surface one upstream's rate-limit when a healthy sibling endpoint
+        # could serve the turn. OpenRouter routing is sticky (the same provider serves the
+        # happy path), so the prompt cache stays warm on the primary and only a real
+        # outage triggers the cross-provider failover — no throughput hopping. Unverified
+        # families (e.g. z-ai/glm, deepseek) keep the conservative pin; the reactive 400
+        # strip-and-retry (_openrouter_signature_retry_kwargs) is the safety net for all.
+        # The trigger is the BROAD replay-artifact contract (_has_replayed_reasoning_metadata
+        # — assistant reasoning/reasoning_content/response_id OR a signed reasoning/thinking
+        # CONTENT block), matching the reactive strip path, so an unverified signed block
+        # cannot slip past the pin via a non-`reasoning_details` artifact.
+        if self._has_replayed_reasoning_metadata(messages) and not _reasoning_signature_portable_across_or_providers(cache_model):
             provider_body = extra_body.setdefault("provider", {})
             if isinstance(provider_body, dict):
                 provider_body["allow_fallbacks"] = False
+        # Owner-configured OpenRouter provider routing (resilience/repro). Gap-merge:
+        # NEVER override the anthropic require_parameters pin or the (unverified-family)
+        # reasoning-continuity allow_fallbacks=False pin set above. Affects same-model
+        # provider routing only — it never changes the MODEL, so the P3 reviewer context
+        # floor is untouched.
+        _or_provider = _resolve_or_provider()
+        if _or_provider:
+            provider_body = extra_body.setdefault("provider", {})
+            if isinstance(provider_body, dict):
+                for _k, _v in _or_provider.items():
+                    if _k == "require_parameters" and provider_body.get("require_parameters"):
+                        continue
+                    if _k == "allow_fallbacks" and provider_body.get("allow_fallbacks") is False:
+                        continue
+                    provider_body[_k] = _v
 
         kwargs: Dict[str, Any] = {
             "model": resolved_model,
@@ -2383,15 +2598,27 @@ class LLMClient:
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
-        if tools:
+        if response_format:
+            kwargs["response_format"] = dict(response_format)
+        server_web_tool = (
+            self._openrouter_main_web_search_tool()
+            if (tools and allow_server_web_search)
+            else None
+        )
+        if tools or server_web_tool:
             prepared_tools = [
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
+            if server_web_tool:
+                prepared_tools.append(server_web_tool)
             if prepared_tools and cache_model.startswith("anthropic/"):
-                last_tool = {**prepared_tools[-1]}
-                last_tool["cache_control"] = {"type": "ephemeral"}
-                prepared_tools[-1] = last_tool
+                for idx in range(len(prepared_tools) - 1, -1, -1):
+                    if isinstance(prepared_tools[idx].get("function"), dict):
+                        last_tool = {**prepared_tools[idx]}
+                        last_tool["cache_control"] = {"type": "ephemeral"}
+                        prepared_tools[idx] = last_tool
+                        break
             kwargs["tools"] = prepared_tools
             kwargs["tool_choice"] = tool_choice
 
@@ -2403,13 +2630,13 @@ class LLMClient:
         else:
             supported = self._get_supported_parameters(resolved_model)
         if supported is not None:
-            for sampling_param in _OPTIONAL_SAMPLING_PARAMS:
-                if sampling_param not in supported and sampling_param in kwargs:
+            for optional_param in _OPTIONAL_DROPPABLE_PARAMS:
+                if optional_param not in supported and optional_param in kwargs:
                     log.debug(
                         "Model %s does not list %s in supported_parameters; stripping",
-                        resolved_model, sampling_param,
+                        resolved_model, optional_param,
                     )
-                    kwargs.pop(sampling_param, None)
+                    kwargs.pop(optional_param, None)
         return kwargs
 
     def _normalize_remote_response(
@@ -2444,6 +2671,27 @@ class LLMClient:
         for _sdk_field in ("refusal", "annotations", "audio", "function_call"):
             if msg.get(_sdk_field) is None:
                 msg.pop(_sdk_field, None)
+        annotations = msg.get("annotations") if isinstance(msg.get("annotations"), list) else []
+        web_sources: List[Dict[str, str]] = []
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+            citation = annotation.get("url_citation") if isinstance(annotation.get("url_citation"), dict) else annotation
+            url = str(citation.get("url") or "").strip() if isinstance(citation, dict) else ""
+            if not url:
+                continue
+            web_sources.append({
+                "url": url[:500],
+                "title": str(citation.get("title") or "")[:300] if isinstance(citation, dict) else "",
+                "content": str(citation.get("content") or citation.get("snippet") or "")[:1000] if isinstance(citation, dict) else "",
+            })
+        if web_sources:
+            usage["web_search_sources"] = web_sources[:20]
+        # Provider response annotations are transport metadata, not valid chat
+        # input fields for the next round. Persist harvested citations in usage.
+        msg.pop("annotations", None)
+        if isinstance(usage.get("server_tool_use"), dict):
+            usage["server_tool_use"] = dict(usage["server_tool_use"])
         # Provider-private reasoning text on the OpenAI-compatible direct lanes
         # (GLM / Z.AI / cloud.ru, legacy vLLM expose a top-level ``reasoning_content``).
         # Unlike ``reasoning``/``reasoning_details`` (kept for same-family continuity
@@ -2638,6 +2886,8 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
+        allow_server_web_search: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
@@ -2651,6 +2901,7 @@ class LLMClient:
             return self._chat_gigachat(
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,
+                timeout=timeout,
             )
 
         if no_proxy:
@@ -2659,6 +2910,8 @@ class LLMClient:
                 kwargs = self._build_remote_kwargs(
                     target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
                     skip_capability_fetch=True,
+                    allow_server_web_search=allow_server_web_search,
+                    response_format=response_format,
                 )
                 prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
                     kwargs.get("messages"),
@@ -2684,7 +2937,9 @@ class LLMClient:
 
         client = self._get_remote_client(target)
         kwargs = self._build_remote_kwargs(
-            target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools
+            target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
+            allow_server_web_search=allow_server_web_search,
+            response_format=response_format,
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's
@@ -2778,8 +3033,10 @@ def openrouter_web_search_server_tool(
         messages=[{"role": "user", "content": query}],
         tools=[{
             "type": "openrouter:web_search",
-            "search_context_size": search_context_size,
-            "max_total_results": 10,
+            "parameters": {
+                "search_context_size": search_context_size,
+                "max_total_results": 10,
+            },
         }],
     )
 

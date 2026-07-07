@@ -28,8 +28,10 @@ from ouroboros.headless import (
 from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.contracts.task_contract import (
     attach_task_contract,
+    normalize_acceptance_claims,
     normalize_allowed_resources,
     normalize_bool,
+    normalize_disabled_tools,
     normalize_resource_policy,
 )
 from ouroboros.outcomes import public_task_result
@@ -191,6 +193,12 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     resource_policy = normalize_resource_policy(body.get("resource_policy") or raw_metadata.get("resource_policy") or {})
     if resource_policy:
         metadata["resource_policy"] = resource_policy
+    disabled_tools = normalize_disabled_tools(body.get("disabled_tools") or raw_metadata.get("disabled_tools") or [])
+    if disabled_tools:
+        metadata["disabled_tools"] = disabled_tools
+    acceptance_claims = normalize_acceptance_claims(body.get("acceptance_claims") or raw_metadata.get("acceptance_claims") or [])
+    if acceptance_claims:
+        metadata["acceptance_claims"] = acceptance_claims
     service_teardown = str(body.get("service_teardown") or raw_metadata.get("service_teardown") or "").strip().lower()
     if service_teardown:
         if service_teardown not in {"stop", "keep"}:
@@ -241,6 +249,17 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     if deadline_at:
         metadata["deadline_at"] = deadline_at
     child_drive = prepare_task_drive(drive_root, task_id, effective_drive_mode, project_id=_task_project_id)
+    # v6.52.0 (P1): stage attachments into the SAME drive the task will read from at
+    # runtime — the child drive when forked/empty, else the shared drive (matches the
+    # task['drive_root'] set at the end of this handler). The returned manifest renders
+    # READY read_file(root='artifact_store', ...) lines and feeds native image blocks.
+    from ouroboros.artifacts import stage_task_attachments
+
+    effective_drive = child_drive or drive_root
+    attachment_manifest = stage_task_attachments(
+        effective_drive, task_id, _normalize_attachments(body.get("attachments"))
+    )
+    attachment_images = [m for m in attachment_manifest if m.get("is_image")]
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
     metadata.setdefault("source", str(body.get("source") or "api_task"))
@@ -273,7 +292,7 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         workspace_mode=workspace_mode,
         memory_mode=memory_mode,
         workspace_preflight=workspace_preflight_summary,
-        attachments=body.get("attachments"),
+        attachments=attachment_manifest,
     )
     task = {
         "id": task_id,
@@ -287,6 +306,8 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         "context_requires_self_body_docs": normalize_bool(body.get("context_requires_self_body_docs")),
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
+        "disabled_tools": disabled_tools,
+        "acceptance_claims": acceptance_claims,
         "deadline_at": deadline_at,
         "depth": depth,
         "parent_task_id": parent_task_id,
@@ -299,7 +320,14 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         "memory_mode": memory_mode,
         "project_id": _task_project_id,
         "metadata": metadata,
-        "attachments": _normalize_attachments(body.get("attachments")),
+        # v6.52.0 (P1): the STAGED manifest (root/relpath/mime/is_image), not raw
+        # host paths — relpaths resolve against task['drive_root'] at read time.
+        "attachments": attachment_manifest,
+        "attachment_images": attachment_images,
+        # v6.52.0 (P1): record the effective drive (child when forked/empty, else the shared
+        # drive) so build_user_content can resolve staged attachment IMAGES for EVERY task
+        # shape — not just child-drive tasks. The child-drive block below re-affirms it.
+        "drive_root": str(effective_drive),
     }
     task = attach_task_contract(task)
     if child_drive is not None:
@@ -647,7 +675,7 @@ def _normalize_attachments(value: Any) -> List[Dict[str, str]]:
     for item in value:
         if isinstance(item, dict):
             path = str(item.get("path") or "").strip()
-            label = str(item.get("label") or pathlib.Path(path).name).strip()
+            label = str(item.get("label") or item.get("display_name") or pathlib.Path(path).name).strip()
         else:
             path = str(item or "").strip()
             label = pathlib.Path(path).name
@@ -687,11 +715,42 @@ def _compose_task_text(
             parts = [description[:idx].rstrip(), "\n", workspace_lines, description[idx:]]
         else:
             parts.append(f"\n\n[HEADLESS_WORKSPACE]\n{workspace_lines}[END_HEADLESS_WORKSPACE]")
-    normalized = _normalize_attachments(attachments)
-    if normalized:
-        rendered = "\n".join(f"- {item['label']}: {item['path']}" for item in normalized)
+    rendered = _render_attachment_lines(attachments)
+    if rendered:
         parts.append(f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]")
     return "".join(parts)
+
+
+def _render_attachment_lines(attachments: Any) -> str:
+    """Render READY attachment lines from a staged manifest.
+
+    v6.52.0 (P1): each line is a ready-to-use read_file call against the canonical
+    artifact_store root — NEVER a bare absolute host path. ``attachments`` is the
+    manifest returned by ``stage_task_attachments`` (entries with root/relpath/mime/
+    is_image)."""
+    if not isinstance(attachments, list):
+        return ""
+    lines: List[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        relpath = str(item.get("relpath") or "").strip()
+        root = str(item.get("root") or "artifact_store").strip() or "artifact_store"
+        label = str(item.get("label") or pathlib.Path(relpath).name).strip()
+        if not relpath:
+            continue
+        kind = "image" if item.get("is_image") else (str(item.get("mime") or "").strip() or "file")
+        # v6.54.3: also surface the REAL staged path for process tools — scripts
+        # (openpyxl, audio, ffmpeg) open files by OS path, and omitting it made
+        # models GUESS wrong absolute paths that tripped light-mode path guards.
+        # The staged path lives inside this task's own artifact_store, so both
+        # forms address the same file.
+        abs_path = str(item.get("abs_path") or "").strip()
+        script_hint = f" | script/process path: {abs_path}" if abs_path else ""
+        lines.append(
+            f"- {label} ({kind}): read_file(root='{root}', path='{relpath}'){script_hint}"
+        )
+    return "\n".join(lines)
 
 
 def _is_workspace_result(result: Dict[str, Any]) -> bool:

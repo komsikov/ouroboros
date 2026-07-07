@@ -16,6 +16,7 @@ distinct branch of the cascade).
 """
 from __future__ import annotations
 
+import pathlib
 from subprocess import CompletedProcess
 from types import SimpleNamespace
 
@@ -37,6 +38,39 @@ def _ctx(tmp_path):
         repo_dir=tmp_path,
         drive_logs=lambda: pathlib.Path(str(tmp_path)),
     )
+
+
+def test_run_shell_preserves_leading_stdout_whitespace(tmp_path, fake_subprocess):
+    fake_subprocess(stdout="  indented\n")
+    result = _run_shell(_ctx(tmp_path), ["printf", "x"])
+    assert "STDOUT:\n  indented\n" in result
+
+
+def test_run_shell_accepts_task_drive_label_as_cwd(tmp_path, fake_subprocess):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ctx = _ctx(repo)
+    ctx.drive_root = tmp_path / "drive"
+    ctx.task_id = "task1"
+    calls = fake_subprocess(stdout="ok")
+    result = _run_shell(ctx, ["pwd"], cwd="task_drive")
+    assert "SHELL_CWD_BLOCKED" not in result
+    assert pathlib.Path(calls[0]["kwargs"]["cwd"]).parts[-2:] == ("task_drives", "task1")
+
+
+def test_run_shell_accepts_user_files_label_as_safe_deliverables_cwd(tmp_path, fake_subprocess, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ctx = _ctx(repo)
+    user_home = tmp_path / "user-home"
+    deliverables = user_home / "Deliverables"
+    ctx.drive_root = tmp_path / "drive"
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(user_home))
+    monkeypatch.setenv("OUROBOROS_DELIVERABLES_ROOT", str(deliverables))
+    calls = fake_subprocess(stdout="ok")
+    result = _run_shell(ctx, ["pwd"], cwd="user_files")
+    assert "SHELL_CWD_BLOCKED" not in result
+    assert calls[0]["kwargs"]["cwd"] == str(deliverables.resolve())
 
 
 @pytest.fixture
@@ -92,11 +126,15 @@ class TestPerCallTimeout:
         ctx = self._ctx_with_deadline(tmp_path, 100)
         assert _resolve_effective_timeout(360, ctx, override_sec=99999) == 60
 
-    def test_resolve_override_zero_falls_through_to_default(self):
-        assert _resolve_effective_timeout(360, None, override_sec=0) == 360
+    def test_resolve_override_zero_falls_through_to_default(self, monkeypatch):
+        # override 0 -> falls through to the config SSOT default (OUROBOROS_TOOL_TIMEOUT_SEC=600),
+        # NOT the in-code 360 (the prior `!= default_setting` skip wrongly returned 360).
+        monkeypatch.setenv("OUROBOROS_TOOL_TIMEOUT_SEC", "600")
+        assert _resolve_effective_timeout(360, None, override_sec=0) == 600
 
-    def test_resolve_override_none_is_default(self):
-        assert _resolve_effective_timeout(360, None, override_sec=None) == 360
+    def test_resolve_override_none_is_default(self, monkeypatch):
+        monkeypatch.setenv("OUROBOROS_TOOL_TIMEOUT_SEC", "600")
+        assert _resolve_effective_timeout(360, None, override_sec=None) == 600  # config SSOT, not in-code 360
 
     def test_run_shell_threads_timeout_sec(self, tmp_path, fake_subprocess):
         calls = fake_subprocess(stdout="ok")
@@ -108,10 +146,11 @@ class TestPerCallTimeout:
         _run_shell(_ctx(tmp_path), ["echo", "hi"], timeout=7)
         assert calls[0]["kwargs"]["timeout"] == 7
 
-    def test_run_shell_default_timeout_when_omitted(self, tmp_path, fake_subprocess):
+    def test_run_shell_default_timeout_when_omitted(self, tmp_path, fake_subprocess, monkeypatch):
+        monkeypatch.setenv("OUROBOROS_TOOL_TIMEOUT_SEC", "600")
         calls = fake_subprocess(stdout="ok")
         _run_shell(_ctx(tmp_path), ["echo", "hi"])
-        assert calls[0]["kwargs"]["timeout"] == 360
+        assert calls[0]["kwargs"]["timeout"] == 600  # config SSOT default (was a buggy effective 360)
 
     def test_schema_exposes_timeout_sec_and_timeout_alias(self):
         from ouroboros.tools.shell import get_tools
@@ -238,6 +277,7 @@ def test_run_shell_timeout_uses_settings_timeout(tmp_path, monkeypatch):
         raise __import__("subprocess").TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
 
     monkeypatch.setattr("ouroboros.tools.shell.load_settings", lambda: {"OUROBOROS_TOOL_TIMEOUT_SEC": 42})
+    monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
     monkeypatch.setattr("ouroboros.tools.shell._tracked_subprocess_run", fake_timeout)
     result = _run_shell(_ctx(tmp_path), ["sleep", "999"])
 
@@ -270,6 +310,7 @@ def test_run_shell_deadline_caps_real_default_timeout(monkeypatch):
 
 def test_run_shell_explicit_timeout_wins_over_deadline(monkeypatch):
     monkeypatch.setattr("ouroboros.tools.shell.load_settings", lambda: {"OUROBOROS_TOOL_TIMEOUT_SEC": 42})
+    monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
     ctx = SimpleNamespace(task_metadata={"deadline_at": "2026-06-10T00:20:00Z"})
 
     assert _resolve_effective_timeout(360, ctx) == 42

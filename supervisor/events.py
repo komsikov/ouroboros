@@ -68,6 +68,59 @@ def _active_subagent_count(root_task_id: str, pending: list, running: dict) -> i
     return count
 
 
+def _task_own_id(task: Dict[str, Any]) -> str:
+    return str(task.get("id") or task.get("task_id") or "").strip()
+
+
+def _iter_tree_subagent_tasks(root_task_id: str, pending: list, running: dict):
+    for task in pending:
+        if isinstance(task, dict) and _is_active_subagent_task(task, root_task_id):
+            yield task
+    for meta in running.values():
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if isinstance(task, dict) and _is_active_subagent_task(task, root_task_id):
+            yield task
+
+
+def _depth_reservation_admits(
+    root_task_id: str, parent_id: Any, pending: list, running: dict, max_active: int
+) -> bool:
+    """FR2 depth-aware reservation: when the tree is at the per-root active cap,
+    still admit a child whose parent is a RUNNING subagent that has NO active
+    direct child yet — one reserved direct child per running subagent — so a deep
+    cooperative build is not starved by a wide first level. Bounded by a hard
+    ceiling (2x the cap, capped at the documented per-root hard max 50) so the
+    reservation can never unbound the tree; structural depth/max_children gates
+    still apply on top."""
+    parent = str(parent_id or "").strip()
+    if not parent:
+        return False
+    parent_running = any(
+        _task_own_id(t) == parent
+        for meta in running.values()
+        if isinstance(meta, dict) and isinstance((t := meta.get("task")), dict) and _is_active_subagent_task(t, root_task_id)
+    )
+    if not parent_running:
+        return False
+    direct_children = sum(
+        1 for t in _iter_tree_subagent_tasks(root_task_id, pending, running)
+        if str(t.get("parent_task_id") or "").strip() == parent
+    )
+    if direct_children >= 1:
+        return False
+    hard_ceiling = min(50, 2 * max(1, int(max_active)))
+    return _active_subagent_count(root_task_id, pending, running) < hard_ceiling
+
+
+def _subagent_cap_blocks(root_task_id: str, parent_id: Any, pending: list, running: dict, max_active: int) -> bool:
+    """A subagent schedule is rejected when the tree is at the per-root active cap AND
+    the FR2 depth-aware reservation does not admit it."""
+    return (
+        _active_subagent_count(root_task_id, pending, running) >= max_active
+        and not _depth_reservation_admits(root_task_id, parent_id, pending, running, max_active)
+    )
+
+
 def _subagent_rejection_meta(
     tid: str,
     *,
@@ -145,6 +198,38 @@ def _send_subagent_rejection(
             error=detail,
         ),
     )
+
+
+def _record_delegation_constraint(
+    root_task_id: str,
+    *,
+    task_id: str,
+    role: str,
+    directive: str,
+    scope: Any,
+    rationale: str,
+    advisory: bool = False,
+) -> None:
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_append
+
+        tree_ledger_append(
+            root_task_id,
+            "delegation_constraint",
+            rationale,
+            task_id=task_id,
+            role=role,
+            payload={
+                "constraint_id": f"dc_{uuid.uuid4().hex[:16]}",
+                "directive": directive,
+                "scope": scope,
+                "rationale": rationale,
+                "created_by": task_id,
+                "advisory": bool(advisory),
+            },
+        )
+    except Exception:
+        log.debug("Failed to record delegation constraint for %s", task_id, exc_info=True)
 
 
 def _compose_subagent_text(
@@ -258,6 +343,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     child_drive_root = str(fields.get("child_drive_root") or "")
     budget_drive_root = str(fields.get("budget_drive_root") or "")
     task_constraint = fields.get("task_constraint") if isinstance(fields.get("task_constraint"), dict) else None
+    required_capabilities = fields.get("required_capabilities") if isinstance(fields.get("required_capabilities"), list) else []
     workspace_root = str(fields.get("workspace_root") or "")
     workspace_mode = str(fields.get("workspace_mode") or "")
     project_id = str(fields.get("project_id") or "")
@@ -292,6 +378,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "child_drive_root": child_drive_root,
         "budget_drive_root": budget_drive_root,
         "task_constraint": task_constraint,
+        "required_capabilities": required_capabilities,
         "workspace_root": workspace_root,
         "workspace_mode": workspace_mode,
         "project_id": project_id,
@@ -314,6 +401,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "role": role,
             "memory_mode": memory_mode,
             "task_constraint": task_constraint,
+            "required_capabilities": required_capabilities,
             "child_drive_root": child_drive_root,
             "workspace_root": workspace_root,
             "workspace_mode": workspace_mode,
@@ -336,6 +424,9 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     if task_constraint is None:
         task.pop("task_constraint", None)
         task["metadata"].pop("task_constraint", None)
+    if not required_capabilities:
+        task.pop("required_capabilities", None)
+        task["metadata"].pop("required_capabilities", None)
     if parent_id:
         task["parent_task_id"] = parent_id
     return task
@@ -450,6 +541,12 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     }
     ctx.update_budget_from_usage(usage_for_budget)
 
+    # Server-side web-search citations ({url,title,content}, capped at 20 in
+    # llm.py). Persisted so post-hoc audits (e.g. the GAIA leakage audit) can see
+    # what the native web-search tool actually fetched — the search happens on the
+    # provider side and never appears in tools.jsonl.
+    web_search_sources = usage.get("web_search_sources")
+
     try:
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": evt.get("ts", utc_now_iso()),
@@ -474,6 +571,7 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
             "cached_tokens": cached_tokens,
             "cache_write_tokens": cache_write_tokens,
             "prompt_cache_ttl": prompt_cache_ttl,
+            **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
         })
     except Exception:
         log.warning("Failed to log llm_usage event to events.jsonl", exc_info=True)
@@ -574,6 +672,15 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
+    if task_id:
+        # Managed-update merge watchdog (P2/SC2): if an assisted-resolution task ended without
+        # landing the merge, free the live worktree + commit-exclusivity by rolling the update back.
+        try:
+            from supervisor.update_merge import abort_orphaned_assisted_tx
+
+            abort_orphaned_assisted_tx(str(task_id))
+        except Exception:
+            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
     meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
     task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
     task_type = str(evt.get("task_type") or task.get("type") or "")
@@ -804,7 +911,13 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
                         "status": status,
                         "cost_usd": effective_result.get("cost_usd", 0),
                         "result": truncate_for_log(str(effective_result.get("result") or ""), 4000),
+                        # P3 uniform contract: flag when the WS preview was truncated so
+                        # the bubble can offer "show full" and fetch the genuinely-full text
+                        # on demand (full_ref = subagent_task_id -> GET /api/tasks/{id}),
+                        # instead of leaving the 4000-char cap looking like the whole output.
+                        "result_truncated": len(str(effective_result.get("result") or "")) > 4000,
                         "trace_summary": truncate_for_log(str(effective_result.get("trace_summary") or ""), 4000),
+                        "trace_summary_truncated": len(str(effective_result.get("trace_summary") or "")) > 4000,
                         "error": truncate_for_log(str(effective_result.get("error") or ""), 1000),
                         "artifact_status": str(effective_result.get("artifact_status") or ""),
                     },
@@ -1528,6 +1641,11 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     task_group = evt.get("task_group") if isinstance(evt.get("task_group"), dict) else {}
     subagent_envelope = evt.get("subagent_envelope") if isinstance(evt.get("subagent_envelope"), dict) else {}
     task_constraint = evt.get("task_constraint") if isinstance(evt.get("task_constraint"), dict) else None
+    required_capabilities = [
+        str(item or "").strip().lower()
+        for item in (evt.get("required_capabilities") if isinstance(evt.get("required_capabilities"), list) else [])
+        if str(item or "").strip()
+    ]
     workspace_root = str(evt.get("workspace_root") or "").strip()
     workspace_mode = str(evt.get("workspace_mode") or "").strip()
     project_id = str(evt.get("project_id") or "").strip()
@@ -1574,6 +1692,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "child_drive_root": child_drive_root,
         "budget_drive_root": budget_drive_root,
         "task_constraint": task_constraint,
+        "required_capabilities": required_capabilities,
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
         "effective_model_lane": effective_model_lane,
@@ -1596,6 +1715,15 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
 
     if delegation_role == "subagent" and acting_reject_detail:
         log.warning("Acting subagent request rejected: task_id=%s detail=%s", tid, acting_reject_detail[:160])
+        _record_delegation_constraint(
+            root_task_id,
+            task_id=tid,
+            role=role,
+            directive="block_surface",
+            scope={"surface": str((task_constraint or {}).get("surface") or evt.get("write_surface") or "")},
+            rationale=acting_reject_detail,
+            advisory=True,
+        )
         _reject_schedule_task(
             ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
             parent_id=parent_id, root_task_id=root_task_id, role=role,
@@ -1615,6 +1743,45 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             result_fields=result_fields, detail=detail,
         )
         return
+
+    if delegation_role == "subagent":
+        try:
+            from ouroboros.tool_access import subagent_profile_satisfies
+            from ouroboros.tools.control_delegation import effective_delegation_budget
+            from ouroboros.task_tree_ledger import open_delegation_constraints
+
+            selected_profile = (
+                "acting_subagent"
+                if isinstance(task_constraint, dict)
+                and task_constraint.get("mode") == ACTING_SUBAGENT_MODE
+                and task_constraint.get("surface")
+                else "local_readonly_subagent"
+            )
+            _ok, missing_caps = subagent_profile_satisfies(selected_profile, required_capabilities)
+            constraints_for_tree = open_delegation_constraints(root_task_id)
+            decision = effective_delegation_budget(
+                task_contract.get("delegation_budget") if isinstance(task_contract, dict) else {},
+                missing_capabilities=missing_caps,
+                unresolved_constraints=constraints_for_tree,
+                write_surface=str((task_constraint or {}).get("surface") or "") if isinstance(task_constraint, dict) else "",
+                role=role,
+                requested_lane=requested_model_lane,
+                effective_lane=effective_model_lane,
+                active_child_count=_active_subagent_count(root_task_id, getattr(ctx, "PENDING", []), getattr(ctx, "RUNNING", {})),
+            )
+            if not decision.ok:
+                detail = f"Subagent rejected: {decision.reason_code}: {decision.detail}"
+                _reject_schedule_task(
+                    ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
+                    parent_id=parent_id, root_task_id=root_task_id, role=role,
+                    result_fields=result_fields, detail=detail,
+                )
+                return
+            if isinstance(task_contract, dict) and decision.budget:
+                task_contract = {**task_contract, "delegation_budget": decision.budget}
+                result_fields["task_contract"] = task_contract
+        except Exception:
+            log.debug("Delegation reconciliation failed open for %s", tid, exc_info=True)
 
     max_depth = get_max_subagent_depth()
     if depth > max_depth:
@@ -1662,18 +1829,31 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         pending_ref = getattr(ctx, "PENDING", QUEUE_PENDING)
         running_ref = getattr(ctx, "RUNNING", QUEUE_RUNNING)
         max_active = get_max_active_subagents_per_root()
-        if delegation_role == "subagent" and _active_subagent_count(root_task_id, pending_ref, running_ref) >= max_active:
-            log.warning("Rejected subagent due to active child cap: root=%s desc=%s", root_task_id, desc[:100])
-            detail = (
-                "Subagent rejected: active child limit "
-                f"({max_active}) exceeded for root_task_id={root_task_id}."
+        queued_behind_active_cap = False
+        if delegation_role == "subagent" and _subagent_cap_blocks(root_task_id, parent_id, pending_ref, running_ref, max_active):
+            active_count = _active_subagent_count(root_task_id, pending_ref, running_ref)
+            if active_count >= 50:
+                log.warning("Rejected subagent due to hard active child cap: root=%s desc=%s", root_task_id, desc[:100])
+                detail = (
+                    "Subagent rejected: hard active child limit "
+                    f"(50) exceeded for root_task_id={root_task_id}."
+                )
+                _reject_schedule_task(
+                    ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
+                    parent_id=parent_id, root_task_id=root_task_id, role=role,
+                    result_fields=result_fields, detail=detail,
+                )
+                return
+            queued_behind_active_cap = True
+            _record_delegation_constraint(
+                root_task_id,
+                task_id=tid,
+                role=role,
+                directive="cap_children",
+                scope={"max_children": max_active},
+                rationale=f"Queued behind active subagent cap {max_active}; wait for a slot before additional fan-out.",
+                advisory=True,
             )
-            _reject_schedule_task(
-                ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
-                parent_id=parent_id, root_task_id=root_task_id, role=role,
-                result_fields=result_fields, detail=detail,
-            )
-            return
         dup_id = _find_duplicate_task(
             desc,
             task_context,
@@ -1735,6 +1915,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "project_id": project_id,
             "allowed_resources": allowed_resources,
             "task_contract": task_contract,
+            "required_capabilities": required_capabilities,
             "model_lane": requested_model_lane,
             "requested_model_lane": requested_model_lane,
             "effective_model_lane": effective_model_lane,
@@ -1761,6 +1942,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "parent_task_id": parent_id,
             "delegation_role": delegation_role,
             "task_group_id": task_group_id,
+            "required_capabilities": required_capabilities,
             "requested_model_lane": requested_model_lane,
             "effective_model_lane": effective_model_lane,
             "model": model,
@@ -1773,6 +1955,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                 active_subagent_count=_active_subagent_count(root_task_id, pending_ref, running_ref),
                 max_active_subagents=max_active,
             ))
+            if queued_behind_active_cap:
+                progress_meta["queued_behind_active_cap"] = True
         else:
             progress_meta["task_event"] = "scheduled"
         workers = getattr(ctx, "WORKERS", {}) or {}
@@ -1781,6 +1965,10 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             suffix = " (all workers are currently busy; it will start when one is free)"
         else:
             suffix = ""
+        if delegation_role == "subagent" and queued_behind_active_cap:
+            suffix = (
+                f" (queued behind active subagent cap {max_active}; it will start when a slot frees)"
+            )
         # A subagent's scheduled notice routes to its root project thread by lineage (C4.4); else its own chat; a headless subagent (chat_id=0, no bound root) still skips.
         _notice_chat = (_bound_project_chat_id(ctx, tid, parent_id, root_task_id)
                         if delegation_role == "subagent" else 0) or chat_id
@@ -1823,31 +2011,42 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         live["evolution_mode_enabled"] = enabled
         if enabled:
             live["evolution_consecutive_failures"] = 0
+        # Owner stop is AUTHORITATIVE against the post-task pipeline (mirrors /evolve): set
+        # the durable evolution_owner_stopped flag on disable, clear it on enable (this is an
+        # owner-authorized clear). This is what apply_pending_request reads to refuse re-arm.
+        live["evolution_owner_stopped"] = (not enabled)
         # Symmetry with the owner /evolve path: an explicit toggle must not inherit a
         # stale post-task one-shot autostop that would disable the campaign after one cycle.
         live["post_task_autostop"] = False
 
     st = update_state(_toggle_evolution)
-    try:
-        from supervisor.evolution_lifecycle import pause_evolution_campaign, start_evolution_campaign
-
-        if enabled:
-            start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool")
-        else:
-            pause_evolution_campaign("disabled via agent tool")
-    except Exception:
-        log.debug("Failed to update evolution campaign toggle state", exc_info=True)
     if not enabled:
-        # Cancel the live evolution worker too — pruning PENDING alone leaves a
-        # mid-cycle task running (and eligible for retry).
+        # Cancel the live evolution worker BEFORE the terminal campaign close below:
+        # complete_evolution_campaign runs the per-cycle worktree cleanup, which skips
+        # while a task still holds the shared worktree — so the running cycle must be gone
+        # first (pruning PENDING alone leaves a mid-cycle task running and eligible for retry).
         from supervisor.queue import cancel_running_evolution_tasks
+        from ouroboros.post_task_evolution import drop_pending_request
+        from supervisor import state as _evo_state
 
+        # Fast path; the evolution_owner_stopped flag is the durable backstop.
+        drop_pending_request(_evo_state.DRIVE_ROOT)
         cancel_running_evolution_tasks("disabled via agent tool")
         ctx.PENDING[:] = [t for t in ctx.PENDING if str(t.get("type")) != "evolution"]
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off_via_tool")
+    try:
+        from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+
+        if enabled:
+            start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool")
+        else:
+            # Terminal close (not a resumable pause), so a later /evolve start mints fresh.
+            complete_evolution_campaign("disabled via agent tool", status="stopped")
+    except Exception:
+        log.debug("Failed to update evolution campaign toggle state", exc_info=True)
     if st.get("owner_chat_id"):
-        state_str = "ON" if enabled else "OFF"
+        state_str = "ON" if enabled else "OFF — post-task auto-evolution also paused until /evolve start"
         ctx.send_with_budget(int(st["owner_chat_id"]), f"🧬 Evolution: {state_str} (via agent tool)")
 
 

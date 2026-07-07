@@ -23,95 +23,75 @@ TARGET_MODULE_LINES = 1000
 MAX_MODULE_LINES = 1600
 TARGET_FUNCTION_LINES = 150
 # Advisory SDK orchestration stays single-flow; split tracked as tech debt.
-# Fork merge with upstream/ouroboros-redesign stacks per-round OTEL chain-span
-# management onto the upstream loop body, pushing _run_llm_loop_impl to ~311
-# lines; raised to cover it. Split of the loop is tracked as tech debt.
-MAX_FUNCTION_LINES = 320
-# Ceiling covers safety, review-state, tools/git, skills/extensions, gateway
-# helpers, the packaged CLI bridge/installer, the v5.32 generated Atlas
-# compiler/tests, v5.33 external-workspace CLI artifact/preflight contract,
-# and the v6.1 subagent status SSOT/wait/browser-ingress hardening. Keep this
-# tight and lower it again when the headless/subagent helpers settle.
-# v6.4.0-rc.1 adds the send_video tool/bridge/event path; keep the cap tight
-# while allowing that first-class transport surface.
-# v6.5.0-rc.1 adds task-scoped artifact/user_files/root-resolution helpers
-# for light-mode external deliverables; keep the headroom narrow.
-# v6.6.0-rc.1 adds 4 helpers for effect-gated task-acceptance review and light-mode
-# cognitive/root redirects: turn_has_reviewable_effects, _user_file_basenames,
-# _extract_fenced_json, light_cognitive_or_root_redirect. Keep the headroom narrow.
-# v6.7.0-rc.1 adds reliability helpers for the subagent/worker fixes: worker
-# network policy (in_worker_process), monotonic status guard
-# (_is_status_regression), terminal-event/cancel emitters (_emit_task_done_terminal,
-# _emit_cancel_task_done, _drop_cancelled_pending), bundled-node resolution
-# (embedded_node_candidates, resolve_bundled_node), marketplace opener
-# (_build_opener), and the schedule pool-unavailable guard
-# (_reject_schedule_pool_unavailable). v6.7.1 adds the out-of-process extension
-# runner and proxy validation helpers. v6.9.0-rc.1 adds the first-class
-# evolution campaign, schedule, and memory-provenance helpers. v6.10.0 adds
-# adaptive LLM request normalization plus role-based remote/Colab bootstrap
-# helpers; v6.11 adds narrow safety-critical headroom for hermetic preflight,
-# live-mutation fuses, child advisory crash isolation, and evolution transaction
-# evidence; v6.12 adds the QA-fix helpers (marketplace collision-rename, task-cost
-# reconstruction, evolution-stop cancel, preflight process-tree reaping, worker
-# log forwarding). The low/max context-mode work adds the owner setting helpers
-# (normalize_context_mode, get_context_mode, api_owner_context_mode) and the
-# context_layout doc-layout SSOT (_read_doc, generate_doc_nav_map,
-# architecture_context_section, reference_doc_sections), the context-overflow
-# classifier (_is_context_overflow_error), the opt-in degraded low-context
-# scope-review limit resolver (_effective_scope_input_limit), two main-loop
-# extractions that keep the orchestrators under the per-function gate
-# (_run_round_compaction, _record_llm_call_error), and the structured
-# development-context signal helper (_task_requires_development_context). Real
-# triad/scope fixes add three narrow guard/supplemental helpers
-# (_degraded_scope_requested, _detect_context_mode_self_lowering,
-# _blocks_context_mode_self_lowering_js) and the CLI owner context-mode wrapper
-# (_owner_context_mode_command). The structural context-mode owner guard adds
-# four contract/network helpers (_settings_file_context_mode,
-# _guard_context_mode_lowering, _is_context_mode_owner_post,
-# _block_context_mode_owner_post), plus the idle-task gateway predicate
-# (_has_running_agent_tasks). The GigaChat provider adds the native gigachat::
-# execution-path helpers in llm.py (_get_gigachat_client, _gigachat_text,
-# _gigachat_function_result, _gigachat_messages, _gigachat_functions,
-# _gigachat_sanitize_schema, _chat_gigachat, _normalize_gigachat_response) plus
-# the gateway catalog fetcher (_fetch_gigachat_model_catalog). Keep the headroom
-# narrow and pay down after surfaces stabilize.
-# v6.15.0 adds out-of-process extension parity (capability matrix + negotiation,
-# on_unload-at-teardown, companion catalog surface, WS-out bridge), the atomic
-# enable dry-run, and the durable extension health vector (extension_health.py).
-# That introduces a small, justified batch of new functions. Keep headroom narrow.
-# v6.17.0 adds task contracts/outcome axes, task-aware context helpers, and
-# restart-verified evolution accounting. Keep the cap close to the smoke result.
-# Workspace/tool hardening adds git shell classifiers, protected artifact
-# policy, artifact-history retention, and focused regression tests. Keep the
-# cap at the verified smoke result.
-# Phase 3 runtime-agent hardening adds subagent lane envelopes, planning swarm
-# guards, marketplace rollback, extension crash-UX helpers, and the scheduler
-# rejection cleanup needed to keep oversized functions below the hard gate.
-# Phase 4 adds WebKit/device browser helpers, the owner-local UI preferences
-# endpoint, and focused browser/UI smoke tests. Keep the cap at the verified
-# smoke result and pay down after the browser/frontend surfaces settle.
-# v6.18.0 recovery adds shared cross-platform shell path helpers plus
-# bg-consciousness/reconnect/widget regression coverage. Keep the cap at the
-# verified smoke result; pay it down after the recovery release lands.
-# Recovery completion restores strict scope-review contract parsing after the
-# atlas/context-limit incident; keep the cap at the verified smoke result.
-# v6.19.0-rc.1 adds the workspace executor bridge as a first-class runtime
-# boundary for container-backed benchmark workspaces, including service
-# process-group lifecycle helpers, shared devtools output-root guards, and
-# strict cleanup/protected-artifact review follow-ups. Review cycle 2 added
-# durable executor panic-cleanup/backend-path helpers. Keep deliberate headroom
-# for small safety/review helpers so minor fixes do not churn this gate; pay down
-# with a focused simplification pass after the prerelease lands.
-# Fork merge with old/main (upstream/ouroboros-redesign) additionally unions the
-# redesign's modules (guardrails_llm, telemetry/OTEL, observability,
-# llm_observability, PWA, analytics, fixed-infra policy) on top of this fork's
-# self-evolution surface. Keep the higher cap to cover the combined surface;
-# lower again after the overlapping observability stacks are reconciled.
-# Merge with upstream ouroboros v6.32.2: upstream raised MAX_TOTAL_FUNCTIONS to
-# 3500 (paydown + headroom). The fork's redesign/telemetry surface sits on top,
-# so keep the higher 3500 cap; the OTEL-wrapped loop keeps MAX_FUNCTION_LINES at
-# 320. test_smoke.py::test_function_count_reasonable enforces the cap in CI.
-MAX_TOTAL_FUNCTIONS = 3500
+MAX_FUNCTION_LINES = 300
+# Deterministic anti-bloat brake (BIBLE P3 "codebase size" gate, P7 minimalism):
+# tests/test_smoke.py::test_function_count_reasonable enforces this in CI and in
+# the hermetic self-commit preflight. Owner decision 2026-06-10: first paydown
+# in gate history (consolidation pass removed ~60 dead/duplicate/trivial-wrapper
+# functions) plus headroom to 3500 so routine fixes stop churning this constant.
+# v6.45.1: the 4-TZ mega-sprint plus managed #53 added reviewed GAIA/vision/
+# benchmark/evolution helper surfaces; accepted with explicit release-review debt.
+# The convention stands: growth must be acknowledged — bump deliberately with a
+# one-line justification here. Value archaeology lives in git history of this line.
+# v6.46.0: GAIA-forensic hardening added reviewed single-purpose helpers (fail_tasks,
+# _deliverables_root, _resolve_or_provider, the generative context-window probe, the
+# GAIA adapter knobs); bump with small headroom so the release's tests do not re-churn.
+# v6.47.0: the verify-before-done flagship (verify_and_record + receipt-store/grounding/
+# flag/nudge helpers in outcomes.py + loop.py), FR2 cooperative-subagent helpers, FR1
+# skill-publish eligibility predicate, and the query_code/shell/control extracted helpers.
+# v6.50.0: reconciliation-layer helpers (typed delegation constraints, schedule-time
+# capability reconciliation, child-absorption outcome shelf) plus SWE-Pro adapter
+# hardening tests. Small headroom; split/paydown remains tracked in DEVELOPMENT.md.
+# scope-review false-1M fix: +4 plus headroom (3575 -> 3582) — reviewed
+# single-purpose helpers in tools/scope_review.py: _is_designated_default_reviewer +
+# its nested _normalized, _provider_error_is_oversize, and
+# _scope_oversize_advisory_result (the last DEDUPES the two oversize→advisory
+# branches, keeping run_scope_review under the per-function line gate).
+# v6.50.3: +5 TB/swarm capability helpers — A1 verify._expected_matches (exact/
+# structured match), A3 loop._contract_expected_output (no-op nudge gate), B1
+# agent_task_pipeline._build_swarm_efficiency (delegation rollup), B2
+# control._count_live_sibling_children (burst/absorb advisory), A2
+# outcomes._is_ignored_readonly_block (SSOT predicate shared by the execution axis
+# and the verification ledger). Cap 3585 = current count 3584 + 1 slot headroom
+# (rebased on #57's scope-review fix, which already moved the cap to 3582).
+# v6.51.0: +11 net = shell_parse.recover_stringified_argv + normalize_check_argv (verify
+# argv/PATH SSOT, idea-1), outcomes.latest_unreconciled_failed_receipt + ...verification
+# (red-finalize predicate, idea-3), and the review_evidence process-aware acceptance packet
+# (build_task_acceptance_evidence + 6 bounded/redacted/leak-safe helpers, idea-2), minus
+# verify._normalize_check (now an alias to the shell_parse SSOT). The 6 _accept_* helpers
+# keep build_task_acceptance_evidence under the 150-line method gate. +1 (review round-1):
+# the _accept_enforce_budget `_size()` closure (disclosed-truncation ladder, leak-safety fix).
+# Cap 3597 = 3585 + 12, no extra headroom (acknowledged growth, per the gate's purpose).
+# v6.52.0 +15 = 3612: media.py ocr_pdf/youtube_transcript + 4 helpers (P4b); llm._is_deferrable_image_user_turn
+# (P4a ordering); verify._confine_artifact_path + _probe_artifact_lifecycle (C); artifacts.stage_task_attachments
+# + _safe_attachment_name + context._build_attachment_image_blocks + gateway._render_attachment_lines
+# + ws._chat_attachment_uploads (P1 attachment substrate + full desktop unify).
+# v6.52.2 +8 = 3620: ephemeral-scratch + exit-masking integrity. shell._resolve_scratch_abs +
+# shell._scratch_safety_reason + shell._record_scratch_fingerprints (Fix #1 scratch guard +
+# every-exit-path fingerprint recording); artifacts.record_task_scratch +
+# artifacts.read_task_scratch_fingerprints (fingerprinted scratch manifest); verify._check_has_exit_masking
+# (Fix #2 sensor); outcomes.latest_unreconciled_masked_pass + outcomes.latest_unreconciled_masked_verification.
+# evolution-stop authoritative fix: +2 functions -> new count 3622; cap set to 3624 (+2 headroom).
+# evolution_lifecycle.complete_evolution_campaign (terminal owner-stop, distinct from the resumable pause) +
+# post_task_evolution.drop_pending_request (clear a queued promotion at the owner-stop sites; the durable backstop
+# is the evolution_owner_stopped flag read in apply_pending_request).
+# v6.53.0 benchmark-generalization hardening adds small typed helpers for Observable Acceptance Claims,
+# support_refs, GAIA profiles, media frame extraction, VLM timeout wrapping, and workspace inheritance.
+# Cap intentionally moves with a small headroom rather than hiding growth elsewhere.
+# v6.54.3 runtime-reliability: +~20 functions for the OUROBOROS_SAFETY_MODE owner-guard set
+# (config ratchet/getters, owner endpoint, registry/browser detectors — mirrors the established
+# context-mode/scope-floor pattern), transport-timeout SSOT getters, the read-vs-write
+# runtime_data scan refinement, and slot-visibility helpers; cap 3636 -> 3690 with small headroom.
+# v6.56.0 cost-axis/bench sprint: +~5 functions (task_pacing cost milestones +
+# ceiling resolver, loop transport wrapper, media ffmpeg resolver chain,
+# protected-artifact round-2 classifiers) — deliberate feature growth; 3690 -> 3699
+# with the usual small headroom.
+MAX_TOTAL_FUNCTIONS = 3699
+GRANDFATHERED_OVERSIZED_FUNCTIONS = {
+    ("agent_startup_checks.py", "verify_restart"),  # managed #53 boot diagnostic flow, 307 lines
+    ("git.py", "_run_reviewed_stage_cycle"),  # reviewed-commit gate orchestration, 302 lines
+    ("events.py", "_handle_schedule_task"),  # v6.50 admission reconciliation grew the existing scheduling choke point.
+}
 # Grandfathered modules are accepted debt until their surfaces stabilize/split.
 GRANDFATHERED_OVERSIZED_MODULES = {
     "llm.py",
@@ -132,6 +112,8 @@ GRANDFATHERED_OVERSIZED_MODULES = {
     # is tracked as accepted debt to pay down after the feature stabilizes.
     "registry.py",
     "events.py",
+    "control.py",
+    "workers.py",
     # v6.33.0 reliability work crossed three core modules that were at/near the
     # ceiling. loop.py (was 1523) gained deadline-aware finalization + intrinsic
     # pacing; the helpers are tightly coupled to loop internals (_forced_final_answer,

@@ -56,42 +56,6 @@ class TestChecklistSectionLoader:
             mod.load_checklist_section("Nonexistent Section")
 
 
-class TestGoalScopePrecedence:
-    def test_goal_wins(self):
-        mod = _get_module("ouroboros.tools.review_helpers")
-        text, source = mod.resolve_intent(goal="fix X", scope="scope Y", commit_message="msg Z")
-        assert source == "goal"
-        assert "fix X" in text
-
-    def test_scope_when_no_goal(self):
-        mod = _get_module("ouroboros.tools.review_helpers")
-        text, source = mod.resolve_intent(goal="", scope="scope Y", commit_message="msg Z")
-        assert source == "scope"
-        assert "scope Y" in text
-
-    def test_commit_message_when_no_goal_no_scope(self):
-        """v4.33.0: commit-message fallback returns only the subject line,
-        and source is labelled ``commit message (subject)`` to make the
-        scoping explicit for downstream readers.
-        """
-        mod = _get_module("ouroboros.tools.review_helpers")
-        text, source = mod.resolve_intent(goal="", scope="", commit_message="msg Z")
-        assert source == "commit message (subject)"
-        assert "msg Z" in text
-
-    def test_fallback_when_all_empty(self):
-        mod = _get_module("ouroboros.tools.review_helpers")
-        text, source = mod.resolve_intent()
-        assert source == "fallback"
-        assert "No explicit goal" in text
-
-    def test_no_raw_task_text_in_fallback(self):
-        """Fallback must NOT use raw task/chat text."""
-        mod = _get_module("ouroboros.tools.review_helpers")
-        text, source = mod.resolve_intent()
-        assert "task" not in text.lower() or "No explicit" in text
-
-
 class TestGoalSection:
     def test_goal_section_has_source(self):
         mod = _get_module("ouroboros.tools.review_helpers")
@@ -466,8 +430,18 @@ class TestRunScopeReviewFailClosed:
         assert mod._window_scaled_reserves(1_000_000) == (
             mod._SCOPE_MAX_TOKENS, mod._SCOPE_OUTPUT_MARGIN_TOKENS
         )
-        full = mod._effective_scope_input_limit(scope_model="openai/gpt-5.5")
-        assert full == mod._SCOPE_INPUT_TOKEN_LIMIT
+        # The designated >=1M reviewer keeps the ABSOLUTE reserves (not the
+        # window-scaled ones); its cap is the family-calibrated absolute limit.
+        from ouroboros.tools.review_helpers import calibrated_input_token_limit
+
+        full = mod._effective_scope_input_limit(scope_model=mod._SCOPE_MODEL_DEFAULT)
+        assert full == calibrated_input_token_limit(
+            mod._SCOPE_MODEL_DEFAULT,
+            context_window=mod._SCOPE_MODEL_CONTEXT_WINDOW,
+            output_reserve=mod._SCOPE_MAX_TOKENS,
+            tokenizer_margin=mod._SCOPE_OUTPUT_MARGIN_TOKENS,
+        )
+        assert full > 400_000  # a real 1M window keeps a large workable cap
 
     def test_irreducible_overflow_terminal_split_by_authority(self, tmp_path, monkeypatch):
         """Ladder terminal: the >=1M blocking reviewer fails CLOSED
@@ -676,6 +650,11 @@ class TestRunScopeReviewFailClosed:
             "_call_scope_llm",
             lambda *a, **k: (json.dumps(raw_items), {"prompt_tokens": 10, "completion_tokens": 5}, None),
         )
+        # Treat the fake reviewer as >=1M so this test isolates the ADVISORY-ENFORCEMENT
+        # downgrade (its target) from the separate sub-floor downgrade: an off-default
+        # model with no Capability Evidence now fail-closes to the sub-floor (v6.46.0 fix),
+        # which would empty critical_findings via the sub-floor path instead.
+        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda m: 1_000_000)
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
 
@@ -812,6 +791,71 @@ class TestRunScopeReviewFailClosed:
         assert result.blocked is True
         assert result.status == "error"
 
+    def test_gateway_provider_error_400_oversize_downgrades_to_nonblocking_skip(self, tmp_path, monkeypatch):
+        """F2: an openai-compatible/OpenRouter oversize 400 returns an EMPTY body +
+        usage['provider_error']{code:400} with llm_error='' (NOT a raised text error),
+        so the text-marker oversize branch never fires and the empty body would
+        otherwise hard-block as empty_response. With independent size evidence it must
+        downgrade to the SAME non-blocking budget_exceeded advisory (the v6.46.0
+        OpenRouter scope-discard variant)."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-gateway-400-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        # 32 chars ~= 8 estimated tokens: below the effective input limit (10), but
+        # near enough to be independent size evidence for an opaque gateway 400.
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("x" * 32, None))
+        monkeypatch.setattr(
+            mod, "_call_scope_llm",
+            lambda *a, **k: ("", {"prompt_tokens": 0, "completion_tokens": 0,
+                                  "provider_error": {"code": 400, "kind": "provider_error", "message": ""}}, ""),
+        )
+        monkeypatch.setattr(mod, "_effective_scope_input_limit", lambda *a, **k: 10)
+
+        result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-sonnet-4.5")
+
+        assert result.blocked is False
+        assert result.status == "budget_exceeded"
+        assert result.advisory_findings
+        assert result.advisory_findings[0]["item"] == "scope_review_skipped"
+
+    def test_gateway_provider_error_400_non_oversize_stays_fail_closed(self, tmp_path, monkeypatch):
+        """F2 guard: a NON-size gateway 400 (auth/param/policy — same code, same empty
+        body) must NOT downgrade. No size evidence (small prompt, large window) keeps the
+        fail-closed empty_response block, so a misconfiguration never silently skips the
+        blocking scope review."""
+        mod = _get_module("ouroboros.tools.scope_review")
+
+        class MockCtx:
+            repo_dir = str(tmp_path)
+            task_id = "scope-gateway-auth400-test"
+            pending_events = []
+
+            def drive_logs(self):
+                return tmp_path
+
+        monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("x" * 32, None))
+        monkeypatch.setattr(
+            mod, "_call_scope_llm",
+            lambda *a, **k: ("", {"prompt_tokens": 0, "completion_tokens": 0,
+                                  "provider_error": {"code": 400, "kind": "provider_error", "message": "invalid api key"}}, ""),
+        )
+        # Even a large prompt near the resolved window must stay fail-closed when the
+        # provider gives a concrete non-size message. Size proximity is reserved for
+        # opaque/empty gateway 400 bodies.
+        monkeypatch.setattr(mod, "_effective_scope_input_limit", lambda *a, **k: 10)
+
+        result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
+
+        assert result.blocked is True
+        assert result.status == "empty_response"
+
     def test_effective_scope_limit_uses_real_window_for_small_window_reviewer(self, monkeypatch):
         """B2: a KNOWN sub-1M reviewer window (Capability Evidence) replaces the
         assumed 1M, so the pack overflows into the visible budget_exceeded skip
@@ -884,13 +928,13 @@ class TestScopeReviewModule:
         assert "SCOPE_REVIEW_BLOCKED" in source
         assert "fail" in source.lower() or "block" in source.lower()
 
-    def test_scope_review_uses_opus(self):
+    def test_scope_review_default_is_fable(self):
         mod = _get_module("ouroboros.tools.scope_review")
-        assert "gpt-5.5" in mod._SCOPE_MODEL_DEFAULT
-        # Verify the getter returns opus when no override env var is set
+        assert "fable-5" in mod._SCOPE_MODEL_DEFAULT
+        # Verify the getter returns the shipped default when no override env var is set
         import os
         if not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL"):
-            assert "gpt-5.5" in mod._get_scope_model()
+            assert "fable-5" in mod._get_scope_model()
         # else: env override is active — default check not applicable in this env
 
     def test_scope_review_model_configurable_via_env(self):
@@ -1866,19 +1910,78 @@ class TestTriadPromptAntiPatternLock:
 
 
 def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_path):
-    """claudexor B4: with NO capability evidence, an unknown reviewer must NOT be
-    treated as 1M unless the owner explicitly declared blocking_1m. floor=advisory
-    (or any non-blocking declaration) -> sub-floor window so the P3 authority
-    downgrades; floor=blocking_1m (default for the designated gpt-5.5) -> 1M."""
+    """claudexor B4 + v6.46.0 false-1M fix: with NO capability evidence, ONLY the
+    SHIPPED designated reviewer (_SCOPE_MODEL_DEFAULT) is granted the 1M blocking
+    sentinel under blocking_1m. An OFF-DEFAULT reviewer (e.g. an
+    OUROBOROS_SCOPE_REVIEW_MODEL pin) fails closed to the sub-floor under BOTH floors —
+    so the P3 authority downgrades it visibly instead of silently treating a 200K model
+    as 1M and overflowing its real window into a provider 400. A non-default >=1M
+    reviewer must be owner-acked to regain 1M."""
     from ouroboros.tools import scope_review as sr
+    from ouroboros import capability_evidence
+    from types import SimpleNamespace
 
-    # Isolated, empty data dir -> probe returns no evidence for any model.
+    # Isolated, empty evidence -> no model gets Capability Evidence.
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        capability_evidence,
+        "probe",
+        lambda *a, **k: SimpleNamespace(window_tokens=0),
+    )
 
+    # An OFF-DEFAULT reviewer with no evidence fails closed under advisory...
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
     w_adv = sr._scope_reviewer_window("gigachat::GigaChat-3-Ultra")
     assert 0 < w_adv < sr._SCOPE_MODEL_CONTEXT_WINDOW, w_adv  # fail-closed sub-floor
 
+    # ...AND under blocking_1m (the v6.46.0 bug: a pinned off-default 200K model that
+    # used to be wrongly trusted as 1M now fails closed instead of overflowing).
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
-    w_block = sr._scope_reviewer_window("gigachat::GigaChat-3-Ultra")
-    assert w_block == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_block  # explicit owner declaration
+    w_offdefault = sr._scope_reviewer_window("anthropic/claude-sonnet-4.5")
+    assert w_offdefault == sr._SCOPE_FAILCLOSED_WINDOW, w_offdefault
+
+    # The SHIPPED designated reviewer keeps the 1M sentinel under blocking_1m.
+    w_designated = sr._scope_reviewer_window(sr._SCOPE_MODEL_DEFAULT)
+    assert w_designated == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_designated
+
+    # Direct-provider and explicit OpenRouter spellings of the same shipped reviewer
+    # are also the designated default. Regression guard for anthropic::claude-fable-5
+    # being reduced to bare "claude-fable-5" and then misclassified as off-default.
+    w_direct = sr._scope_reviewer_window("anthropic::claude-fable-5")
+    assert w_direct == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_direct
+    w_openrouter = sr._scope_reviewer_window("openrouter::anthropic/claude-fable-5")
+    assert w_openrouter == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_openrouter
+
+
+def test_scope_reviewer_window_uses_scope_slot_route_not_main(monkeypatch, tmp_path):
+    """Capability Evidence for scope review must use the scope slot's route.
+
+    A local-routed main lane (`USE_LOCAL_MAIN=true`) must not turn a remote direct
+    OpenAI scope reviewer into a local route lookup.
+    """
+    from types import SimpleNamespace
+    from ouroboros import capability_evidence, config
+    from ouroboros.tools import scope_review as sr
+
+    captured = {}
+
+    def fake_probe(drive_root, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(window_tokens=333_333)
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        config,
+        "load_settings",
+        lambda: {
+            "USE_LOCAL_MAIN": True,
+            "OPENAI_BASE_URL": "https://api.openai.test/v1",
+        },
+    )
+    monkeypatch.setattr(capability_evidence, "probe", fake_probe)
+
+    assert sr._scope_reviewer_window("openai::gpt-5.5") == 333_333
+    assert captured["provider"] == "openai"
+    assert captured["model"] == "openai::gpt-5.5"
+    assert captured["base_url"] == "https://api.openai.test/v1"
+    assert captured["use_local"] is False

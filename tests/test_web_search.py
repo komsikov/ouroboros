@@ -135,7 +135,7 @@ def test_web_search_uses_official_openai_responses(monkeypatch):
             return _Stream()
 
     class _Client:
-        def __init__(self, api_key=None, base_url=None):
+        def __init__(self, api_key=None, base_url=None, **kwargs):  # v6.54.3: accepts timeout
             calls["api_key"] = api_key
             calls["base_url"] = base_url
             self.responses = _Responses()
@@ -147,7 +147,7 @@ def test_web_search_uses_official_openai_responses(monkeypatch):
         search_module._web_search(request_ctx, "latest news", model="gpt-5.2")
     )
 
-    assert result == {"answer": "fresh answer", "sources": [], "backend": "openai_responses"}
+    assert result == {"answer": "fresh answer", "answer_type": "summary", "sources": [], "backend": "openai_responses"}
     assert calls["api_key"] == "openai-key"
     assert calls["base_url"] is None
     assert calls["kwargs"]["model"] == "gpt-5.2"
@@ -187,7 +187,7 @@ def test_web_search_falls_back_to_openrouter_server_tool(monkeypatch):
         completions = _Completions()
 
     class _Client:
-        def __init__(self, api_key=None, base_url=None):
+        def __init__(self, api_key=None, base_url=None, **kwargs):  # v6.54.3: accepts timeout
             calls["api_key"] = api_key
             calls["base_url"] = base_url
             self.chat = _Chat()
@@ -228,6 +228,42 @@ def test_web_search_falls_back_to_ddgs(monkeypatch):
 
     assert result["backend"] == "ddgs"
     assert result["sources"] == [{"url": "https://example.com", "title": "Example", "snippet": "Snippet"}]
+
+
+def test_web_search_backend_pin_ddgs_forces_retrieval_no_cascade(monkeypatch):
+    # All LLM keys present, but the pin forces ddgs (fixed-model "no second LLM" run).
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "ddgs")
+
+    def _boom(*_a, **_k):  # any LLM backend touched => the pin leaked
+        raise AssertionError("pinned ddgs must not cascade to an LLM backend")
+
+    monkeypatch.setattr(search_module, "_web_search_openrouter", _boom)
+    monkeypatch.setattr(search_module, "_web_search_anthropic", _boom)
+    monkeypatch.setattr(search_module, "_web_search_ddgs", lambda q: json.dumps({"backend": "ddgs", "sources": []}))
+
+    result = json.loads(_web_search(types.SimpleNamespace(pending_events=[]), "q"))
+    assert result["backend"] == "ddgs"
+
+
+def test_web_search_backend_pin_openai_hard_fails_no_cascade(monkeypatch):
+    # 'openai' is a TRUE pin: with no OpenAI key it must NOT fall back to other backends.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+
+    def _boom(*_a, **_k):
+        raise AssertionError("pinned openai must not cascade to another backend")
+
+    monkeypatch.setattr(search_module, "_web_search_openrouter", _boom)
+    monkeypatch.setattr(search_module, "_web_search_anthropic", _boom)
+    monkeypatch.setattr(search_module, "_web_search_ddgs", _boom)
+
+    result = json.loads(_web_search(types.SimpleNamespace(pending_events=[]), "q"))
+    assert result["backend"] == "openai"
+    assert "openai" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +415,7 @@ def test_web_search_sanitizes_provider_errors(ctx, patch_env, monkeypatch):
             raise RuntimeError(f"provider rejected Authorization: Bearer {leaked_secret}")
 
     class _Client:
-        def __init__(self, api_key=None, base_url=None):
+        def __init__(self, api_key=None, base_url=None, **kwargs):  # v6.54.3: accepts timeout
             self.responses = _Responses()
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))

@@ -77,8 +77,10 @@ OUROBOROS_REPO_DIR=/opt/ouroboros-src
 OUROBOROS_DATA_DIR=/logs/agent/ouroboros-data
 OUROBOROS_SETTINGS_PATH=/logs/agent/ouroboros-data/settings.json
 OUROBOROS_RUNTIME_MODE=pro
-OUROBOROS_REVIEW_ENFORCEMENT=advisory
+OUROBOROS_REVIEW_ENFORCEMENT=blocking
 OUROBOROS_TASK_REVIEW_MODE=required
+OUROBOROS_SAFETY_MODE=light
+OUROBOROS_MAX_WORKERS=4
 OUROBOROS_MODEL_LIGHT=google/gemini-3.5-flash
 OUROBOROS_WORKER_START_METHOD=spawn
 ```
@@ -220,13 +222,15 @@ official limits:
 task.toml [agent].timeout_sec
 ```
 
-Honesty note: on a standard Terminal-Bench leaderboard run Harbor does **not**
-pass `task_timeout_sec` to the agent, and `run_tb.py` does not synthesize one
-(injecting an arbitrary deadline would be a methodology override, which
-`validate_methodology` forbids). So the deadline-milestone / deadline-derived
-`run_command` cap features are inert on leaderboard runs by design — they apply
-only to user/headless tasks that carry an explicit `deadline_at`. Pass
-`task_timeout_sec` yourself only for local experiments, never for a submission.
+Honesty note: Harbor's `AgentContext` does not reliably pass `[agent].timeout_sec`
+to installed agents, but the adapter now has a second legitimate fallback:
+`_resolve_task_timeout_from_dataset` reads the public cached `task.toml` for the
+current task package and forwards that official timeout to Ouroboros. Therefore
+deadline milestones and deadline-derived `run_command` caps are usually active on
+leaderboard-shaped cached runs; they are inert only when neither Harbor context nor
+the public task cache exposes a timeout. Passing a synthetic `task_timeout_sec`
+yourself remains a local experiment only; never inflate a task timeout for a
+submission.
 
 Setup and environment timeouts are separate:
 
@@ -235,17 +239,103 @@ Setup and environment timeouts are separate:
 - agent execution: task `[agent].timeout_sec`;
 - verifier: task `[verifier].timeout_sec`.
 
-For heavy Docker builds, use:
+> ⚠️ **LEADERBOARD-DISQUALIFYING — do NOT use for a submission.** Setting
+> `--environment-build-timeout-multiplier` or `--agent-setup-timeout-multiplier`
+> to anything other than the default (null/1.0) makes the run **non-submittable**.
+> The official Harbor leaderboard validator
+> (`harbor/leaderboard/static_validation.py::_check_no_job_overrides`,
+> verified in harbor 0.13.1 and upstream
+> <https://github.com/harbor-framework/harbor>) rejects ANY non-null
+> `agent_setup_timeout_multiplier` / `environment_build_timeout_multiplier`
+> ("must not be set"), and **10/10 sampled real accepted submissions leave both
+> `null`** (HF repo, see "Leaderboard Validity Rules" below). These are LOCAL-ONLY
+> debug knobs. `run_tb.py` already guards them behind `--allow-setup-build-multipliers`
+> and grades any such run `local_low_k`.
+>
+> **The faithful way to survive heavy/slow builds is NOT a multiplier — it is a
+> pre-built/pinned image** (`environment.force_build=false`, which 8/10 real
+> accepted submissions use). Pre-build the task images once and reuse them so the
+> default 1.0 build/setup timeouts are never hit.
+
+For heavy Docker builds **in a LOCAL (non-submission) run only**, you may use:
 
 ```bash
---environment-build-timeout-multiplier 4
+--environment-build-timeout-multiplier 4   # LOCAL ONLY — disqualifies a submission
+--agent-setup-timeout-multiplier 4         # LOCAL ONLY — disqualifies a submission
 ```
 
-For installed Ouroboros setup, use:
+## Leaderboard Validity Rules (verified 2026-06-30 against primary sources)
 
-```bash
---agent-setup-timeout-multiplier 4
-```
+Triangulated from the OFFICIAL Harbor validator code (the same one the Hub/Supabase
+bot runs), the published submission README, and 10 real accepted submissions. **A
+run is leaderboard-valid ONLY if ALL of these hold; otherwise it is LOCAL-only.**
+
+| Rule | Requirement | Source |
+|---|---|---|
+| Trials per task `k` | **≥ 5** (`MIN_TRIALS_PER_TASK = 5`) | validator code; HF README; real submission path `…-k5-…` |
+| Task `timeout_multiplier` | **== 1.0** | validator `_check_no_job_overrides`; timeouts post |
+| `agent_timeout_multiplier`, `verifier_timeout_multiplier` | **must be null** | validator |
+| **`agent_setup_timeout_multiplier`** | **must be null** (NOT a multiplier ≠1) | validator rejects any non-null; **10/10 accepted submissions = null** |
+| **`environment_build_timeout_multiplier`** | **must be null** | validator rejects any non-null; **10/10 accepted submissions = null** |
+| Resource overrides (`override_cpus/memory_mb/storage_mb/gpus`, `*.override_timeout_sec`) | **must be unset** | validator |
+| Container network access | **ALLOWED** by default (task/package setup and in-container commands may use the network unless a task restricts it) | TB2.1 paper + Harbor task config |
+| Ouroboros **agent-web tools** (`--allow-agent-web`) | **LOCAL-only / disclose** — static validation does not reject it, but enabling first-class web/search/browser tools raises reward-hacking exposure. Keep OFF for leaderboard-faithful runs unless the submission rules explicitly allow that exact scaffold | integrity update; `run_tb.py` self-stamps web-on runs non-faithful |
+| Pre-built / pinned images (`environment.force_build=false`) | **ALLOWED & STANDARD** (TB2.1 reproducibility design) | **8/10 accepted submissions use `force_build:false`** |
+| Host-side `colima` resources, `--n-concurrent` | **ALLOWED** (not job-config overrides) | not in validator |
+
+Primary sources (read these before any submission-grade run):
+- Official validator code: <https://github.com/harbor-framework/harbor> →
+  `src/harbor/leaderboard/static_validation.py` (`MIN_TRIALS_PER_TASK`,
+  `_check_no_job_overrides`, `_trial_timeout_override_fields`). Installed locally as
+  harbor `0.13.1`.
+- Submission rules + real accepted configs:
+  <https://huggingface.co/datasets/harborframework/terminal-bench-2-leaderboard>
+  (browse `submissions/terminal-bench/2.0/<agent>__<model>/.../config.json`).
+- Reward-hacking judge + web policy:
+  <https://www.tbench.ai/news/leaderboard-integrity-update>
+- Timeout policy (task timeout must not be changed):
+  <https://www.tbench.ai/news/leaderboard-integrity-and-timeouts>
+- Run/submit docs: <https://www.tbench.ai/docs/run-terminal-bench-2-1> ;
+  leaderboard: <https://www.tbench.ai/leaderboard/terminal-bench/2.1> ;
+  status/news: <https://www.tbench.ai/news>
+- **Submission status (2026-06-30): CLOSED** — "new submission process coming soon";
+  no `2.1/` submission path published yet. Re-check the two links above before running.
+
+### Cost reality (don't burn money on non-faithful full runs)
+A FULL run is expensive: gpt-5.5-high on TB2.1 (89 tasks) costs **~$1.5/trial
+average** (median ~$1.2, worst single task ~$12). So **k=3 ≈ $330–420**, and a
+faithful **k=5 ≈ $550–700**. Per-trial wall-clock is ~75% LLM solving (~14 min at
+n-concurrent 3). **Before launching a full run, confirm the config is leaderboard-valid
+(table above) — a wrong knob (e.g. a setup/build multiplier, k<5) means the whole
+spend is non-submittable and must be re-run.** Cost is in each trial's
+`agent/ouroboros-run-summary.json` → `cost_usd` (sum across trials for the run total;
+note deleted/retried trial dirs drop their cost record, so the on-disk sum is a lower bound).
+
+### Hard-won errors / gotchas (so we don't repeat them)
+- **×4 setup/build multipliers are NOT faithful.** The old advice in "Timeout
+  Semantics" (and example commands) used them; they DISQUALIFY a submission. Use
+  **pre-built images** instead to survive slow/heavy builds at the default 1.0 timeouts.
+- **Distinguish container network from Ouroboros web tools.** Terminal-Bench tasks
+  normally allow container-level network access for package installs and task work, but
+  `--allow-agent-web` exposes Ouroboros's first-class web/search/browser tools. That is
+  a scaffold change with reward-hacking risk (TB site/GitHub/online solution lookups),
+  so keep it OFF for leaderboard-faithful runs and disclose it for local experiments.
+  For example, `mteb-leaderboard` must reach its answer via official sources, not a
+  3rd-party TB "explorer" that leaks the reference + canary.
+- **Container-secret env var is `OUROBOROS_BENCH_ALLOW_CONTAINER_SECRETS=1`** (full
+  name; the bare `ALLOW_CONTAINER_SECRETS` silently fails every task).
+- **`run_tb.py` flag names differ from harbor's:** `--setup-timeout-multiplier` /
+  `--build-timeout-multiplier` (run_tb) map to
+  `--agent-setup-timeout-multiplier` / `--environment-build-timeout-multiplier` (harbor).
+- **No-resume fragility of `run_tb.py`** (fresh job + `--force-build` each call) vs the
+  robust path: **`harbor job resume -p <jobdir> [-f <ErrorType>]`** continues an existing
+  job (keeps completed trials, re-runs pending + the `-f`-removed errored-artifact trials);
+  wrap it in a retry loop so a transient SSL/DNS blip just re-resumes instead of restarting.
+- **install-timeout on slow mirrors** (`RuntimeError: Command timed out after 1200s`) and
+  AgentSetupTimeout are infra, not capability — pre-built images remove this failure class.
+- **Pausing via SIGSTOP + sleep** blows in-flight trials' wall-clock deadlines →
+  `deadline_local` reward-0 artifacts on resume; reclassify (reason_code + pause window)
+  and re-run those trials before scoring. Don't count infra/pause artifacts as genuine fails.
 
 ## Common Commands
 
@@ -378,6 +468,38 @@ to the measured model inside the container. `OUROBOROS_MODEL_LIGHT` defaults to
 `--agent-kwarg ouroboros_light_model=<provider/model>` or `run_tb.py
 --light-model ...`. This avoids accidentally running safety checks and
 lightweight JSON decisions on the expensive measured model.
+
+### Why `--all-model` pins the review slots too
+
+`run_tb.py --all-model` pins `OUROBOROS_REVIEW_MODELS` to the solve model
+(lightened to ONE reviewer at low effort). This is intentional and must stay:
+a TB run claims a SINGLE-MODEL measurement, so the acceptance-review content —
+which feeds improvement passes back into the answer — must come from the same
+model. Substituting a stronger/different reviewer would smuggle a second
+reasoning model into the scaffold and invalidate the single-model claim; the
+lone low-effort reviewer slot keeps review ON (part of the measured harness)
+without reviewer diversity. `single_reviewer_no_diversity` stays loud in logs
+by design.
+
+### Scaffold defaults (v6.55.0)
+
+The adapter template pins, and the methodology discloses:
+
+- `OUROBOROS_RUNTIME_MODE=pro` — the container is a disposable jail with a
+  fresh repo copy; pro unlocks the file/self-modification surface the bench
+  legitimately measures.
+- `OUROBOROS_MAX_WORKERS=4` (was 2) — same-model subagent slots for
+  decomposition within one trial; the root agent occupies one lane. Higher
+  values blow container memory (each worker is a full Python process).
+- `OUROBOROS_SAFETY_MODE=light` — the jail is isolated; the LLM safety pass
+  was 34% of all LLM calls in the k=5 run while the deterministic guards do
+  the actual protecting. Light keeps the LLM check for integration tools only.
+- `claude_code_edit` disabled in every trial — benches measure the
+  single-model Ouroboros harness; the embedded Claude-Code delegate is a
+  separate experiment.
+- `_DEADLINE_SAFETY_SEC=105` (was 30) — measured finalization overhead plus a
+  provider-recovery margin, so trials finalize before Harbor's hard deadline
+  instead of losing a finished answer (gpt2-codegolf overran by 26.5s at 30).
 
 ## Infra-Failure Semantics
 

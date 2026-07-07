@@ -36,6 +36,7 @@ from ouroboros.contracts import (
     build_task_contract,  # noqa: F401  — imported for ``public API`` assertion
     GetToolsProtocol,  # noqa: F401  — imported for ``public API`` assertion
     normalize_allowed_resources,  # noqa: F401  — imported for ``public API`` assertion
+    normalize_acceptance_claims,  # noqa: F401  — imported for ``public API`` assertion
     normalize_resource_policy,  # noqa: F401  — imported for ``public API`` assertion
     SKILL_MANIFEST_SCHEMA_VERSION,
     SCHEMA_VERSION_KEY,
@@ -75,11 +76,35 @@ def test_public_api_is_stable():
         "read_schema_version",
         "attach_task_contract",
         "build_task_contract",
+        "normalize_acceptance_claims",
         "normalize_allowed_resources",
+        "normalize_budget_profile",
         "normalize_resource_policy",
     }
     missing = expected - set(dir(contracts))
     assert missing == set(), f"contracts package missing public names: {missing}"
+
+
+def test_budget_profile_frozen_key_set():
+    """§11.1 additive ABI pin (v6.56.0): the normalized budget_profile key set.
+
+    ``cost_hard_stop_pct`` is the additive in-task cost hard-stop knob
+    (None -> historical 50%-of-remaining stop; 0 -> no in-task stop, never a
+    $0 ceiling). Removing or renaming any key here is a deliberate ABI break.
+    """
+    from ouroboros.contracts.task_contract import normalize_budget_profile
+
+    profile = normalize_budget_profile(None)
+    assert set(profile) == {
+        "improvement_policy",
+        "max_improvement_passes",
+        "reserve_finalization_pct",
+        "stall_rounds_threshold",
+        "cost_hard_stop_pct",
+    }
+    assert profile["cost_hard_stop_pct"] is None
+    assert normalize_budget_profile({"cost_hard_stop_pct": 0})["cost_hard_stop_pct"] == 0
+    assert normalize_budget_profile({"cost_hard_stop_pct": "37"})["cost_hard_stop_pct"] == 37
 
 
 def test_task_contract_preserves_protected_artifact_policy():
@@ -106,6 +131,40 @@ def test_task_contract_preserves_protected_artifact_policy():
             "allow": ["execute"],
             "deny": ["read_bytes", "hash"],
         }
+    ]
+
+
+def test_task_contract_normalizes_observable_acceptance_claims():
+    contract = build_task_contract({
+        "task_contract": {
+            "acceptance_claims": [
+                {
+                    "id": "answer.ok",
+                    "claim": "  final answer is a bare number  ",
+                    "surface": "FINAL ANSWER line",
+                    "support": "host-attested exact check",
+                    "priority": "should",
+                },
+                "deliverable exists",
+            ]
+        }
+    })
+
+    assert contract["acceptance_claims"] == [
+        {
+            "id": "answer_ok",
+            "claim": "final answer is a bare number",
+            "surface": "FINAL ANSWER line",
+            "support": "host-attested exact check",
+            "priority": "should",
+        },
+        {
+            "id": "claim_2",
+            "claim": "deliverable exists",
+            "surface": "",
+            "support": "",
+            "priority": "must",
+        },
     ]
 
 
@@ -1112,8 +1171,10 @@ def test_task_create_request_declares_executor_ref_contract():
         "memory_mode",
         "project_id",
         "attachments",
+        "acceptance_claims",
         "allowed_resources",
         "resource_policy",
+        "disabled_tools",
         "executor_ref",
         "service_teardown",
         "deadline_at",

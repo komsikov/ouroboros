@@ -35,9 +35,16 @@ from typing import Optional
 _LOCK = threading.Lock()
 _SEMAPHORES: dict = {}
 
-# Hard ceiling on how long a single call will WAIT for a slot when the task has no deadline,
-# so a wedged provider can never park a worker forever on the semaphore.
-_MAX_SLOT_WAIT_SEC = 180.0
+def _max_slot_wait_sec() -> float:
+    """Hard ceiling (seconds) a single call WAITS for a slot when the task has no deadline,
+    so a wedged provider can never park a worker forever. SSOT: config SETTINGS_DEFAULTS."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    default = SETTINGS_DEFAULTS["OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC"]
+    try:
+        return float(os.environ.get("OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC", default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _cap() -> int:
@@ -56,10 +63,9 @@ def _cap() -> int:
 
 
 def enabled() -> bool:
-    if _cap() <= 0:
-        return False
-    flag = str(os.environ.get("OUROBOROS_MODEL_CONCURRENCY_ENABLED", "true")).strip().lower()
-    return flag not in ("0", "false", "no", "off")
+    # Single SSOT knob: OUROBOROS_MODEL_MAX_CONCURRENCY (<=0 disables the guard). No
+    # separate enable flag — one config surface only (P7 minimalism / DEVELOPMENT SSOT).
+    return _cap() > 0
 
 
 def _semaphore_for(model: str, use_local: bool) -> threading.BoundedSemaphore:
@@ -80,7 +86,7 @@ def model_call_slot(model: str, use_local: bool = False, deadline_ts: Optional[f
     """Hold a per-route concurrency slot around ONE provider call.
 
     Fail-soft: if disabled, or the slot can't be acquired before the task deadline (or the
-    ``_MAX_SLOT_WAIT_SEC`` ceiling), proceed WITHOUT a slot (no throttle) rather than blocking
+    no-deadline wait ceiling), proceed WITHOUT a slot (no throttle) rather than blocking
     the task past its deadline. Never raises out of the context setup.
     """
     if not enabled():
@@ -92,7 +98,7 @@ def model_call_slot(model: str, use_local: bool = False, deadline_ts: Optional[f
         yield
         return
     # Bound the wait by the remaining deadline (epoch seconds) and the hard ceiling.
-    timeout = _MAX_SLOT_WAIT_SEC
+    timeout = _max_slot_wait_sec()
     if deadline_ts:
         timeout = max(0.0, min(timeout, float(deadline_ts) - time.time()))
     acquired = False

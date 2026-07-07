@@ -120,7 +120,9 @@ class TestImageEviction:
         messages = [{"role": "user", "content": [block]}]
         _evict_stale_image_blocks(messages, incoming=MAX_LIVE_IMAGE_BLOCKS)
         text = messages[0]["content"][0]["text"]
-        assert "vlm_query file_path=/data/uploads/screenshots/x.png" in text
+        # Re-view hint points at view_image (local-file, native context, NOT web-gated);
+        # VLM tools are also outside _WEB_TOOLS as of v6.45.
+        assert "view_image path=/data/uploads/screenshots/x.png" in text
 
 
 class TestImageTokenEstimates:

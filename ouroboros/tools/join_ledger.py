@@ -2,12 +2,14 @@
 size gate). The parent's explicit, structured (P5 — not parsed-from-prose) controls for
 not orphaning spawned subagent children:
 
-  - peek_task: inspect a child's status / latest beacons / result tail WITHOUT absorbing.
+  - peek_task: inspect a child's status / latest beacons / result tail (a PURE READ —
+    makes no finalization decision and does not alter the change-based handoff reminder).
   - discard_child_result: explicitly abandon a child's result (stamps a durable
     parent_decision the pre-finalization reminder honors), lineage-gated to OWN children.
 
 The shared lineage/ledger helpers (_status_drive_root, _is_own_child,
-_record_child_decision_beacon) live here too and are reused by control._cancel_task.
+_record_child_decision_beacon) and the cancel_task handler (moved here from control.py,
+upgraded with a recorded reason + lineage gate) live here too.
 """
 
 from __future__ import annotations
@@ -67,11 +69,26 @@ def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
         return False
 
 
+def _clip(text: object, limit: int, *, tail: bool = False) -> str:
+    """Truncate to ``limit`` chars with an EXPLICIT omission marker so a peek never
+    silently drops cognitive content (P1 — no silent horizon cut; the agent can then
+    get_task_result the full body if it needs the omitted part)."""
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    omitted = len(s) - limit
+    if tail:
+        return f"…(+{omitted} earlier chars omitted — get_task_result for the full body)\n{s[-limit:]}"
+    return f"{s[:limit]}…(+{omitted} more chars omitted)"
+
+
 def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
-    """Read a child's CURRENT status + latest coordination beacons WITHOUT marking its
-    result absorbed (D#7 — the parent's 'see intermediate findings' right). Unlike
-    get_task_result this never advances the absorption signature, so peeking does not
-    suppress the pre-finalization handoff reminder. view: summary | partials | tail."""
+    """Read a child's CURRENT status + latest coordination beacons + result tail (D#7 — the
+    parent's 'see intermediate findings' right). A PURE READ: it changes no state. The
+    pre-finalization handoff reminder is CHANGE-BASED (it re-surfaces whenever a child's
+    status/result changes and is suppressed only by an explicit discard_child_result /
+    cancel_task, or by being unchanged since last shown) — peeking neither suppresses nor
+    re-triggers it. view: summary | partials | tail."""
     try:
         tid = validate_task_id(task_id)
     except ValueError as exc:
@@ -93,17 +110,19 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
             rows = [r for r in tree_ledger_rows(rid) if str(r.get("task_id") or "") == tid]
             if v in ("partials", "summary"):
                 beacons = [r for r in rows if str(r.get("kind")) in ("partial_finding", "blocker", "question", "milestone", "interface_contract")]
+                if len(beacons) > 8:
+                    parts.append(f"  …(+{len(beacons) - 8} older beacon(s) omitted; showing newest 8)")
                 for r in beacons[-8:]:
-                    parts.append(f"  • [{r.get('kind')}] {str(r.get('text') or '')[:400]}")
+                    parts.append(f"  • [{r.get('kind')}] {_clip(r.get('text'), 400)}")
     except Exception:
         log.debug("peek_task ledger read failed for %s", tid, exc_info=True)
     if v in ("tail", "summary"):
         result = str(data.get("result") or "")
         if result:
-            parts.append(f"[PEEK_RESULT_TAIL]\n{result[-1200:]}\n[/PEEK_RESULT_TAIL]")
+            parts.append(f"[PEEK_RESULT_TAIL]\n{_clip(result, 1200, tail=True)}\n[/PEEK_RESULT_TAIL]")
     trace = str(data.get("trace_summary") or "")
     if trace and v == "tail":
-        parts.append(f"[PEEK_TRACE]\n{trace[:800]}\n[/PEEK_TRACE]")
+        parts.append(f"[PEEK_TRACE]\n{_clip(trace, 800)}\n[/PEEK_TRACE]")
     return "\n".join(parts)
 
 
@@ -118,7 +137,7 @@ def _discard_child_result(ctx: ToolContext, task_id: str, reason: str) -> str:
         tid = validate_task_id(task_id)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (discard_child_result): {exc}"
-    reason_text = " ".join(str(reason or "").split())[:500]
+    reason_text = _clip(" ".join(str(reason or "").split()), 500)
     if not reason_text:
         return "⚠️ TOOL_ARG_ERROR (discard_child_result): a non-empty reason is required."
     status_drive_root = _status_drive_root(ctx)
@@ -144,12 +163,65 @@ def _discard_child_result(ctx: ToolContext, task_id: str, reason: str) -> str:
     return f"Discarded child result {tid} (reason: {reason_text}). It will not block finalization."
 
 
+def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason: str) -> str:
+    """Explicitly override an unresolved delegation constraint in this task tree."""
+
+    cid = " ".join(str(constraint_id or "").split())
+    if not cid:
+        return "⚠️ TOOL_ARG_ERROR (override_delegation_constraint): constraint_id is required."
+    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    if not reason_text:
+        return "⚠️ TOOL_ARG_ERROR (override_delegation_constraint): a non-empty reason is required."
+    try:
+        from ouroboros.tools.task_tree import tree_root_id
+        from ouroboros.task_tree_ledger import open_delegation_constraints, tree_ledger_append
+
+        rid = tree_root_id(ctx)
+        if not rid:
+            return "⚠️ override_delegation_constraint: no task-tree scope."
+        open_rows = open_delegation_constraints(rid)
+        target_row = next((
+            row for row in open_rows
+            if isinstance(row.get("payload"), dict)
+            and str(row["payload"].get("constraint_id") or "") == cid
+        ), None)
+        if target_row is None:
+            return f"⚠️ override_delegation_constraint: constraint {cid!r} is not open in this task tree."
+        emitter_task_id = str(target_row.get("task_id") or "").strip()
+        if emitter_task_id:
+            status_drive_root = _status_drive_root(ctx)
+            if not _is_own_child(ctx, status_drive_root, emitter_task_id):
+                return (
+                    "⚠️ override_delegation_constraint: only the parent of the task that raised "
+                    f"constraint {cid!r} may override it."
+                )
+        meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+        role = str(meta.get("role") or getattr(ctx, "role", "") or "")
+        return tree_ledger_append(
+            rid,
+            "decision",
+            f"overrode delegation constraint {cid}: {reason_text}",
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+            role=role,
+            allow_constraint_override=True,
+            payload={
+                "constraint_id": cid,
+                "decision": "overridden",
+                "reason": reason_text,
+                "parent_task_id": str(getattr(ctx, "task_id", "") or ""),
+            },
+        )
+    except Exception:
+        log.debug("Failed to override delegation constraint %s", cid, exc_info=True)
+        return f"⚠️ override_delegation_constraint: failed to record override for {cid}."
+
+
 def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     try:
         tid = validate_task_id(task_id)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
-    reason_text = " ".join(str(reason or "").split())[:500]
+    reason_text = _clip(" ".join(str(reason or "").split()), 500)
     status_drive_root = _status_drive_root(ctx)
     # Only stamp the join-ledger parent_decision (+ post to the tree ledger) when the
     # target is THIS task's own child — a cancel must not rewrite an unrelated task's
@@ -208,9 +280,10 @@ def get_tools() -> list[ToolEntry]:
             "name": "peek_task",
             "description": "Look at a child task's CURRENT status, its latest coordination beacons "
                            "(partial_finding/blocker/question/milestone) and a tail of its result — "
-                           "WITHOUT absorbing it. Use this to check on intermediate findings or decide "
-                           "whether to keep waiting / steer / cancel, without committing to its result. "
-                           "Unlike get_task_result, peeking does NOT clear the pre-finalization reminder.",
+                           "a PURE READ. Use this to check intermediate findings or decide whether to keep "
+                           "waiting / steer / cancel, without committing to a finalization decision. It "
+                           "changes no state: the pre-finalization reminder is change-based and is cleared "
+                           "only by discard_child_result / cancel_task, not by reading.",
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string"},
                 "view": {"type": "string", "enum": ["summary", "partials", "tail"], "default": "summary",
@@ -228,4 +301,12 @@ def get_tools() -> list[ToolEntry]:
                 "reason": {"type": "string", "description": "Why this child's result is not needed."},
             }, "required": ["task_id", "reason"]},
         }, _discard_child_result),
+        ToolEntry("override_delegation_constraint", {
+            "name": "override_delegation_constraint",
+            "description": "Explicitly override an unresolved delegation_constraint in this task tree. Requires a reason; records an append-only decision row so a future schedule_subagent call may proceed audibly.",
+            "parameters": {"type": "object", "properties": {
+                "constraint_id": {"type": "string"},
+                "reason": {"type": "string", "description": "Why overriding this constraint is correct."},
+            }, "required": ["constraint_id", "reason"]},
+        }, _override_delegation_constraint),
     ]

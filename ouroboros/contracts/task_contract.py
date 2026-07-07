@@ -48,6 +48,30 @@ def normalize_allowed_resources(value: Any) -> Dict[str, Any]:
     return out
 
 
+def normalize_disabled_tools(value: Any) -> list[str]:
+    """A clean, de-duplicated list of tool names the task is NOT allowed to use.
+
+    This is the declarative tool-policy surface a benchmark adapter (or any
+    caller) uses to withhold specific capabilities — e.g. disabling the agent's
+    own web-search/browser/VLM tools for a faithful run while leaving shell
+    network egress (git/pip) intact. It is independent of ``allowed_resources``
+    (which gates resource AXES like web/network), so it never triggers the
+    web<->network cross-implication in the registry resource gate.
+    """
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return []
+    seen: list[str] = []
+    for item in items:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def normalize_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -100,6 +124,126 @@ def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
         "max_children": _opt_nonneg_int(v.get("max_children")),
         "intent_note": _bounded_intent_note(v.get("intent_note")),
     }
+
+
+VALID_IMPROVEMENT_POLICIES = ("fixed", "adaptive", "until_deadline")
+
+
+def _opt_pct(value: Any) -> Any:
+    """A 0-100 percentage, or None when unset/blank (meaning 'use the config default')."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_cost_hard_stop_pct(value: Any) -> Any:
+    """Like ``_opt_pct`` but FAIL-SAFE for the one percentage whose 0 is the
+    maximally-permissive setting (0 = NO in-task cost stop). A malformed value
+    must NOT silently collapse to 0 and disable the safety stop: a negative
+    number, a non-numeric, or a ``0 < v < 1`` fraction (a likely fraction-vs-
+    percent mix-up, e.g. 0.5 meaning "half") maps to None — the historical 50%
+    default — not to 0. An explicit 0 / 0.0 / "0" is honored verbatim."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num == 0:
+        return 0
+    if num < 1:
+        return None  # negative, or a 0<v<1 fraction — do not silently disable the stop
+    return max(0, min(100, int(num)))
+
+
+def normalize_budget_profile(value: Any) -> Dict[str, Any]:
+    """The typed improvement-pacing block (v6.54.4) — how the acceptance-review
+    improvement loop spends the task's remaining time budget. Lives INSIDE the
+    task contract (no new top-level gateway field); subagents inherit via the
+    parent-contract spread. Absent input -> None fields, meaning the config
+    defaults apply — which reproduce today's behavior exactly (one bounded
+    improvement pass, finalization reserve = the grace window).
+
+    ``improvement_policy``: fixed (default; the configured/max pass cap decides) |
+    adaptive (passes stop early when the remaining window can no longer fit a
+    review comfortably) | until_deadline (passes bounded ONLY by the time gate).
+
+    ``cost_hard_stop_pct`` (v6.56.0, additive): the in-task cost hard-stop as a
+    percentage of the budget remaining at task start. None -> the historical
+    default (50: force-finalize once the task has spent half the remaining
+    budget). 0 -> NO in-task cost stop at all — the deadline/rounds axes and the
+    global between-task budget gate remain the only bounds, and cost milestones
+    become informational against the start snapshot. The ceiling is resolved in
+    ``task_pacing.resolve_cost_ceiling_usd`` (0 maps to no ceiling, never a $0
+    ceiling). A MALFORMED value (negative / non-numeric / a ``0<v<1`` fraction)
+    maps to None (the 50% default), NOT to 0 — it must not silently disable the
+    stop (see ``_opt_cost_hard_stop_pct``).
+    """
+    v = value if isinstance(value, Mapping) else {}
+    policy = str(v.get("improvement_policy") or "").strip().lower()
+    return {
+        "improvement_policy": policy if policy in VALID_IMPROVEMENT_POLICIES else "fixed",
+        "max_improvement_passes": _opt_nonneg_int(v.get("max_improvement_passes")),
+        "reserve_finalization_pct": _opt_pct(v.get("reserve_finalization_pct")),
+        "stall_rounds_threshold": _opt_nonneg_int(v.get("stall_rounds_threshold")),
+        "cost_hard_stop_pct": _opt_cost_hard_stop_pct(v.get("cost_hard_stop_pct")),
+    }
+
+
+def _bounded_claim_text(value: Any, limit: int = 600) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" ⚠️(+{len(text) - limit} chars omitted)"
+
+
+def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
+    """Normalize LLM-readable acceptance claims.
+
+    These are advisory task-success claims, not a deterministic oracle.  The
+    fields deliberately stay general (claim/surface/support/priority) so normal
+    user tasks and benchmarks share one vocabulary.
+    """
+    items = value if isinstance(value, list) else []
+    out: list[Dict[str, str]] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(items, start=1):
+        if isinstance(item, Mapping):
+            claim = _bounded_claim_text(item.get("claim"))
+            surface = _bounded_claim_text(item.get("surface"), limit=300)
+            support = _bounded_claim_text(item.get("support"), limit=500)
+            priority = str(item.get("priority") or "must").strip().lower() or "must"
+            raw_id = str(item.get("id") or item.get("criterion_id") or f"claim_{idx}").strip()
+        else:
+            claim = _bounded_claim_text(item)
+            surface = ""
+            support = ""
+            priority = "must"
+            raw_id = f"claim_{idx}"
+        if not claim:
+            continue
+        criterion_id = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in raw_id)[:80]
+        if not criterion_id:
+            criterion_id = f"claim_{idx}"
+        base = criterion_id
+        suffix = 2
+        while criterion_id in seen:
+            criterion_id = f"{base}_{suffix}"
+            suffix += 1
+        seen.add(criterion_id)
+        if priority not in {"must", "should", "nice_to_have"}:
+            priority = "must"
+        out.append({
+            "id": criterion_id,
+            "claim": claim,
+            "surface": surface,
+            "support": support,
+            "priority": priority,
+        })
+    return out
 
 
 def normalize_resource_policy(value: Any) -> Dict[str, Any]:
@@ -191,6 +335,11 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         or metadata.get("deadline_at")
         or ""
     ).strip()
+    disabled_tools = normalize_disabled_tools(
+        merged.get("disabled_tools")
+        if merged.get("disabled_tools") is not None
+        else (task.get("disabled_tools") or metadata.get("disabled_tools"))
+    )
     workspace_root = str(
         merged.get("workspace_root")
         or task.get("workspace_root")
@@ -205,6 +354,12 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
     ).strip()
     task_type = str(merged.get("task_type") or task.get("type") or "task").strip() or "task"
 
+    acceptance_claims = normalize_acceptance_claims(
+        merged.get("acceptance_claims")
+        if merged.get("acceptance_claims") is not None
+        else (merged.get("success_criteria") or task.get("acceptance_claims") or metadata.get("acceptance_claims"))
+    )
+
     contract = {
         "schema_version": 1,
         "status": str(merged.get("status") or "draft"),
@@ -216,8 +371,10 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "success_criteria": list(merged.get("success_criteria") or [])
         if isinstance(merged.get("success_criteria"), list)
         else [],
+        "acceptance_claims": acceptance_claims,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
+        "disabled_tools": disabled_tools,
         "deadline_at": deadline_at,
         "context_requires_self_body_docs": normalize_bool(
             merged.get("context_requires_self_body_docs")
@@ -239,6 +396,11 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             if merged.get("delegation_budget") is not None
             else (task.get("delegation_budget") or metadata.get("delegation_budget"))
         ),
+        "budget_profile": normalize_budget_profile(
+            merged.get("budget_profile")
+            if merged.get("budget_profile") is not None
+            else (task.get("budget_profile") or metadata.get("budget_profile"))
+        ),
     }
     for key in ("notes", "review_notes"):
         if merged.get(key):
@@ -255,4 +417,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["attach_task_contract", "build_task_contract", "normalize_allowed_resources", "normalize_bool", "normalize_delegation_budget", "normalize_resource_policy"]
+__all__ = ["attach_task_contract", "build_task_contract", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]

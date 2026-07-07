@@ -69,6 +69,12 @@ _ARTIFACT_LIFECYCLE_FIELDS = {
 # + git's own binary verdict), never code/content inference (Bible P5).
 _PATCH_EXCLUDE_RULES_VERSION = 2
 _PATCH_MAX_UNTRACKED_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB per untracked file
+# v6.52.2: the task-scoped manifest of {ABSOLUTE_path: sha256} fingerprints the agent declared via
+# run_command/run_script `scratch=[...]` (ephemeral verification files). The patch capture below
+# EXCLUDES a matching untracked path ONLY while its current content still matches the recorded sha
+# (so a later real file at the same path is not dropped). SSOT for the name; ouroboros.artifacts
+# imports this (headless is the lower-level module).
+SCRATCH_MANIFEST_NAME = ".scratch_manifest.json"
 _TOP_LEVEL_EXCLUDE_DIRS = {".ouroboros", ".venv", "venv", "env"}
 _ANY_SEGMENT_EXCLUDE_DIRS = {
     ".cache",
@@ -89,6 +95,18 @@ _PATCH_JUNK_RE = re.compile(
     r"|\.pyc$|\.pyo$|^(dist|build)/|\.DS_Store|(^|/)\.coverage$"
     r"|coverage\.xml$|(^|/)htmlcov/"
 )
+_LOCKFILE_MANIFESTS = {
+    "package-lock.json": "package.json",
+    "npm-shrinkwrap.json": "package.json",
+    "yarn.lock": "package.json",
+    "pnpm-lock.yaml": "package.json",
+    "go.sum": "go.mod",
+    "Cargo.lock": "Cargo.toml",
+    "poetry.lock": "pyproject.toml",
+    "Pipfile.lock": "Pipfile",
+    "composer.lock": "composer.json",
+    "Gemfile.lock": "Gemfile",
+}
 _SENSITIVE_EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
 _SENSITIVE_KEY_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 _SENSITIVE_FILENAMES = {
@@ -516,6 +534,10 @@ def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
 
 
 _DELIVERABLE_MANIFEST_FILE_CAP = 10000
+_DELIVERABLE_MANIFEST_HASH_CHUNK = 1024 * 1024  # 1 MiB streaming chunks (bounded memory)
+# Files larger than this are recorded by size only (hash skipped) so a single huge
+# binary/media/build artifact cannot wedge or OOM genesis finalization.
+_DELIVERABLE_MANIFEST_HASH_BYTE_CAP = 64 * 1024 * 1024  # 64 MiB
 
 
 def _build_deliverable_manifest(
@@ -525,7 +547,9 @@ def _build_deliverable_manifest(
     (deferral 3): rel path + size + sha256 per file, surfaced on the artifact axis so a
     genesis project's OUTPUT (not just its patch diff) is inspectable. Excludes VCS and
     virtualenv junk. P1 fail-loud: if the tree exceeds the file cap, ``truncated`` is set
-    instead of silently dropping files."""
+    instead of silently dropping files. Hashing STREAMS in fixed chunks (never loads a
+    whole file into memory) and skips the hash for files over the byte cap, so a large
+    artifact can neither OOM nor wedge finalization."""
     import hashlib
 
     contents: List[Dict[str, Any]] = []
@@ -538,15 +562,36 @@ def _build_deliverable_manifest(
                 truncated = True
                 break
             fpath = pathlib.Path(root) / fname
-            try:
-                data = fpath.read_bytes()
-            except Exception:
+            if fpath.is_symlink():
+                # SECURITY: never follow a symlink out of the project — a genesis child
+                # could point one at an owner/runtime file outside workspace_root, and
+                # stat()/open() would then read/hash bytes outside the deliverable tree.
+                # Record it as a symlink WITHOUT reading the target.
+                contents.append({
+                    "rel": str(fpath.relative_to(workspace_root)),
+                    "symlink": True,
+                    "sha256": "",
+                })
+                count += 1
                 continue
-            contents.append({
-                "rel": str(fpath.relative_to(workspace_root)),
-                "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            })
+            try:
+                size = fpath.stat().st_size
+            except OSError:
+                continue
+            entry: Dict[str, Any] = {"rel": str(fpath.relative_to(workspace_root)), "size": size}
+            if size > _DELIVERABLE_MANIFEST_HASH_BYTE_CAP:
+                entry["sha256"] = ""
+                entry["hash_skipped"] = "size_over_cap"
+            else:
+                try:
+                    h = hashlib.sha256()
+                    with open(fpath, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(_DELIVERABLE_MANIFEST_HASH_CHUNK), b""):
+                            h.update(chunk)
+                    entry["sha256"] = h.hexdigest()
+                except Exception:
+                    continue
+            contents.append(entry)
             count += 1
         if truncated:
             break
@@ -761,6 +806,7 @@ def write_workspace_patch_artifacts(
     errors: List[Dict[str, Any]] = []
     diagnostics: List[Dict[str, Any]] = []
     excluded: List[Dict[str, str]] = []
+    tracked_excluded: List[Dict[str, str]] = []
     sensitive: List[Dict[str, str]] = []
     included_untracked: List[str] = []
     task_base_sha = _acting_base_sha_from_task(task)
@@ -777,14 +823,38 @@ def write_workspace_patch_artifacts(
         root,
         errors,
     )
-    diffstat = _git_stdout(
-        ["git", "diff", "--stat", "--no-ext-diff", "--no-color", base_ref, "--"],
-        root,
-        allow_rc={0},
-        errors=errors,
-    )
+    diffstat = ""
     untracked = _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
+    # v6.52.2: exclude declared ephemeral scratch (run_command/run_script `scratch=[...]`) so a
+    # throwaway verification file the agent forgot to delete never leaks into the workspace patch.
+    # The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
+    # still matches the recorded scratch sha — so a LATER real file written to the same path
+    # (different content) is NOT dropped. Empty/absent/mismatched => included (no regression).
+    scratch_sha_by_rel: dict = {}
+    scratch_sha_by_abs: dict = {}
+    try:
+        _scratch_map = json.loads((artifact_dir / SCRATCH_MANIFEST_NAME).read_text(encoding="utf-8")).get("scratch")
+        if isinstance(_scratch_map, dict):
+            for _abs, _sha in _scratch_map.items():
+                try:
+                    _resolved = pathlib.Path(str(_abs)).resolve(strict=False)
+                    scratch_sha_by_abs[os.path.normcase(str(_resolved))] = str(_sha)
+                    scratch_sha_by_rel[_resolved.relative_to(root).as_posix()] = str(_sha)
+                except Exception:
+                    continue
+    except Exception:
+        scratch_sha_by_rel = {}
+        scratch_sha_by_abs = {}
     for rel in untracked:
+        _want_sha = scratch_sha_by_rel.get(rel) or scratch_sha_by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
+        if _want_sha:
+            try:
+                _cur_sha = sha256((root / rel).read_bytes()).hexdigest()
+            except OSError:
+                _cur_sha = None
+            if _cur_sha == _want_sha:
+                excluded.append({"path": rel, "reason": "declared ephemeral scratch (v6.52.2)"})
+                continue
         sensitive_reason = _sensitive_untracked_reason(rel)
         if sensitive_reason:
             sensitive.append({"path": rel, "reason": sensitive_reason})
@@ -798,6 +868,15 @@ def write_workspace_patch_artifacts(
             excluded.append({"path": rel, "reason": blob_reason})
             continue
         included_untracked.append(rel)
+    incidental_lock_excludes = _incidental_lockfile_excludes([*changed_tracked, *included_untracked])
+    if incidental_lock_excludes:
+        kept_untracked: List[str] = []
+        for rel in included_untracked:
+            if rel in incidental_lock_excludes:
+                excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
+            else:
+                kept_untracked.append(rel)
+        included_untracked = kept_untracked
     if sensitive:
         errors.append({
             "type": "sensitive_untracked_files",
@@ -809,8 +888,20 @@ def write_workspace_patch_artifacts(
     total_size = 0
     with patch_path.open("wb") as fh:
         if not errors:
+            tracked_lock_excludes = sorted(set(changed_tracked) & incidental_lock_excludes)
+            tracked_pathspec = ["--"]
+            if tracked_lock_excludes:
+                tracked_pathspec += ["."] + [f":(exclude){rel}" for rel in tracked_lock_excludes]
+                for rel in tracked_lock_excludes:
+                    tracked_excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
+            diffstat = _git_stdout(
+                ["git", "diff", "--stat", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
+                root,
+                allow_rc={0},
+                errors=errors,
+            )
             total_size += _append_git_output(
-                ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, "--"],
+                ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
                 root,
                 fh,
                 hasher,
@@ -912,11 +1003,13 @@ def write_workspace_patch_artifacts(
         "diffstat": diffstat,
         "counts": {
             "tracked_changed": len(changed_tracked),
+            "tracked_excluded": len(tracked_excluded),
             "untracked_included": len(included_untracked),
             "untracked_excluded": len(excluded),
             "sensitive_blocked": len(sensitive),
         },
         "tracked_changed": changed_tracked,
+        "tracked_excluded": tracked_excluded,
         "untracked_included": included_untracked,
         "untracked_excluded": excluded,
         "sensitive_blocked": sensitive,
@@ -1302,6 +1395,28 @@ def _patch_exclude_reason(rel: str) -> str:
     if _PATCH_JUNK_RE.search(posix):
         return f"junk artifact: {posix}"
     return ""
+
+
+def _lockfile_manifest_for(rel: str) -> str:
+    posix = str(rel).replace("\\", "/")
+    path = pathlib.PurePosixPath(posix)
+    manifest = _LOCKFILE_MANIFESTS.get(path.name)
+    return path.with_name(manifest).as_posix() if manifest else ""
+
+
+def _incidental_lockfile_excludes(changed_paths: List[str]) -> set[str]:
+    changed = {str(path or "").replace("\\", "/") for path in changed_paths if str(path or "").strip()}
+    lock_to_manifest = {
+        path: manifest
+        for path in changed
+        for manifest in [_lockfile_manifest_for(path)]
+        if manifest
+    }
+    if not lock_to_manifest:
+        return set()
+    if not (changed - set(lock_to_manifest)):
+        return set()
+    return {path for path, manifest in lock_to_manifest.items() if manifest not in changed}
 
 
 def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str) -> str:

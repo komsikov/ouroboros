@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List
 
-from ouroboros.config import get_review_models
+from ouroboros.config import adaptive_quorum, get_review_models
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.triad_review import extract_json_array
@@ -126,6 +126,56 @@ def aggregate_outcome_tier(result: ReviewRunResult) -> str:
     return worst
 
 
+def dissent_findings(result: ReviewRunResult, *, limit: int = 1) -> List[str]:
+    """Compact dissent bullets from NON-contributing minority reviewers (v6.54.4).
+
+    A cleanly-parsed reviewer whose verdict differs from the aggregate AND who
+    carries a CONCRETE recommendation/alternative contributes ONE verbatim
+    "[DISSENT — slot N]: ..." line. Not a veto — the aggregate stands; this ends
+    the class where an aggregate-PASS silently discarded a minority FAIL whose
+    concrete recommendation was correct (GAIA 3cef3a44). A DELIBERATE minority
+    DEGRADED — the reviewer's own parsed verdict (the prompt's "cannot judge →
+    return DEGRADED and explain" branch, which is exactly what the 3cef3a44
+    reviewer returned) — may dissent too, but only on the strength of a concrete
+    findings[].recommendation. Parse-fail placeholders (parsed=None),
+    contract-demoted PASSes (their parsed verdict stays PASS — they agree with
+    the aggregate), and coach-only DEGRADED stay excluded (no clean dissenting
+    signal). ONE bullet by design (plan decision #13) — the first concrete
+    dissenter speaks."""
+    agg = str(getattr(result, "aggregate_signal", "") or "").upper()
+    contributing_ids = {str(a.get("slot_id", "")) for a in _contributing_actors(result)}
+    out: List[str] = []
+    for actor in (getattr(result, "actors", None) or []):
+        if not isinstance(actor, dict) or len(out) >= limit:
+            continue
+        slot_id = str(actor.get("slot_id", ""))
+        signal = str(actor.get("signal", "")).upper()
+        if slot_id in contributing_ids or signal == agg:
+            continue
+        parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+        deliberate_degraded = (
+            signal == "DEGRADED"
+            and str(parsed.get("verdict") or "").strip().upper() == "DEGRADED"
+        )
+        if signal not in ("PASS", "FAIL") and not deliberate_degraded:
+            continue
+        recommendation = ""
+        for finding in (parsed.get("findings") or []):
+            if isinstance(finding, dict):
+                recommendation = str(finding.get("recommendation") or "").strip()
+                if recommendation:
+                    break
+        if not recommendation and not deliberate_degraded:
+            recommendation = str(parsed.get("completion_coach") or "").strip()
+        if not recommendation:
+            continue  # a bare contrary verdict with no concrete alternative is noise
+        compact = " ".join(recommendation.split())
+        if len(compact) > 300:
+            compact = compact[:300].rstrip() + "…"
+        out.append(f"[DISSENT — {slot_id} said {signal}]: check this before finalizing — {compact}")
+    return out
+
+
 def build_improvement_capsule(result: ReviewRunResult) -> str:
     """Compact, anti-derailment "Final improvement note" fed back to the agent:
     tier + up to 3 actionable findings + one completion_coach, framed as optional
@@ -164,10 +214,15 @@ def build_improvement_capsule(result: ReviewRunResult) -> str:
     # would re-loop EVERY clean required review. The capsule is actionable only
     # when there are real findings to act on OR the tier itself is incomplete
     # (best_effort/blocked). The coach is then included as the next step.
-    actionable = bool(bullets) or tier in (OUTCOME_TIER_BEST_EFFORT, OUTCOME_TIER_BLOCKED)
+    dissent = dissent_findings(result)
+    actionable = bool(bullets) or bool(dissent) or tier in (OUTCOME_TIER_BEST_EFFORT, OUTCOME_TIER_BLOCKED)
     if not actionable:
         return ""
     lines = [f"[Final improvement note] Reviewer assessment: {tier or result.aggregate_signal}."]
+    # Dissent rides ON TOP of the capsule (v6.54.4): same anti-derailment frame,
+    # never a veto — a minority reviewer with a concrete recommendation is a
+    # "check this before finalizing" pointer, not a re-litigation of the verdict.
+    lines += dissent
     lines += [f"- {b}" for b in bullets]
     if coach:
         lines.append(f"Highest-value next step: {coach}")
@@ -205,8 +260,8 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
     # "for whom we review" is auditable. Reviewer reasoning, not a new
     # authoritative gate (criteria live in actors[].parsed, not a separate phase).
     criteria_key = (
-        ', criteria_used (the acceptance criteria you re-derived from the goal and checked, '
-        "as a short list of strings)"
+        ', criteria_used (the acceptance criteria you re-derived from the full goal narrative '
+        'and checked, not only from explicit bullet points, as a short list of strings)'
         if request.surface == "task_acceptance"
         else ""
     )
@@ -221,9 +276,19 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
     )
     acceptance_rules = (
         "For TASK ACCEPTANCE: do not accept a 'solved' claim on assertion alone. Re-derive the "
-        "acceptance criteria from the goal/spec yourself, then require that the evidence contains "
-        "an EXECUTED check that MIRRORS what the real grader would run (the actual test/command "
-        "and its observed output) — not a narrative that it passes. "
+        "acceptance criteria from the FULL goal/spec narrative yourself (including prose context, "
+        "requirements implied outside bullet lists, and any named user-facing interface), enumerate "
+        "all affected components/surfaces you expect the deliverable to cover. If "
+        "`task_contract.acceptance_claims` is present, treat those "
+        "claim/surface/support entries as structured hints, not as an oracle: verify them against "
+        "the full goal and use `acceptance_support_refs` as the host-built support map. The claim's "
+        "`support` text names expected evidence; it is NOT evidence unless a receipt/tool/artifact/source "
+        "ref actually supports it. "
+        "Record in criteria_used which claims were supported, missing, partial, or rejected, and why. "
+        "Require per-criterion evidence: an EXECUTED check that MIRRORS what the real grader would run "
+        "(the actual test/command and its observed output) — not a narrative that it passes. "
+        "If the evidence covers only part of the affected surface list, do not classify solved; "
+        "name the uncovered criteria/surfaces in findings or completion_coach. "
         "EVIDENCE INDEPENDENCE: a passing test is only credible if it is not graded by the "
         "agent's own hand. From the diff and tool trace, identify which test/check files the "
         "agent CREATED or MODIFIED this turn versus which were pre-existing or grader-owned; if "
@@ -236,6 +301,28 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
         "auto-evaluation, or provider/runtime fault is NOT itself an agent failure — judge "
         "whether the requested artifact/answer was produced before the environment terminated; "
         "do not FAIL a correct deliverable for an environment-imposed limit, note it as context. "
+        "METRIC-GROUNDED EVIDENCE: when the task states an explicit success metric, contains a "
+        "worked example, or warns that grading uses held-out cases, treat an existence-only "
+        "(artifact_observation) or substring-only verification receipt as INSUFFICIENT for solved — "
+        "require evidence that the metric/example is actually met (an exact/exact_line/json_equals "
+        "receipt, or the metric value in the check output). ANTI-CHEAT: credible verification uses "
+        "ONLY public task info (instruction text, embedded examples, installed oracles, the agent's "
+        "own independent checks); if the evidence came from reading a hidden /tests/ dir, "
+        "solution.sh, copied verifier code, or an online answer, treat the success claim as "
+        "UNVERIFIED. "
+        "PROCESS, NOT ONLY OUTCOME: the packet includes a `tool_trajectory` (HOW the task was "
+        "solved) and a first-class `verification_summary`. Audit the process — if the agent used "
+        "the wrong tool, went the wrong direction, ignored its OWN red verification "
+        "(`verification_summary.unreconciled_red`, or a RED `latest_status`), grounded on a check "
+        "whose exit code may be MASKED (`verification_summary.check_exit_masking_unreconciled` — a "
+        "`| tail`/`grep`/`|| true` pipeline can report exit 0 over a real failure, so that green is "
+        "weak evidence), or the final claim "
+        "is not supported by the trajectory, say so: a deliverable that looks superficially "
+        "correct but was reached the wrong way, or that contradicts the agent's own checks, is at "
+        "most best_effort, and completion_coach must name the process fix. PROVENANCE: every "
+        "evidence block is tagged in `__provenance__` (host_attested / agent_supplied / "
+        "tool_result / artifact / hidden_or_restricted) — weigh host_attested over agent_supplied, "
+        "and NEVER credit a success claim to `hidden_or_restricted` evidence (a benchmark/test leak). "
         if request.surface == "task_acceptance"
         else ""
     )
@@ -426,6 +513,17 @@ class ReviewCoordinator:
         # FAIL still counts regardless of tier (conservative — never excuse a fail).
         classify_tier = bool((request.policy or {}).get("classify_outcome_tier"))
         _valid_tiers = {"solved", "best_effort", "blocked_with_evidence"}
+        # Advisory acceptance surface (task review) ONLY: review may UPGRADE but must
+        # not single-FAIL-veto a grounded answer, and a SOLVED PASS need not carry a
+        # tier-up coach. The blocking commit/scope immune gate (HARDNESS_HARD_GATE) is
+        # a SEPARATE path and stays fail-closed and unchanged (Bible P3). Keyed on the
+        # surface (the SSOT): EVERY task_acceptance review is advisory — both the
+        # host-forced loop path and the visible task_acceptance_review tool — while
+        # commit/scope use distinct surfaces, so this can never relax the immune gate.
+        is_advisory = (
+            request.surface == "task_acceptance"
+            or str((request.policy or {}).get("hardness") or "") == HARDNESS_ADVISORY_VISIBLE
+        )
         for actor in actors:
             if actor.status == "error":
                 actor_errors.append(f"{actor.slot_id}:{actor.error}")
@@ -438,10 +536,15 @@ class ReviewCoordinator:
             # The required-tier contract needs BOTH a valid outcome_tier AND a
             # non-empty completion_coach (both are required JSON keys); a PASS
             # missing either is non-responsive to the contract.
+            _tier = str(parsed.get("outcome_tier") or "").strip().lower() if isinstance(parsed, dict) else ""
             contract_ok = (
-                isinstance(parsed, dict)
-                and str(parsed.get("outcome_tier") or "").strip().lower() in _valid_tiers
-                and bool(str(parsed.get("completion_coach") or "").strip())
+                _tier in _valid_tiers
+                and (
+                    bool(str((parsed or {}).get("completion_coach") or "").strip())
+                    # Advisory carve-out: a SOLVED deliverable has no tier-up step, so an
+                    # empty coach must NOT demote it to DEGRADED.
+                    or (is_advisory and _tier == "solved")
+                )
             )
             if signal == "FAIL":
                 fail_count += 1
@@ -461,7 +564,12 @@ class ReviewCoordinator:
         min_successful = max(1, int((request.policy or {}).get("min_successful_slots") or 1))
         fail_closed_on_errors = bool((request.policy or {}).get("fail_closed_on_errors"))
         degraded_reasons = actor_errors + parse_degraded
-        if fail_count:
+        # Advisory acceptance: require a MAJORITY of FAILs to aggregate FAIL (so a
+        # single stochastic FAIL — especially likely when all 3 slots are the SAME
+        # model — cannot veto a grounded answer). The blocking gate keeps single-FAIL
+        # fail-closed (threshold 1).
+        fail_threshold = adaptive_quorum(len(slots)) if is_advisory else 1
+        if fail_count >= fail_threshold:
             aggregate = "FAIL"
         elif pass_count >= min_successful and not (fail_closed_on_errors and actor_errors):
             aggregate = "PASS"

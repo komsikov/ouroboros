@@ -147,7 +147,7 @@ def test_load_skill_surfaces_unreadable_manifest(tmp_path):
     """Phase 3 round 16 regression: an existing-but-unreadable manifest
     must surface as ``load_error`` instead of silently looking like
     "not a skill dir at all"."""
-    import os, platform
+    import platform
     if platform.system() == "Windows":
         pytest.skip("chmod-based permission test not portable to Windows")
     drive_root = tmp_path / "drive"
@@ -185,17 +185,14 @@ def test_discover_skills_picks_up_multiple(tmp_path):
     assert names == {"alpha", "beta"}
 
 
-def test_find_skill_returns_match_and_missing(tmp_path):
+def test_find_skill_returns_match_and_missing(tmp_path, monkeypatch):
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
     repo_root = tmp_path / "skills"
     _write_skill(repo_root, "alpha", manifest=_valid_script_manifest("alpha"))
-    os.environ["OUROBOROS_SKILLS_REPO_PATH"] = str(repo_root)
-    try:
-        assert find_skill(drive_root, "alpha") is not None
-        assert find_skill(drive_root, "does-not-exist") is None
-    finally:
-        os.environ.pop("OUROBOROS_SKILLS_REPO_PATH", None)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(repo_root))
+    assert find_skill(drive_root, "alpha") is not None
+    assert find_skill(drive_root, "does-not-exist") is None
 
 
 # ---------------------------------------------------------------------------
@@ -597,9 +594,9 @@ def test_vcs_cache_dirs_are_not_hashed(tmp_path):
 def test_symlink_escape_excluded_from_pack(tmp_path):
     """Phase 3 round 10 regression: a symlink inside ``skill_dir`` whose
     target resolves outside the tree must NOT be hashed — otherwise
-    ``compute_content_hash`` + ``_build_skill_file_pack`` would exfiltrate
+    ``compute_content_hash`` + ``_build_skill_file_packs`` would exfiltrate
     arbitrary local file contents to external reviewer models."""
-    import os, platform
+    import platform
     if platform.system() == "Windows":
         pytest.skip("symlink creation requires admin on Windows")
     drive_root = tmp_path / "drive"
@@ -715,7 +712,7 @@ def test_toplevel_skill_files_are_hashed_and_reviewed(tmp_path):
     )
 
 
-def test_extension_status_reflects_persisted_verdict_in_phase4(tmp_path):
+def test_extension_status_reflects_persisted_verdict_in_phase4(tmp_path, monkeypatch):
     """Phase 4 lifted the old Phase 3 ``pending_phase4`` overlay — now
     that the extension loader exists, a persisted review verdict for a
     ``type: extension`` skill must surface verbatim so operators and
@@ -749,11 +746,8 @@ def test_extension_status_reflects_persisted_verdict_in_phase4(tmp_path):
     # Real verdict surfaces — Phase 4 retired the ``pending_phase4`` overlay.
     assert reloaded.review.status == "clean"
 
-    os.environ["OUROBOROS_SKILLS_REPO_PATH"] = str(repo_root)
-    try:
-        summary = summarize_skills(drive_root)
-    finally:
-        os.environ.pop("OUROBOROS_SKILLS_REPO_PATH", None)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(repo_root))
+    summary = summarize_skills(drive_root)
     statuses = {s["name"]: s["review_status"] for s in summary["skills"]}
     assert statuses["ext2"] == "clean"
 
@@ -763,16 +757,13 @@ def test_extension_status_reflects_persisted_verdict_in_phase4(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_summarize_skills_shape_contains_counts_and_flat_list(tmp_path):
+def test_summarize_skills_shape_contains_counts_and_flat_list(tmp_path, monkeypatch):
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
     repo_root = tmp_path / "skills"
     _write_skill(repo_root, "alpha", manifest=_valid_script_manifest("alpha"))
-    os.environ["OUROBOROS_SKILLS_REPO_PATH"] = str(repo_root)
-    try:
-        summary = summarize_skills(drive_root)
-    finally:
-        os.environ.pop("OUROBOROS_SKILLS_REPO_PATH", None)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(repo_root))
+    summary = summarize_skills(drive_root)
     assert summary["count"] == 1
     assert summary["available"] == 0
     assert summary["pending_review"] == 1

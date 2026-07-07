@@ -19,11 +19,22 @@ Doctrine:
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import threading
 from typing import Any, Callable, Optional, Sequence
 
 log = logging.getLogger("ouroboros.project_naming")
+
+
+def _light_use_local(explicit: Optional[bool]) -> bool:
+    """Resolve the light-lane local route for naming. Honor an explicit caller value;
+    otherwise follow the runtime ``USE_LOCAL_LIGHT`` flag — naming runs on the LIGHT model,
+    so it must route local/remote like every other light-lane caller (e.g. the safety
+    check at ``ouroboros/safety.py::_resolve_safety_routing``) instead of hardcoding remote."""
+    if explicit is not None:
+        return bool(explicit)
+    return str(os.environ.get("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1")
 
 # Mirror gateway ``_MAX_DERIVED_NAME`` so heuristic and LLM names share one cap.
 MAX_PROJECT_NAME = 60
@@ -79,7 +90,28 @@ def _light_naming_model() -> str:
     return resolve_credentialed_model(get_light_model())
 
 
-_NAMING_CALL_TIMEOUT_SEC = 60.0
+def _naming_timeout_sec() -> float:
+    """Provider-call transport timeout for the naming LIGHT call. SSOT: config
+    SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC"]
+    try:
+        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _naming_async_timeout_sec() -> float:
+    """Gateway HARD wait for the inline turn-into-project name. SSOT: config
+    SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC"]
+    try:
+        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _record_naming_budget(usage: Any, model: str, use_local: bool) -> None:
@@ -111,7 +143,7 @@ def llm_project_name(
     owner_text: object,
     *,
     fallback_candidates: Sequence[object] = (),
-    use_local: bool = False,
+    use_local: Optional[bool] = None,
     llm_client: Optional[Any] = None,
     drive_root: Optional[Any] = None,
     task_id: str = "",
@@ -119,30 +151,37 @@ def llm_project_name(
     """SYNC bounded LLM-first project title. On ANY failure returns the heuristic
     fallback over ``fallback_candidates`` then ``owner_text``. Never raises.
 
-    The provider call is wrapped in the #4 per-model concurrency slot so a flurry of
-    namers cannot storm one model's rate limit, carries a bounded transport timeout so a
-    stalled provider can't wedge card creation, and — when ``drive_root`` is given — runs
-    through ``chat_observed`` so the naming spend is recorded in the forensic ledger like
+    ``use_local=None`` (the default) routes via the runtime ``USE_LOCAL_LIGHT`` flag so a
+    local-only / local-light deployment names with its configured local model instead of a
+    remote provider. The provider call is wrapped in the #4 per-model concurrency slot so a
+    flurry of namers cannot storm one model's rate limit, carries a bounded transport timeout
+    so a stalled provider can't wedge card creation, and — when ``drive_root`` is given —
+    runs through ``chat_observed`` so the naming spend is recorded in the forensic ledger like
     every other internal one-shot (reflection/consolidation/compaction).
     """
     fb = fallback_project_name(*list(fallback_candidates), owner_text)
     text = " ".join(str(owner_text or "").split())
     if not text:
         return fb
+    use_local = _light_use_local(use_local)
     try:
         from ouroboros import model_concurrency
         from ouroboros.llm import LLMClient
 
         client = llm_client or LLMClient()
         model = _light_naming_model()
+        # A title only needs the head of the request; bound the prompt input but mark the cut
+        # explicitly (P1 — no SILENT truncation) rather than dropping the tail invisibly. The
+        # full request is unaffected (this is only the naming prompt's view).
+        naming_input = text if len(text) <= 4000 else text[:4000] + " …[request truncated for naming]"
         chat_kwargs = dict(
-            messages=[{"role": "user", "content": _NAMING_PROMPT.format(request=text[:4000])}],
+            messages=[{"role": "user", "content": _NAMING_PROMPT.format(request=naming_input)}],
             model=model,
             tools=None,
             reasoning_effort="low",
             max_tokens=256,
             use_local=use_local,
-            timeout=_NAMING_CALL_TIMEOUT_SEC,
+            timeout=_naming_timeout_sec(),
         )
         with model_concurrency.model_call_slot(model, use_local):
             if drive_root is not None:
@@ -169,21 +208,24 @@ async def llm_project_name_async(
     owner_text: object,
     *,
     fallback_candidates: Sequence[object] = (),
-    timeout_sec: float = 8.0,
-    use_local: bool = False,
+    timeout_sec: Optional[float] = None,
+    use_local: Optional[bool] = None,
     llm_client: Optional[Any] = None,
     drive_root: Optional[Any] = None,
     task_id: str = "",
 ) -> str:
     """ASYNC variant for the gateway (Starlette) path: runs the bounded sync call off
-    the event loop with a HARD timeout. On timeout/failure returns the heuristic
-    fallback. Never raises."""
+    the event loop with a HARD timeout. ``timeout_sec=None`` (default) uses the config SSOT
+    ``OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC``. On timeout/failure returns the heuristic
+    fallback. ``use_local=None`` defers to ``USE_LOCAL_LIGHT`` inside the sync helper.
+    Never raises."""
     import asyncio
 
     fb = fallback_project_name(*list(fallback_candidates), owner_text)
     text = " ".join(str(owner_text or "").split())
     if not text:
         return fb
+    eff_timeout = _naming_async_timeout_sec() if timeout_sec is None else float(timeout_sec)
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(
@@ -195,7 +237,7 @@ async def llm_project_name_async(
                 drive_root=drive_root,
                 task_id=task_id,
             ),
-            timeout=max(0.1, float(timeout_sec)),
+            timeout=max(0.1, eff_timeout),
         )
     except Exception:
         log.debug("llm_project_name_async timed out/failed; using heuristic", exc_info=True)
@@ -229,9 +271,22 @@ def spawn_proactive_namer(
             name = llm_project_name(body, drive_root=drive_root, task_id=task_id)
             if not name:
                 return
-            from ouroboros.task_results import STATUS_RUNNING, write_task_result
+            from ouroboros.task_results import (
+                STATUS_RUNNING,
+                load_task_result,
+                write_task_result,
+            )
 
-            write_task_result(drive_root, task_id, STATUS_RUNNING, suggested_name=name)
+            # Persist suggested_name as same-status ENRICHMENT, not a RUNNING transition: a
+            # fast task may already be terminal (completed/failed/cancelled) by the time this
+            # daemon finishes, and write_task_result's monotonic guard DROPS a regressing
+            # RUNNING write — which would silently lose the name the convert path reuses.
+            # Writing under the current on-disk status lets the monotonic guard's same-status
+            # enrichment carry the field through (and a benign drop only in the rare race where
+            # the status advanced past our read — acceptable for a best-effort title).
+            current = load_task_result(drive_root, task_id) or {}
+            status = str(current.get("status") or "") or STATUS_RUNNING
+            write_task_result(drive_root, task_id, status, suggested_name=name)
             if broadcast is not None:
                 try:
                     broadcast({"type": "task_named", "task_id": task_id, "suggested_name": name})

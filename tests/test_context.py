@@ -117,6 +117,49 @@ def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch)
     assert "runtime_data/uploads" in payload["runtime_mode_rule"]
 
 
+def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path)
+
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"}, ctx=ctx)
+    payload = json.loads(section.split("\n\n", 1)[1])
+    fs = payload["capabilities"]["filesystem"]
+
+    assert fs["profile"] == "self_modification"
+    assert "task_drive" in fs["allowed_shell_cwd_roots"]
+    assert "status" in fs["git_readonly_subcommands"]
+    assert "active_workspace" in fs["light_gated_roots"]
+
+
+def test_runtime_section_external_workspace_includes_user_files_shell_affordance(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    drive = tmp_path / "data"
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "workspace"
+    drive.mkdir()
+    repo.mkdir(exist_ok=True)
+    workspace.mkdir(exist_ok=True)
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=drive,
+        workspace_root=workspace,
+        workspace_mode="external",
+    )
+
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"}, ctx=ctx)
+    payload = json.loads(section.split("\n\n", 1)[1])
+    fs = payload["capabilities"]["filesystem"]
+
+    assert fs["profile"] == "external_workspace_task"
+    assert "user_files" in fs["allowed_shell_cwd_roots"]
+
+
 def test_health_invariants_reports_remote_context_overflow(tmp_path):
     env = _make_health_env(
         tmp_path,
@@ -1053,42 +1096,6 @@ def test_recent_sections_filter_process_logs_by_task_id(tmp_path):
     combined = "\n\n".join(sections)
     assert "in-scope" in combined
     assert "out-of-scope" not in combined
-
-
-def test_should_consolidate_chat_blocks(tmp_path):
-    from ouroboros.consolidator import should_consolidate, BLOCK_SIZE
-    chat_path = tmp_path / 'chat.jsonl'
-    meta_path = tmp_path / 'dialogue_meta.json'
-    entries = [
-        json.dumps({"ts": f"2026-03-09T10:{i % 60:02d}:00Z", "direction": "in", "text": "msg"})
-        for i in range(BLOCK_SIZE + 5)
-    ]
-    chat_path.write_text("\n".join(entries) + "\n", encoding='utf-8')
-    assert should_consolidate(meta_path, chat_path) is True
-
-
-def test_consolidate_chat_creates_block(tmp_path):
-    from unittest.mock import MagicMock
-    from ouroboros.consolidator import consolidate, _load_meta, _load_blocks, BLOCK_SIZE
-    chat_path = tmp_path / 'chat.jsonl'
-    blocks_path = tmp_path / 'dialogue_blocks.json'
-    meta_path = tmp_path / 'dialogue_meta.json'
-    entries = [
-        json.dumps({"ts": f"2026-03-09T10:{i % 60:02d}:00Z", "direction": "in", "text": f"msg {i}"})
-        for i in range(BLOCK_SIZE + 5)
-    ]
-    chat_path.write_text("\n".join(entries) + "\n", encoding='utf-8')
-    mock_llm = MagicMock()
-    mock_llm.chat.return_value = (
-        {"content": "### Block: test\n\nSummary."},
-        {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.001},
-    )
-    usage = consolidate(chat_path, blocks_path, meta_path, mock_llm)
-    assert usage is not None
-    meta = _load_meta(meta_path)
-    assert meta["last_consolidated_offset"] == BLOCK_SIZE
-    blocks = _load_blocks(blocks_path)
-    assert len(blocks) == 1
 
 
 def test_installed_skills_section_includes_warnings_verdict(tmp_path, monkeypatch):
