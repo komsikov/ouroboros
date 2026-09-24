@@ -129,7 +129,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/06-agent-core.md": 307100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
-    "docs/architecture/08-git-branching-ci-and-build.md": 19287,
+    # 19287 -> 19550 (PR #1255; measured 19506): the Docker subsection maps the new root .dockerignore
+    # (what it keeps out of image layers and why .git/tests/ must stay in), a config
+    # BIBLE P6 requires on the map.
+    "docs/architecture/08-git-branching-ci-and-build.md": 19550,
     "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,
     # 17655 -> 20400: the supervisor-reliability sprint adds eight invariants the chapter lacked
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack

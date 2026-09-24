@@ -1,4 +1,29 @@
-# Other
-.devcontainer
-graphify-out
+# Build context for `docker build -t ouroboros-web .` (Dockerfile: COPY . .).
+# Keep secrets, host environments and local runtime state out of image
+# layers. Do NOT exclude .git, tests/ or sources: CI builds this image and
+# runs pytest inside it, and the agent needs its own Git history.
 
+# Secrets (mirrors .gitignore)
+.env
+.env.*
+**/*.key
+**/*.pem
+
+# Host environments and caches
+.venv/
+venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state and build output
+/data/
+/dist/
+/build/
+
+# Other
+/.devcontainer
+/graphify-out
