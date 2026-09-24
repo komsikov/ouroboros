@@ -525,7 +525,7 @@ class TestDockerignore:
     def test_private_state_is_excluded(self):
         patterns = self._patterns()
         required = {
-            ".env", ".env.*", "**/*.key", "**/*.pem",
+            "**/.env", "**/.env.*", "**/*.key", "**/*.pem",
             ".venv/", "venv/", "env/", "/data/",
             "/.review-drive/", "/.claudexor/", "/.adversarial-review/",
         }

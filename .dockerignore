@@ -5,8 +5,8 @@
 # tests/test_build_scripts.py::TestDockerignore pins both halves.
 
 # Secrets (mirrors .gitignore)
-.env
-.env.*
+**/.env
+**/.env.*
 **/*.key
 **/*.pem
 
